@@ -43,7 +43,7 @@ export function createApp(options: AppOptions): Express {
   });
   api.use("/auth", authRoutes(auth, cookies));
   api.use("/modules", moduleAccess(auth, cookies), navigationRoutes());
-  api.use("/calendar", moduleAccess(auth, cookies), calendarRoutes());
+  api.use("/calendar", moduleAccess(auth, cookies), calendarRoutes(options.db));
   api.use((_req, res) => sendError(res, 404, "NOT_FOUND", "Not found."));
   app.use("/api", api);
 
