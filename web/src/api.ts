@@ -5,6 +5,7 @@ export class ApiError extends Error {
     readonly status: number,
     readonly code: string,
     message: string,
+    readonly details?: Record<string, unknown>,
   ) {
     super(message);
   }
@@ -61,7 +62,7 @@ export async function api<T>(path: string, options: RequestOptions = {}): Promis
   if (idleExpiresAt) idleExpiryListeners.forEach((l) => l(idleExpiresAt));
 
   if (response.status === 204) return undefined as T;
-  const payload = (await response.json().catch(() => ({}))) as {
+  const payload = (await response.json().catch(() => ({}))) as Record<string, unknown> & {
     error?: { code: string; message: string };
   };
   if (!response.ok) {
@@ -71,7 +72,7 @@ export async function api<T>(path: string, options: RequestOptions = {}): Promis
     if (response.status === 401 && path !== "/api/auth/login") {
       sessionEndedListeners.forEach((l) => l(code));
     }
-    throw new ApiError(response.status, code, message);
+    throw new ApiError(response.status, code, message, payload);
   }
   return payload as T;
 }
