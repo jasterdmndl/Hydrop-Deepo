@@ -2,6 +2,7 @@ import { type ReactNode, useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { api, ApiError } from "./api";
 import { LogoutErrorBanner, useAuth, useSignedInUser } from "./auth/AuthContext";
+import type { RemindersResponse } from "./calendar/calendarView";
 
 export type ModuleState = "open" | "read-only" | "locked" | "coming-later";
 
@@ -225,6 +226,21 @@ export function AppShell({ activeKey, sectionName, modulesData, children }: AppS
 export function ChooseModule() {
   const user = useSignedInUser();
   const { data, loading, error, reload } = useModulesData();
+  const [reminders, setReminders] = useState<RemindersResponse | null>(null);
+  const [remindersError, setRemindersError] = useState(false);
+
+  const loadReminders = useCallback(async () => {
+    setRemindersError(false);
+    try {
+      setReminders(await api<RemindersResponse>("/api/calendar/reminders", { background: true }));
+    } catch {
+      setRemindersError(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    void loadReminders();
+  }, [loadReminders]);
 
   return (
     <AppShell activeKey="home" modulesData={data}>
@@ -241,7 +257,14 @@ export function ChooseModule() {
       {error && (
         <div className="alert alert--error" role="alert">
           <span>{error}</span>{" "}
-          <button className="button button--ghost button--sm" type="button" onClick={() => void reload()}>
+          <button
+            className="button button--ghost button--sm"
+            type="button"
+            onClick={() => {
+              void reload();
+              void loadReminders();
+            }}
+          >
             Retry
           </button>
         </div>
@@ -265,6 +288,24 @@ export function ChooseModule() {
                   <span className={`badge badge--${mod.state}`}>{moduleBadgeText(mod.state)}</span>
                 </div>
                 <p className="module-card__desc">{mod.description}</p>
+                {mod.key === "calendar" && (
+                  <div className="module-card__reminders" aria-label="Activity Calendar reminder summary">
+                    {reminders ? (
+                      <>
+                        <span className={`pill ${reminders.overdueCount > 0 ? "pill--overdue" : "pill--neutral"}`}>
+                          {reminders.overdueCount} overdue
+                        </span>
+                        <span className={`pill ${reminders.upcomingCount > 0 ? "pill--scheduled" : "pill--neutral"}`}>
+                          {reminders.upcomingCount} upcoming
+                        </span>
+                      </>
+                    ) : remindersError ? (
+                      <span className="module-card__note">Could not load reminder counts.</span>
+                    ) : (
+                      <span className="module-card__note">Checking reminders…</span>
+                    )}
+                  </div>
+                )}
                 <div className="module-card__footer">
                   {canOpen && mod.path ? (
                     <Link to={mod.path} className="button button--primary">
