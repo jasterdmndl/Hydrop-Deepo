@@ -1,0 +1,29 @@
+# Local planning, references, and IDE tooling
+/AGENTS.md
+/CALENDAR-SLICE-DESIGN.md
+/DECISIONS.md
+/new-chat-prompt.md
+/planning-state.md
+/PLAYWRIGHT-SETUP.md
+/SPEC-KIT-SETUP.md
+/docs/
+/.agents/
+/.specify/
+/.playwright-mcp/
+/tmp/
+
+# Local dependencies, generated output, and test artifacts
+node_modules/
+dist/
+coverage/
+playwright-report/
+test-results/
+*.tsbuildinfo
+*.log
+
+# Local environment values and OS metadata
+.env
+.env.*
+!.env.example
+.DS_Store
+Thumbs.db
