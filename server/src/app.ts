@@ -9,6 +9,7 @@ import { cookieSettings, moduleAccess, requestClock } from "./modules/auth/guard
 import { authRoutes } from "./modules/auth/routes.js";
 import { AuthService } from "./modules/auth/service.js";
 import { navigationRoutes } from "./modules/navigation/routes.js";
+import { posRoutes } from "./modules/pos/routes.js";
 import { type Clock, systemClock } from "./shared/clock.js";
 import { sendError } from "./shared/http.js";
 
@@ -44,6 +45,7 @@ export function createApp(options: AppOptions): Express {
   api.use("/auth", authRoutes(auth, cookies));
   api.use("/modules", moduleAccess(auth, cookies), navigationRoutes());
   api.use("/calendar", moduleAccess(auth, cookies), calendarRoutes(options.db));
+  api.use("/pos", moduleAccess(auth, cookies), posRoutes(options.db));
   api.use((_req, res) => sendError(res, 404, "NOT_FOUND", "Not found."));
   app.use("/api", api);
 
