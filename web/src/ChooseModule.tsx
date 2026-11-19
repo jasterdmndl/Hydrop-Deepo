@@ -1,7 +1,8 @@
-import { type ReactNode, useCallback, useEffect, useState } from "react";
-import { Link } from "react-router-dom";
+import { type MouseEvent, type ReactNode, useCallback, useEffect, useRef, useState } from "react";
+import { Link, useLocation } from "react-router-dom";
 import { api, ApiError } from "./api";
 import { LogoutErrorBanner, useAuth, useSignedInUser } from "./auth/AuthContext";
+import { idlePhase } from "./auth/idle";
 import type { RemindersResponse } from "./calendar/calendarView";
 
 export type ModuleState = "open" | "read-only" | "locked" | "coming-later";
@@ -102,10 +103,122 @@ export interface AppShellProps {
   children: ReactNode;
 }
 
+const DRAWER_MEDIA_QUERY = "(max-width: 799px), (orientation: portrait) and (max-width: 900px)";
+const FOCUSABLE_SELECTOR = 'a[href], button:not(:disabled), [tabindex]:not([tabindex="-1"])';
+
 export function AppShell({ activeKey, sectionName, modulesData, children }: AppShellProps) {
   const user = useSignedInUser();
-  const { logout, loggingOut } = useAuth();
+  const { state, clockOffset, logout, loggingOut, logoutError } = useAuth();
+  const location = useLocation();
   const [fetchedModules, setFetchedModules] = useState<ModulesResponse | null>(null);
+  const [isDrawerMode, setIsDrawerMode] = useState(() =>
+    typeof window !== "undefined" && typeof window.matchMedia === "function"
+      ? window.matchMedia(DRAWER_MEDIA_QUERY).matches
+      : false,
+  );
+  const [drawerOpen, setDrawerOpen] = useState(false);
+
+  const menuButtonRef = useRef<HTMLButtonElement | null>(null);
+  const drawerRef = useRef<HTMLElement | null>(null);
+  const closeButtonRef = useRef<HTMLButtonElement | null>(null);
+  const workspaceRef = useRef<HTMLDivElement | null>(null);
+  const restoreFocusOnCloseRef = useRef(false);
+
+  const closeDrawer = useCallback((restoreFocus: boolean) => {
+    restoreFocusOnCloseRef.current = restoreFocus;
+    setDrawerOpen(false);
+  }, []);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || typeof window.matchMedia !== "function") return;
+    const media = window.matchMedia(DRAWER_MEDIA_QUERY);
+    const update = () => {
+      setIsDrawerMode(media.matches);
+      if (!media.matches) {
+        restoreFocusOnCloseRef.current = false;
+        setDrawerOpen(false);
+      }
+    };
+    update();
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+
+  useEffect(() => {
+    setDrawerOpen(false);
+  }, [location.pathname]);
+
+  useEffect(() => {
+    if (logoutError) setDrawerOpen(false);
+  }, [logoutError]);
+
+  useEffect(() => {
+    const workspace = workspaceRef.current as (HTMLDivElement & { inert: boolean }) | null;
+    if (workspace) {
+      workspace.inert = isDrawerMode && drawerOpen;
+    }
+    const drawer = drawerRef.current as (HTMLElement & { inert: boolean }) | null;
+    if (drawer) {
+      drawer.inert = isDrawerMode && !drawerOpen;
+    }
+    if (isDrawerMode && !drawerOpen && restoreFocusOnCloseRef.current) {
+      restoreFocusOnCloseRef.current = false;
+      menuButtonRef.current?.focus();
+    }
+  }, [isDrawerMode, drawerOpen]);
+
+  useEffect(() => {
+    if (!isDrawerMode || !drawerOpen) return;
+
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const rafId = window.requestAnimationFrame(() => {
+      closeButtonRef.current?.focus();
+    });
+
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (document.querySelector('[role="alertdialog"]')) return;
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeDrawer(true);
+        return;
+      }
+      if (event.key !== "Tab" || !drawerRef.current) return;
+      const focusables = Array.from(drawerRef.current.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)).filter(
+        (el) => el.offsetParent !== null,
+      );
+      if (focusables.length === 0) return;
+      const first = focusables[0]!;
+      const last = focusables[focusables.length - 1]!;
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      window.cancelAnimationFrame(rafId);
+      document.body.style.overflow = previousOverflow;
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [isDrawerMode, drawerOpen, closeDrawer]);
+
+  useEffect(() => {
+    if (!isDrawerMode || !drawerOpen || state.status !== "signed-in") return;
+    const idleExpiresAt = state.idleExpiresAt;
+    const checkIdle = () => {
+      if (idlePhase(Date.now() + clockOffset, idleExpiresAt).phase === "warning") {
+        setDrawerOpen(false);
+      }
+    };
+    checkIdle();
+    const timer = window.setInterval(checkIdle, 1000);
+    return () => window.clearInterval(timer);
+  }, [isDrawerMode, drawerOpen, state, clockOffset]);
 
   useEffect(() => {
     if (modulesData !== undefined) return;
@@ -118,14 +231,49 @@ export function AppShell({ activeKey, sectionName, modulesData, children }: AppS
   const modules = effective?.modules ?? [];
   const stationStatus = effective?.stationStatus ?? null;
   const todayManila = formatManilaToday();
+  const drawerActive = isDrawerMode && drawerOpen;
+
+  const normalizePath = (path: string) => (path.length > 1 && path.endsWith("/") ? path.slice(0, -1) : path);
+
+  const handleDrawerLinkClick = (event: MouseEvent<HTMLAnchorElement>, targetPath: string) => {
+    if (!isDrawerMode) return;
+    const isSamePage = normalizePath(location.pathname) === normalizePath(targetPath);
+    const isPlainClick = !event.metaKey && !event.ctrlKey && !event.shiftKey && !event.altKey && event.button === 0;
+    if (isSamePage && isPlainClick) {
+      event.preventDefault();
+    }
+    closeDrawer(isSamePage);
+  };
 
   return (
     <div className="shell">
-      <aside className="sidebar" aria-label="Workspace navigation">
+      {drawerActive && (
+        <div className="drawer-backdrop" aria-hidden="true" onClick={() => closeDrawer(true)} />
+      )}
+      <aside
+        id="workspace-sidebar"
+        ref={drawerRef}
+        className={drawerActive ? "sidebar sidebar--open" : "sidebar"}
+        role={drawerActive ? "dialog" : undefined}
+        aria-modal={drawerActive ? true : undefined}
+        aria-label="Workspace navigation"
+        aria-hidden={isDrawerMode && !drawerOpen ? true : undefined}
+      >
         <div className="sidebar__top">
-          <div className="brand">
-            <span className="brand__name">Hydrop Deepo</span>
-            <span className="brand__tag">WATER REFILLING STATION</span>
+          <div className="sidebar__brand-row">
+            <div className="brand">
+              <span className="brand__name">Hydrop Deepo</span>
+              <span className="brand__tag">WATER REFILLING STATION</span>
+            </div>
+            <button
+              ref={closeButtonRef}
+              type="button"
+              className="drawer-close"
+              aria-label="Close navigation menu"
+              onClick={() => closeDrawer(true)}
+            >
+              ✕
+            </button>
           </div>
 
           <div className="sidebar__section-label">WORKSPACE</div>
@@ -134,6 +282,7 @@ export function AppShell({ activeKey, sectionName, modulesData, children }: AppS
               to="/"
               className={`nav-item ${activeKey === "home" ? "nav-item--active" : ""}`}
               aria-current={activeKey === "home" ? "page" : undefined}
+              onClick={(event) => handleDrawerLinkClick(event, "/")}
             >
               <span className="nav-item__label">Choose Module</span>
             </Link>
@@ -148,6 +297,7 @@ export function AppShell({ activeKey, sectionName, modulesData, children }: AppS
                     to={mod.path}
                     className={`nav-item ${isActive ? "nav-item--active" : ""}`}
                     aria-current={isActive ? "page" : undefined}
+                    onClick={(event) => handleDrawerLinkClick(event, mod.path!)}
                   >
                     <span className="nav-item__label">{mod.name}</span>
                     {hint && <span className="nav-item__tag">{hint}</span>}
@@ -194,23 +344,41 @@ export function AppShell({ activeKey, sectionName, modulesData, children }: AppS
         </div>
       </aside>
 
-      <div className="workspace">
+      <div className="workspace" ref={workspaceRef}>
         <header className="topbar">
-          <nav className="breadcrumb" aria-label="Breadcrumb">
-            {sectionName ? (
-              <>
-                <Link to="/" className="breadcrumb__link">
-                  Workspace
-                </Link>
-                <span className="breadcrumb__sep" aria-hidden="true">
-                  ›
-                </span>
-                <span className="breadcrumb__current">{sectionName}</span>
-              </>
-            ) : (
-              <span className="breadcrumb__current">Workspace</span>
-            )}
-          </nav>
+          <div className="topbar__start">
+            <button
+              ref={menuButtonRef}
+              type="button"
+              className="menu-button"
+              aria-label="Open navigation menu"
+              aria-expanded={drawerActive}
+              aria-controls="workspace-sidebar"
+              onClick={() => setDrawerOpen(true)}
+            >
+              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+                <line x1="4" y1="6" x2="20" y2="6" />
+                <line x1="4" y1="12" x2="20" y2="12" />
+                <line x1="4" y1="18" x2="20" y2="18" />
+              </svg>
+              <span>Menu</span>
+            </button>
+            <nav className="breadcrumb" aria-label="Breadcrumb">
+              {sectionName ? (
+                <>
+                  <Link to="/" className="breadcrumb__link">
+                    Workspace
+                  </Link>
+                  <span className="breadcrumb__sep" aria-hidden="true">
+                    ›
+                  </span>
+                  <span className="breadcrumb__current">{sectionName}</span>
+                </>
+              ) : (
+                <span className="breadcrumb__current">Workspace</span>
+              )}
+            </nav>
+          </div>
           <div className="topbar__date">{todayManila}</div>
         </header>
 

@@ -14,6 +14,7 @@ import {
   formatTime12h,
   reminderBadgeLabel,
   type RemindersResponse,
+  resolveSelectedActivityForDate,
   shiftMonth,
 } from "./calendarView";
 import { RecordCompletionForm } from "./RecordCompletionForm";
@@ -128,6 +129,13 @@ export function CalendarPage() {
   }, [monthData]);
 
   const gridCells = useMemo(() => buildMonthGrid(calendarMonth), [calendarMonth]);
+  const gridWeeks = useMemo(() => {
+    const weeks: (typeof gridCells)[] = [];
+    for (let i = 0; i < gridCells.length; i += 7) {
+      weeks.push(gridCells.slice(i, i + 7));
+    }
+    return weeks;
+  }, [gridCells]);
   const selectedDayActivities = activitiesByDate.get(selectedDate) ?? [];
   const completedList = historyData?.completedActivities ?? [];
 
@@ -204,9 +212,15 @@ export function CalendarPage() {
     await loadAll(calendarMonth, completionMonth);
   }
 
+  function selectCalendarDate(date: string, dayActivities: ActivityView[]) {
+    setSelectedDate(date);
+    setSelectedActivity((prev) => resolveSelectedActivityForDate(prev, date, dayActivities));
+  }
+
   function handleTodayClick() {
+    const todayActivities = calendarMonth === manilaNow.month ? (activitiesByDate.get(manilaNow.date) ?? []) : [];
     setCalendarMonth(manilaNow.month);
-    setSelectedDate(manilaNow.date);
+    selectCalendarDate(manilaNow.date, todayActivities);
     setBanner(null);
   }
 
@@ -359,7 +373,7 @@ export function CalendarPage() {
               </div>
             </div>
 
-            <div className="calendar-grid-wrap">
+            <div className="calendar-grid-wrap" role="grid" aria-label={formatMonthHeading(calendarMonth)}>
               <div className="calendar-weekdays" role="row">
                 {WEEKDAY_HEADERS.map((day) => (
                   <div key={day} className="calendar-weekday" role="columnheader">
@@ -368,71 +382,83 @@ export function CalendarPage() {
                 ))}
               </div>
 
-              <div className="calendar-grid" role="grid" aria-label={formatMonthHeading(calendarMonth)}>
-                {gridCells.map((cell) => {
-                  const dayActivities = activitiesByDate.get(cell.date) ?? [];
-                  const isToday = cell.date === manilaNow.date;
-                  const isSelected = cell.date === selectedDate;
-                  const hasOverdue = dayActivities.some((a) => a.status === "OVERDUE");
-                  const visible = dayActivities.slice(0, 2);
-                  const hiddenCount = dayActivities.length - visible.length;
+              <div className="calendar-grid">
+                {gridWeeks.map((week, weekIndex) => (
+                  <div key={week[0]?.date ?? weekIndex} className="calendar-week" role="row">
+                    {week.map((cell) => {
+                      const dayActivities = activitiesByDate.get(cell.date) ?? [];
+                      const isToday = cell.date === manilaNow.date;
+                      const isSelected = cell.date === selectedDate;
+                      const hasOverdue = dayActivities.some((a) => a.status === "OVERDUE");
+                      const visible = dayActivities.slice(0, 2);
+                      const hiddenCount = dayActivities.length - visible.length;
 
-                  return (
-                    <div
-                      key={cell.date}
-                      className={`day-cell ${cell.inCurrentMonth ? "" : "day-cell--outside"} ${
-                        isToday ? "day-cell--today" : ""
-                      } ${isSelected ? "day-cell--selected" : ""}`}
-                    >
-                      <button
-                        type="button"
-                        className={`day-number ${isToday ? "day-number--today" : ""} ${
-                          hasOverdue && !isToday ? "day-number--overdue" : ""
-                        }`}
-                        aria-label={`${formatLongDate(cell.date)}${
-                          dayActivities.length > 0 ? `, ${dayActivities.length} activities` : ""
-                        }`}
-                        onClick={() => {
-                          setSelectedDate(cell.date);
-                          if (dayActivities.length === 1) {
-                            setSelectedActivity(dayActivities[0]!);
-                          }
-                        }}
-                      >
-                        {cell.dayNumber}
-                      </button>
-
-                      <div className="day-events">
-                        {visible.map((act) => (
-                          <button
-                            key={act.reference}
-                            type="button"
-                            className={`day-event day-event--${act.status.toLowerCase()}`}
-                            title={`${formatTime12h(act.scheduledTime)} — ${act.name}`}
-                            onClick={() => {
-                              setSelectedDate(act.scheduledDate);
-                              setSelectedActivity(act);
-                            }}
-                          >
-                            {act.name}
-                          </button>
-                        ))}
-                        {hiddenCount > 0 && (
+                      return (
+                        <div
+                          key={cell.date}
+                          role="gridcell"
+                          aria-selected={isSelected || undefined}
+                          className={`day-cell ${cell.inCurrentMonth ? "" : "day-cell--outside"} ${
+                            isToday ? "day-cell--today" : ""
+                          } ${isSelected ? "day-cell--selected" : ""}`}
+                        >
                           <button
                             type="button"
-                            className="day-event-more"
-                            onClick={() => {
-                              setSelectedDate(cell.date);
-                              setSelectedActivity(dayActivities[0] ?? null);
-                            }}
+                            className={`day-number ${isToday ? "day-number--today" : ""} ${
+                              hasOverdue && !isToday ? "day-number--overdue" : ""
+                            }`}
+                            aria-label={`${formatLongDate(cell.date)}${
+                              dayActivities.length > 0
+                                ? `, ${dayActivities.length} ${dayActivities.length === 1 ? "activity" : "activities"}${
+                                    hasOverdue ? ", includes overdue" : ""
+                                  }`
+                                : ""
+                            }`}
+                            onClick={() => selectCalendarDate(cell.date, dayActivities)}
                           >
-                            +{hiddenCount} more
+                            <span className="day-number__value">{cell.dayNumber}</span>
+                            {dayActivities.length > 0 && (
+                              <span className="day-dots" aria-hidden="true">
+                                {dayActivities.slice(0, 3).map((act) => (
+                                  <span key={act.reference} className={`day-dot day-dot--${act.status.toLowerCase()}`} />
+                                ))}
+                              </span>
+                            )}
                           </button>
-                        )}
-                      </div>
-                    </div>
-                  );
-                })}
+
+                          <div className="day-events">
+                            {visible.map((act) => (
+                              <button
+                                key={act.reference}
+                                type="button"
+                                className={`day-event day-event--${act.status.toLowerCase()}`}
+                                title={`${formatTime12h(act.scheduledTime)} — ${act.name}`}
+                                onClick={() => {
+                                  setSelectedDate(act.scheduledDate);
+                                  setSelectedActivity(act);
+                                }}
+                              >
+                                {act.name}
+                              </button>
+                            ))}
+                            {hiddenCount > 0 && (
+                              <button
+                                type="button"
+                                className="day-event-more"
+                                onClick={() => {
+                                  setSelectedDate(cell.date);
+                                  setSelectedActivity(dayActivities[0] ?? null);
+                                }}
+                              >
+                                +{hiddenCount} more
+                              </button>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    })}
+                  </div>
+                ))}
               </div>
             </div>
 
@@ -443,7 +469,7 @@ export function CalendarPage() {
               <span className="muted-sm">All times are station local time</span>
             </div>
 
-            {selectedDayActivities.length > 0 && (
+            {selectedDayActivities.length > 0 ? (
               <div className="selected-day-list">
                 <h3>{formatLongDate(selectedDate)}</h3>
                 <div className="selected-day-items">
@@ -466,6 +492,11 @@ export function CalendarPage() {
                     </button>
                   ))}
                 </div>
+              </div>
+            ) : (
+              <div className="selected-day-list selected-day-list--empty">
+                <h3>{formatLongDate(selectedDate)}</h3>
+                <p className="muted-sm">No activities scheduled for this date.</p>
               </div>
             )}
           </section>
@@ -659,19 +690,24 @@ export function CalendarPage() {
                         <tr
                           key={item.reference}
                           className={isSelected ? "history-row history-row--selected" : "history-row"}
+                          onClick={() => setSelectedActivity(item)}
                         >
-                          <td>
+                          <td className="history-td history-td--activity" data-label="Activity">
                             <button
                               type="button"
                               className="history-row__button"
-                              onClick={() => setSelectedActivity(item)}
+                              aria-pressed={isSelected}
+                              onClick={(e) => {
+                                e.stopPropagation();
+                                setSelectedActivity(item);
+                              }}
                             >
                               <strong>{item.name}</strong>
                               <span className="muted-sm">{item.reference}</span>
                               <span className="pill pill--completed">Completed</span>
                             </button>
                           </td>
-                          <td>
+                          <td className="history-td history-td--completed" data-label="Completed">
                             <div className="history-cell-stack">
                               <strong>
                                 {item.completedDate && item.completedTime
@@ -683,7 +719,9 @@ export function CalendarPage() {
                               </span>
                             </div>
                           </td>
-                          <td>{item.recordedBy ?? "—"}</td>
+                          <td className="history-td history-td--recorder" data-label="Recorded by">
+                            {item.recordedBy ?? "—"}
+                          </td>
                         </tr>
                       );
                     })}

@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  type ActivityView,
   buildMonthGrid,
   createRequestTracker,
   currentManilaDateAndTime,
@@ -7,9 +8,31 @@ import {
   formatMonthHeading,
   formatShortDateTime,
   formatTime12h,
+  resolveSelectedActivityForDate,
   scheduleDraftSignature,
   shiftMonth,
 } from "./calendarView";
+
+function makeActivity(reference: string, scheduledDate: string): ActivityView {
+  return {
+    reference,
+    name: `Activity ${reference}`,
+    scheduledAt: `${scheduledDate}T14:00:00.000Z`,
+    scheduledDate,
+    scheduledTime: "14:00",
+    scheduleNotes: null,
+    status: "SCHEDULED",
+    createdBy: "owner.demo",
+    createdAt: "2026-11-18T00:00:00.000Z",
+    actualCompletedAt: null,
+    completedDate: null,
+    completedTime: null,
+    completionNotes: null,
+    recordedBy: null,
+    recordedAt: null,
+    completion: null,
+  };
+}
 
 describe("calendar view helpers", () => {
   it("builds Sunday-first month grids with leading and trailing days", () => {
@@ -97,5 +120,25 @@ describe("calendar view helpers", () => {
     await req1;
 
     expect(appliedMonths).toEqual(["2027-01"]);
+  });
+
+  it("clears stale activity details when selecting an empty or different date", () => {
+    const nov19 = makeActivity("ACT-001", "2026-11-19");
+    const nov21a = makeActivity("ACT-002", "2026-11-21");
+    const nov21b = makeActivity("ACT-003", "2026-11-21");
+
+    // Empty date clears a previously selected activity from another date.
+    expect(resolveSelectedActivityForDate(nov19, "2026-11-20", [])).toBeNull();
+
+    // Empty date also clears an activity previously from that date if it is no longer scheduled there.
+    expect(resolveSelectedActivityForDate(nov19, "2026-11-19", [])).toBeNull();
+
+    // Single-activity date auto-selects its activity.
+    expect(resolveSelectedActivityForDate(null, "2026-11-19", [nov19])).toEqual(nov19);
+
+    // Multi-activity date clears stale selection from another date,
+    // but preserves a selection that already belongs to that date.
+    expect(resolveSelectedActivityForDate(nov19, "2026-11-21", [nov21a, nov21b])).toBeNull();
+    expect(resolveSelectedActivityForDate(nov21b, "2026-11-21", [nov21a, nov21b])).toEqual(nov21b);
   });
 });

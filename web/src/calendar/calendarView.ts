@@ -250,3 +250,21 @@ export function scheduleDraftSignature(draft: {
     draft.scheduleNotes.trim(),
   ]);
 }
+
+/**
+ * Resolves the selected activity when focusing a calendar date so stale details
+ * from another date are cleared whenever the chosen date is empty or ambiguous.
+ */
+export function resolveSelectedActivityForDate(
+  current: ActivityView | null,
+  date: string,
+  dayActivities: ActivityView[],
+): ActivityView | null {
+  if (dayActivities.length === 1) {
+    return dayActivities[0]!;
+  }
+  if (current && current.scheduledDate === date && dayActivities.some((item) => item.reference === current.reference)) {
+    return current;
+  }
+  return null;
+}
