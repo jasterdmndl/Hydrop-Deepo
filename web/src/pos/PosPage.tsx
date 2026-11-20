@@ -5,28 +5,32 @@ import { createRequestTracker } from "../calendar/calendarView";
 import { AppShell, useModulesData } from "../ChooseModule";
 import { CheckoutRecovery } from "./CheckoutRecovery";
 import {
+  type BeginPaymentResponse,
   cartLinesSignature,
   type CartDraftLine,
   type CatalogRefill,
   type CheckoutLookupView,
   type CheckoutView,
-  clearPendingRecovery,
   clearUnpaidCart,
   computeCashSummary,
   type ConfirmSaleResponse,
   currentManilaIso,
   type DaySummaryView,
   type EndDayResponse,
+  evaluateEndDayGuard,
   formatCentavos,
   formatLiters,
   formatManilaTimestamp,
-  loadPendingRecovery,
+  isPendingRecoveryStorageKey,
+  loadPendingRecoveries,
   loadUnpaidCart,
   parseLitersInput,
   parsePesoInputToCentavos,
   type PendingCheckoutRecovery,
   type PosDayResponse,
   type PrepareCheckoutResponse,
+  type QuoteLineItem,
+  removePendingRecovery,
   savePendingRecovery,
   saveUnpaidCart,
   type SaleView,
@@ -53,6 +57,31 @@ function defaultLineId(waterType: WaterType): string {
   return `std-${waterType}`;
 }
 
+function quoteItemsToDraftLines(items: QuoteLineItem[]): CartDraftLine[] {
+  return items.map((item) =>
+    item.kind === "STANDARD"
+      ? {
+          id: defaultLineId(item.waterType),
+          kind: "STANDARD",
+          waterType: item.waterType,
+          displayName: item.displayLabel,
+          unitVolumeMl: item.unitVolumeMl,
+          unitVolumeLiters: item.unitVolumeLiters,
+          unitPriceCentavos: item.unitPriceCentavos,
+          quantity: item.quantity,
+        }
+      : {
+          id: `custom-${item.lineIndex}-${item.waterType}-${item.unitVolumeMl}-${item.unitPriceCentavos}`,
+          kind: "CUSTOM",
+          waterType: item.waterType,
+          displayName: item.displayLabel,
+          unitVolumeLiters: item.unitVolumeLiters,
+          unitPriceCentavos: item.unitPriceCentavos,
+          quantity: item.quantity,
+        },
+  );
+}
+
 export function PosPage() {
   const user = useSignedInUser();
   const { data: modulesData } = useModulesData();
@@ -69,11 +98,16 @@ export function PosPage() {
   const [prepareKey, setPrepareKey] = useState<string | null>(null);
   const [prepareSignature, setPrepareSignature] = useState<string | null>(null);
   const [cashInput, setCashInput] = useState("");
+  const [confirmNoCashChecked, setConfirmNoCashChecked] = useState(false);
   const [saleError, setSaleError] = useState<string | null>(null);
 
-  const [pendingRecovery, setPendingRecovery] = useState<PendingCheckoutRecovery | null>(() =>
-    loadPendingRecovery(),
+  const [pendingRecoveries, setPendingRecoveries] = useState<PendingCheckoutRecovery[]>(() =>
+    loadPendingRecoveries(),
   );
+  const [selectedRecoveryRef, setSelectedRecoveryRef] = useState<string | null>(
+    () => loadPendingRecoveries()[0]?.reference ?? null,
+  );
+  const [activeConfirming, setActiveConfirming] = useState<PendingCheckoutRecovery | null>(null);
   const [checkingStatus, setCheckingStatus] = useState(false);
   const [retryingRecovery, setRetryingRecovery] = useState(false);
   const [recoveryError, setRecoveryError] = useState<string | null>(null);
@@ -88,6 +122,7 @@ export function PosPage() {
   const [dayActionError, setDayActionError] = useState<string | null>(null);
 
   const [preparingCheckout, setPreparingCheckout] = useState(false);
+  const [startingPayment, setStartingPayment] = useState(false);
   const [confirmingSale, setConfirmingSale] = useState(false);
   const [cancellingDraft, setCancellingDraft] = useState(false);
 
@@ -108,21 +143,46 @@ export function PosPage() {
   const loadTrackerRef = useRef(createRequestTracker());
   const preparedCheckoutRef = useRef<CheckoutView | null>(null);
   preparedCheckoutRef.current = preparedCheckout;
+  const activeConfirmingRef = useRef<PendingCheckoutRecovery | null>(null);
+
+  const activeRecovery = useMemo(
+    () =>
+      pendingRecoveries.find((r) => r.reference === selectedRecoveryRef) ??
+      pendingRecoveries[0] ??
+      null,
+    [pendingRecoveries, selectedRecoveryRef],
+  );
+
+  const inActiveCashStep =
+    step === "review" && preparedCheckout !== null && preparedCheckout.status === "PAYMENT_PENDING";
+  const showRecoveryScreen =
+    activeRecovery !== null && activeConfirming === null && !inActiveCashStep;
 
   const applyServerDayStatus = useCallback((dayRes: PosDayResponse) => {
     setDayStatus(dayRes);
+    if (activeConfirmingRef.current !== null) return;
     const currentPrepared = preparedCheckoutRef.current;
     if (!currentPrepared) return;
-    const stillValid =
-      dayRes.state === "OPEN" &&
-      currentPrepared.businessDate === dayRes.todayDate &&
-      dayRes.unpaidDrafts.some((d) => d.reference === currentPrepared.reference);
-    if (!stillValid) {
+
+    const matched =
+      dayRes.state === "OPEN" && currentPrepared.businessDate === dayRes.todayDate
+        ? (dayRes.unresolvedCheckouts.find(
+            (c) => c.reference === currentPrepared.reference && c.status === "PAYMENT_PENDING",
+          ) ?? dayRes.unpaidDrafts.find((d) => d.reference === currentPrepared.reference))
+        : undefined;
+
+    if (!matched) {
       setPreparedCheckout(null);
       setPrepareKey(null);
       setPrepareSignature(null);
       setStep("select");
       setCashInput("");
+      setConfirmNoCashChecked(false);
+    } else if (
+      matched.status !== currentPrepared.status ||
+      matched.updatedAt !== currentPrepared.updatedAt
+    ) {
+      setPreparedCheckout(matched);
     }
   }, []);
 
@@ -149,9 +209,14 @@ export function PosPage() {
   }, [applyServerDayStatus]);
 
   useEffect(() => {
-    const pending = loadPendingRecovery();
-    setPendingRecovery(pending);
-    if (!pending) {
+    const recoveries = loadPendingRecoveries();
+    setPendingRecoveries(recoveries);
+    setSelectedRecoveryRef((prev) =>
+      prev && recoveries.some((r) => r.reference === prev)
+        ? prev
+        : (recoveries[0]?.reference ?? null),
+    );
+    if (recoveries.length === 0) {
       const savedCart = loadUnpaidCart(user.username);
       if (savedCart) {
         setLines(savedCart.lines);
@@ -167,13 +232,28 @@ export function PosPage() {
         setStep("select");
       }
     }
+    setConfirmNoCashChecked(false);
     hydratedRef.current = true;
     void loadPosState();
   }, [user.username, loadPosState]);
 
-  // Persist unpaid cart only for the signed-in account while no recovery is active.
+  // Synchronize per-reference recovery records across browser tabs in real time.
   useEffect(() => {
-    if (!hydratedRef.current || pendingRecovery) return;
+    const onStorage = (event: StorageEvent) => {
+      if (!isPendingRecoveryStorageKey(event.key)) return;
+      const next = loadPendingRecoveries();
+      setPendingRecoveries(next);
+      setSelectedRecoveryRef((prev) =>
+        prev && next.some((r) => r.reference === prev) ? prev : (next[0]?.reference ?? null),
+      );
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, []);
+
+  // Persist unpaid cart only for the signed-in account while not on recovery/confirming.
+  useEffect(() => {
+    if (!hydratedRef.current || activeConfirming !== null || showRecoveryScreen) return;
     if (lines.length === 0 && !preparedCheckout) {
       clearUnpaidCart(user.username);
       return;
@@ -186,7 +266,16 @@ export function PosPage() {
       prepareKey,
       prepareSignature,
     });
-  }, [user.username, dayStatus?.todayDate, lines, preparedCheckout, prepareKey, prepareSignature, pendingRecovery]);
+  }, [
+    user.username,
+    dayStatus?.todayDate,
+    lines,
+    preparedCheckout,
+    prepareKey,
+    prepareSignature,
+    activeConfirming,
+    showRecoveryScreen,
+  ]);
 
   // Close Customize or End Day modals cleanly on Escape.
   useEffect(() => {
@@ -229,6 +318,31 @@ export function PosPage() {
   }, [lines]);
 
   const customLines = useMemo(() => lines.filter((line) => line.kind === "CUSTOM"), [lines]);
+
+  const endDayGuard = useMemo(
+    () =>
+      evaluateEndDayGuard({
+        businessDate: dayStatus?.day?.businessDate ?? null,
+        serverUnresolved: dayStatus?.unresolvedCheckouts ?? [],
+        serverUnpaidDrafts: dayStatus?.unpaidDrafts ?? [],
+        localPendingRecoveries: pendingRecoveries,
+        activeConfirming,
+      }),
+    [dayStatus, pendingRecoveries, activeConfirming],
+  );
+
+  const localRecoveryRefSet = useMemo(
+    () => new Set(pendingRecoveries.map((r) => r.reference.trim().toUpperCase())),
+    [pendingRecoveries],
+  );
+
+  const serverOnlyUnresolved = useMemo(
+    () =>
+      (dayStatus?.unresolvedCheckouts ?? []).filter(
+        (c) => !localRecoveryRefSet.has(c.reference.trim().toUpperCase()),
+      ),
+    [dayStatus?.unresolvedCheckouts, localRecoveryRefSet],
+  );
 
   function setStandardQuantity(item: CatalogRefill, nextQty: number) {
     const clamped = Math.max(0, Math.min(MAX_LINE_QTY, Math.trunc(nextQty)));
@@ -380,6 +494,7 @@ export function PosPage() {
     setEndDayError(null);
     setEndDayClearDrafts(false);
     setCloseRequestKey(generateKey());
+    setPendingRecoveries(loadPendingRecoveries());
     setEndDayOpen(true);
     try {
       const freshDay = await api<PosDayResponse>("/api/pos/day", { background: true });
@@ -391,6 +506,18 @@ export function PosPage() {
 
   async function handleConfirmEndDay() {
     if (!dayStatus?.day) return;
+    const latestGuard = evaluateEndDayGuard({
+      businessDate: dayStatus.day.businessDate,
+      serverUnresolved: dayStatus.unresolvedCheckouts,
+      serverUnpaidDrafts: dayStatus.unpaidDrafts,
+      localPendingRecoveries: loadPendingRecoveries(),
+      activeConfirming: activeConfirmingRef.current,
+    });
+    if (latestGuard.blocked) {
+      setEndDayError("Resolve or finish in-progress checkout confirmation before closing the day.");
+      return;
+    }
+
     setEndingDay(true);
     setEndDayError(null);
     const key = closeRequestKey ?? generateKey();
@@ -442,18 +569,29 @@ export function PosPage() {
           items: toCartItemInputs(lines),
         },
       });
-      setDayStatus((prev) =>
-        prev
-          ? {
-              ...prev,
-              unpaidDrafts: prev.unpaidDrafts.some((d) => d.reference === res.checkout.reference)
-                ? prev.unpaidDrafts
-                : [...prev.unpaidDrafts, res.checkout],
-            }
-          : prev,
-      );
+      setDayStatus((prev) => {
+        if (!prev) return prev;
+        if (res.checkout.status === "PAYMENT_PENDING") {
+          return {
+            ...prev,
+            unpaidDrafts: prev.unpaidDrafts.filter((d) => d.reference !== res.checkout.reference),
+            unresolvedCheckouts: prev.unresolvedCheckouts.some(
+              (c) => c.reference === res.checkout.reference,
+            )
+              ? prev.unresolvedCheckouts
+              : [...prev.unresolvedCheckouts, res.checkout],
+          };
+        }
+        return {
+          ...prev,
+          unpaidDrafts: prev.unpaidDrafts.some((d) => d.reference === res.checkout.reference)
+            ? prev.unpaidDrafts
+            : [...prev.unpaidDrafts, res.checkout],
+        };
+      });
       setPreparedCheckout(res.checkout);
       setCashInput("");
+      setConfirmNoCashChecked(false);
       setStep("review");
     } catch (err) {
       setSaleError(err instanceof ApiError ? err.message : "Could not prepare checkout.");
@@ -461,6 +599,59 @@ export function PosPage() {
     } finally {
       setPreparingCheckout(false);
     }
+  }
+
+  async function handleBeginPayment() {
+    if (!preparedCheckout || startingPayment) return;
+    setStartingPayment(true);
+    setSaleError(null);
+    loadTrackerRef.current.next();
+    try {
+      const res = await api<BeginPaymentResponse>(
+        `/api/pos/checkouts/${encodeURIComponent(preparedCheckout.reference)}/begin-payment`,
+        {
+          method: "POST",
+          body: {},
+        },
+      );
+      setDayStatus((prev) =>
+        prev
+          ? {
+              ...prev,
+              unpaidDrafts: prev.unpaidDrafts.filter((d) => d.reference !== res.checkout.reference),
+              unresolvedCheckouts: prev.unresolvedCheckouts.some(
+                (c) => c.reference === res.checkout.reference,
+              )
+                ? prev.unresolvedCheckouts.map((c) =>
+                    c.reference === res.checkout.reference ? res.checkout : c,
+                  )
+                : [...prev.unresolvedCheckouts, res.checkout],
+            }
+          : prev,
+      );
+      setPreparedCheckout(res.checkout);
+      setConfirmNoCashChecked(false);
+    } catch (err) {
+      setSaleError(
+        err instanceof ApiError ? err.message : "Could not start cash payment for this checkout.",
+      );
+      await loadPosState();
+    } finally {
+      setStartingPayment(false);
+    }
+  }
+
+  function handleResumeServerPending(checkout: CheckoutView) {
+    const hydrated = quoteItemsToDraftLines(checkout.items);
+    setLines(hydrated);
+    setPreparedCheckout(checkout);
+    setPrepareKey(null);
+    setPrepareSignature(cartLinesSignature(hydrated));
+    setCashInput("");
+    setConfirmNoCashChecked(false);
+    setSaleError(null);
+    setLastSavedSale(null);
+    setStep("review");
   }
 
   const parsedCashCentavos = parsePesoInputToCentavos(cashInput);
@@ -483,6 +674,7 @@ export function PosPage() {
       setPrepareKey(null);
       setPrepareSignature(null);
       setCashInput("");
+      setConfirmNoCashChecked(false);
       setStep("select");
       await loadPosState();
     } catch (err) {
@@ -490,6 +682,37 @@ export function PosPage() {
         err instanceof ApiError
           ? err.message
           : "Could not cancel draft checkout. Check status or retry.",
+      );
+      await loadPosState();
+    } finally {
+      setCancellingDraft(false);
+    }
+  }
+
+  async function handleCancelPaymentPending() {
+    if (!preparedCheckout || !confirmNoCashChecked) return;
+    setCancellingDraft(true);
+    setSaleError(null);
+    try {
+      await api(`/api/pos/checkouts/${encodeURIComponent(preparedCheckout.reference)}/cancel`, {
+        method: "POST",
+        body: { confirmNoCashTaken: true, reason: "No cash received" },
+      });
+      removePendingRecovery(preparedCheckout.reference);
+      setPendingRecoveries(loadPendingRecoveries());
+      clearUnpaidCart(user.username);
+      setPreparedCheckout(null);
+      setPrepareKey(null);
+      setPrepareSignature(null);
+      setCashInput("");
+      setConfirmNoCashChecked(false);
+      setStep("select");
+      await loadPosState();
+    } catch (err) {
+      setSaleError(
+        err instanceof ApiError
+          ? err.message
+          : "Could not cancel unpaid checkout. Check status or retry.",
       );
       await loadPosState();
     } finally {
@@ -542,8 +765,11 @@ export function PosPage() {
       lastError: null,
     };
 
-    // Persist checkout reference and payment context on workstation BEFORE sending confirm.
+    // Persist per-reference recovery AND mark confirming active BEFORE sending confirm.
     savePendingRecovery(pendingRecord);
+    activeConfirmingRef.current = pendingRecord;
+    setActiveConfirming(pendingRecord);
+    setPendingRecoveries(loadPendingRecoveries());
     clearUnpaidCart(user.username);
     setConfirmingSale(true);
     setSaleError(null);
@@ -561,66 +787,92 @@ export function PosPage() {
           },
         },
       );
-      clearPendingRecovery();
-      setPendingRecovery(null);
+      removePendingRecovery(pendingRecord.reference);
+      activeConfirmingRef.current = null;
+      setActiveConfirming(null);
+      const remaining = loadPendingRecoveries();
+      setPendingRecoveries(remaining);
+      setSelectedRecoveryRef((prev) =>
+        prev && remaining.some((r) => r.reference === prev)
+          ? prev
+          : (remaining[0]?.reference ?? null),
+      );
       setLines([]);
       setPreparedCheckout(null);
       setPrepareKey(null);
       setPrepareSignature(null);
       setCashInput("");
+      setConfirmNoCashChecked(false);
       setLastSavedSale(confirmed.sale);
       setStep("select");
       setHistoryRefreshSignal((n) => n + 1);
       await loadPosState();
     } catch (err) {
+      activeConfirmingRef.current = null;
+      setActiveConfirming(null);
+
       if (err instanceof ApiError && err.code === "INSUFFICIENT_CASH") {
-        clearPendingRecovery();
+        removePendingRecovery(pendingRecord.reference);
+        setPendingRecoveries(loadPendingRecoveries());
         setSaleError(err.message);
         return;
       }
 
       if (err instanceof ApiError && err.code === "CHECKOUT_REVIEW_REQUIRED") {
         const updated = persistReviewRequiredFromError(pendingRecord, err) ?? pendingRecord;
-        setPendingRecovery(updated);
+        setPendingRecoveries(loadPendingRecoveries());
+        setSelectedRecoveryRef(updated.reference);
         setRecoveryError(err.message);
         setPreparedCheckout(null);
         setLines([]);
         setPrepareKey(null);
         setPrepareSignature(null);
+        setCashInput("");
+        setConfirmNoCashChecked(false);
+        setStep("select");
         return;
       }
 
-      // Network drop, timeout, 5xx, or 401 session expiry: keep pending recovery visible & durable.
-      setPendingRecovery(pendingRecord);
-      setRecoveryError(
+      // Network drop, timeout, 5xx, or 401 session expiry: keep this exact reference durable.
+      const errorMsg =
         err instanceof ApiError
           ? err.message
-          : "Could not confirm whether the sale was saved. Check transaction status before taking another step.",
-      );
+          : "Could not confirm whether the sale was saved. Check transaction status before taking another step.";
+      savePendingRecovery({ ...pendingRecord, lastError: errorMsg });
+      setPendingRecoveries(loadPendingRecoveries());
+      setSelectedRecoveryRef(pendingRecord.reference);
+      setRecoveryError(errorMsg);
       setPreparedCheckout(null);
       setLines([]);
       setPrepareKey(null);
       setPrepareSignature(null);
+      setCashInput("");
+      setConfirmNoCashChecked(false);
+      setStep("select");
     } finally {
+      activeConfirmingRef.current = null;
+      setActiveConfirming(null);
       setConfirmingSale(false);
     }
   }
 
   async function handleCheckRecoveryStatus() {
-    if (!pendingRecovery) return;
+    const target = activeRecovery;
+    if (!target) return;
     setCheckingStatus(true);
     setRecoveryError(null);
     try {
       const lookup = await api<CheckoutLookupView>(
-        `/api/pos/checkouts/${encodeURIComponent(pendingRecovery.reference)}`,
+        `/api/pos/checkouts/${encodeURIComponent(target.reference)}`,
       );
       const updated: PendingCheckoutRecovery = {
-        ...pendingRecovery,
+        ...target,
         lastLookup: lookup,
         lastError: null,
       };
       savePendingRecovery(updated);
-      setPendingRecovery(updated);
+      setPendingRecoveries(loadPendingRecoveries());
+      setSelectedRecoveryRef(updated.reference);
     } catch (err) {
       setRecoveryError(
         err instanceof ApiError
@@ -633,37 +885,48 @@ export function PosPage() {
   }
 
   async function handleRetryRecovery() {
-    if (!pendingRecovery) return;
+    const target = activeRecovery;
+    if (!target) return;
+    activeConfirmingRef.current = target;
+    setActiveConfirming(target);
     setRetryingRecovery(true);
     setRecoveryError(null);
     try {
       const confirmed = await api<ConfirmSaleResponse>(
-        `/api/pos/checkouts/${encodeURIComponent(pendingRecovery.reference)}/confirm`,
+        `/api/pos/checkouts/${encodeURIComponent(target.reference)}/confirm`,
         {
           method: "POST",
           body: {
-            cashReceivedCentavos: pendingRecovery.cashReceivedCentavos,
-            items: pendingRecovery.items,
-            expectedTotalCentavos: pendingRecovery.totalCentavos,
+            cashReceivedCentavos: target.cashReceivedCentavos,
+            items: target.items,
+            expectedTotalCentavos: target.totalCentavos,
           },
         },
       );
-      clearPendingRecovery();
+      removePendingRecovery(target.reference);
+      activeConfirmingRef.current = null;
+      setActiveConfirming(null);
       clearUnpaidCart(user.username);
-      setPendingRecovery(null);
+      const remaining = loadPendingRecoveries();
+      setPendingRecoveries(remaining);
+      setSelectedRecoveryRef(remaining[0]?.reference ?? null);
       setLines([]);
       setPreparedCheckout(null);
       setPrepareKey(null);
       setPrepareSignature(null);
       setCashInput("");
+      setConfirmNoCashChecked(false);
       setLastSavedSale(confirmed.sale);
       setStep("select");
       setHistoryRefreshSignal((n) => n + 1);
       await loadPosState();
     } catch (err) {
+      activeConfirmingRef.current = null;
+      setActiveConfirming(null);
       if (err instanceof ApiError && err.code === "CHECKOUT_REVIEW_REQUIRED") {
-        const updated = persistReviewRequiredFromError(pendingRecovery, err);
-        if (updated) setPendingRecovery(updated);
+        persistReviewRequiredFromError(target, err);
+        setPendingRecoveries(loadPendingRecoveries());
+        setSelectedRecoveryRef(target.reference);
         setRecoveryError(err.message);
         return;
       }
@@ -673,37 +936,35 @@ export function PosPage() {
           : "Retry could not reach the server. Check transaction status before trying again.",
       );
     } finally {
+      activeConfirmingRef.current = null;
+      setActiveConfirming(null);
       setRetryingRecovery(false);
     }
   }
 
-  function handleContinueSavedSale(sale: SaleView) {
-    clearPendingRecovery();
+  function handleContinueSavedSale(reference: string, sale: SaleView) {
+    removePendingRecovery(reference);
     clearUnpaidCart(user.username);
-    setPendingRecovery(null);
+    const remaining = loadPendingRecoveries();
+    setPendingRecoveries(remaining);
+    setSelectedRecoveryRef(remaining[0]?.reference ?? null);
     setRecoveryError(null);
     setLines([]);
     setPreparedCheckout(null);
     setPrepareKey(null);
     setPrepareSignature(null);
     setCashInput("");
+    setConfirmNoCashChecked(false);
     setLastSavedSale(sale);
     setStep("select");
     setHistoryRefreshSignal((n) => n + 1);
     void loadPosState();
   }
 
-  const activeStepperNumber = pendingRecovery ? 3 : step === "review" ? 2 : 1;
-
-  const localBlockingRecovery =
-    pendingRecovery && dayStatus?.day && pendingRecovery.businessDate === dayStatus.day.businessDate
-      ? pendingRecovery
-      : null;
-
-  const serverUnresolved = dayStatus?.unresolvedCheckouts ?? [];
-  const hasBlockingUnresolved = serverUnresolved.length > 0 || localBlockingRecovery !== null;
-  const serverDrafts = dayStatus?.unpaidDrafts ?? [];
-  const draftsNeedAck = serverDrafts.length > 0 && !endDayClearDrafts;
+  const activeStepperNumber = showRecoveryScreen ? 3 : step === "review" ? 2 : 1;
+  const hasBlockingUnresolved = endDayGuard.blocked;
+  const clearableDrafts = endDayGuard.clearableDrafts;
+  const draftsNeedAck = clearableDrafts.length > 0 && !endDayClearDrafts;
 
   return (
     <AppShell
@@ -771,8 +1032,11 @@ export function PosPage() {
               {formatCentavos(dayStatus.day.summary.totalSalesCentavos)})
             </span>
           )}
-          {pendingRecovery && (
-            <span className="pill pill--overdue">Recovery active: {pendingRecovery.reference}</span>
+          {pendingRecoveries.length === 1 && (
+            <span className="pill pill--overdue">Recovery active: {pendingRecoveries[0]!.reference}</span>
+          )}
+          {pendingRecoveries.length > 1 && (
+            <span className="pill pill--overdue">{pendingRecoveries.length} recoveries active</span>
           )}
         </div>
       </div>
@@ -827,17 +1091,34 @@ export function PosPage() {
             </li>
           </ol>
 
-          {pendingRecovery ? (
-            <CheckoutRecovery
-              record={pendingRecovery}
-              currentUsername={user.username}
-              checking={checkingStatus}
-              retrying={retryingRecovery}
-              errorMessage={recoveryError}
-              onCheckStatus={() => void handleCheckRecoveryStatus()}
-              onRetry={() => void handleRetryRecovery()}
-              onContinueSaved={handleContinueSavedSale}
-            />
+          {showRecoveryScreen && activeRecovery ? (
+            <>
+              {lastSavedSale && (
+                <div className="callout callout--success" role="status">
+                  <p className="callout__title">Sale {lastSavedSale.reference} saved successfully</p>
+                  <p className="callout__body">
+                    {formatCentavos(lastSavedSale.cashReceivedCentavos)} received for{" "}
+                    {formatCentavos(lastSavedSale.totalCentavos)} total. Remaining pending transaction(s) on this
+                    workstation still require status verification below.
+                  </p>
+                </div>
+              )}
+              <CheckoutRecovery
+                record={activeRecovery}
+                allRecoveries={pendingRecoveries}
+                currentUsername={user.username}
+                checking={checkingStatus}
+                retrying={retryingRecovery}
+                errorMessage={recoveryError}
+                onSelectReference={(ref) => {
+                  setSelectedRecoveryRef(ref);
+                  setRecoveryError(null);
+                }}
+                onCheckStatus={() => void handleCheckRecoveryStatus()}
+                onRetry={() => void handleRetryRecovery()}
+                onContinueSaved={handleContinueSavedSale}
+              />
+            </>
           ) : (
             <>
               {lastClosedSummary && dayStatus?.state === "CLOSED" && (
@@ -903,6 +1184,44 @@ export function PosPage() {
                       </button>
                     )}
                   </div>
+                </div>
+              )}
+
+              {step === "select" && serverOnlyUnresolved.length > 0 && (
+                <div className="callout callout--warning" role="status">
+                  <p className="callout__title">Cash-protected checkout(s) awaiting completion or review</p>
+                  <p className="callout__body">
+                    {serverOnlyUnresolved.map((c) => {
+                      const canResumeHere =
+                        c.status === "PAYMENT_PENDING" &&
+                        c.createdBy.toLowerCase() === user.username.toLowerCase() &&
+                        dayStatus?.state === "OPEN" &&
+                        c.businessDate === dayStatus.todayDate;
+                      return (
+                        <span key={c.reference} style={{ display: "block", marginTop: "6px" }}>
+                          <strong className="mono-ref">{c.reference}</strong> ·{" "}
+                          {formatCentavos(c.totalCentavos)} ({c.createdBy}) —{" "}
+                          {c.status === "PAYMENT_PENDING"
+                            ? canResumeHere
+                              ? "Cash payment started"
+                              : "Started by another operator or from a previous day"
+                            : c.resolutionReason ?? "Owner review required"}
+                          {canResumeHere && (
+                            <>
+                              {" "}
+                              <button
+                                type="button"
+                                className="button button--ghost button--sm"
+                                onClick={() => handleResumeServerPending(c)}
+                              >
+                                Resume cash payment
+                              </button>
+                            </>
+                          )}
+                        </span>
+                      );
+                    })}
+                  </p>
                 </div>
               )}
 
@@ -1113,7 +1432,7 @@ export function PosPage() {
                           disabled={!dayStatus?.canSell || lines.length === 0 || preparingCheckout}
                           onClick={() => void handleProceedToCash()}
                         >
-                          {preparingCheckout ? "Preparing checkout…" : "Review & receive cash"}
+                          {preparingCheckout ? "Preparing checkout…" : "Review checkout"}
                         </button>
                         {lines.length > 0 && (
                           <button
@@ -1143,113 +1462,189 @@ export function PosPage() {
               ) : (
                 <div className="pos-layout">
                   <div className="pos-main">
-                    <article className="card pos-cash-card">
-                      <div className="detail-card__header">
-                        <h2>Review &amp; receive cash</h2>
-                        <span className="pill pill--neutral mono-ref">{preparedCheckout?.reference}</span>
-                      </div>
-
-                      <div className="callout callout--info">
-                        <p className="callout__title">Count the cash before confirming</p>
-                        <p className="callout__body">
-                          Confirm only after receiving payment from the customer. Refill containers after the sale is
-                          saved.
-                        </p>
-                      </div>
-
-                      {saleError && (
-                        <div className="alert alert--error" role="alert">
-                          {saleError}
+                    {preparedCheckout?.status !== "PAYMENT_PENDING" ? (
+                      <article className="card pos-cash-card">
+                        <div className="detail-card__header">
+                          <h2>Review checkout</h2>
+                          <div className="summary-pills">
+                            <span className="pill pill--neutral">Unpaid draft</span>
+                            <span className="pill pill--neutral mono-ref">{preparedCheckout?.reference}</span>
+                          </div>
                         </div>
-                      )}
 
-                      <label className="field">
-                        <span>Cash received (₱)</span>
-                        <div className="cash-input-wrap">
-                          <span className="cash-input-prefix" aria-hidden="true">
-                            ₱
-                          </span>
-                          <input
-                            type="text"
-                            inputMode="decimal"
-                            aria-label="Cash received"
-                            placeholder="0.00"
-                            value={cashInput}
-                            onChange={(event) => {
-                              setCashInput(event.target.value);
-                              setSaleError(null);
-                            }}
-                          />
+                        <div className="callout callout--info">
+                          <p className="callout__title">Verify the order before taking cash</p>
+                          <p className="callout__body">
+                            Check the refills and total with the customer first. Click Start cash payment before
+                            accepting cash.
+                          </p>
                         </div>
-                      </label>
 
-                      <div className="quick-tender-row" aria-label="Quick cash amounts">
-                        <button
-                          type="button"
-                          className="button button--ghost button--sm"
-                          onClick={() => setCashInput((reviewTotalCentavos / 100).toFixed(2))}
-                        >
-                          Exact amount
-                        </button>
-                        {[50, 100, 200, 500, 1000].map((peso) => (
+                        {saleError && (
+                          <div className="alert alert--error" role="alert">
+                            {saleError}
+                          </div>
+                        )}
+
+                        <div className="pos-summary-actions">
                           <button
-                            key={peso}
+                            type="button"
+                            className="button button--primary button--block"
+                            disabled={startingPayment || cancellingDraft}
+                            onClick={() => void handleBeginPayment()}
+                          >
+                            {startingPayment
+                              ? "Starting cash payment…"
+                              : `Start cash payment · ${formatCentavos(reviewTotalCentavos)}`}
+                          </button>
+                          <button
+                            type="button"
+                            className="button button--ghost button--block"
+                            disabled={startingPayment || cancellingDraft}
+                            onClick={() => void handleBackToSelection()}
+                          >
+                            {cancellingDraft ? "Returning to refills…" : "Back to refill selection"}
+                          </button>
+                        </div>
+                      </article>
+                    ) : (
+                      <article className="card pos-cash-card">
+                        <div className="detail-card__header">
+                          <h2>Review &amp; receive cash</h2>
+                          <div className="summary-pills">
+                            <span className="pill pill--scheduled">Cash payment started</span>
+                            <span className="pill pill--neutral mono-ref">{preparedCheckout.reference}</span>
+                          </div>
+                        </div>
+
+                        {pendingRecoveries.some((r) => r.reference !== preparedCheckout.reference) &&
+                          !activeConfirming && (
+                            <div className="callout callout--warning" role="status">
+                              <p className="callout__title">Another recovery is pending on this device</p>
+                              <p className="callout__body">
+                                Finish or cancel this cash payment ({preparedCheckout.reference}), then return to resolve
+                                any earlier pending reference.
+                              </p>
+                            </div>
+                          )}
+
+                        <div className="callout callout--info">
+                          <p className="callout__title">Count the cash before confirming</p>
+                          <p className="callout__body">
+                            Confirm only after receiving payment from the customer. Refill containers after the sale is
+                            saved.
+                          </p>
+                        </div>
+
+                        {saleError && (
+                          <div className="alert alert--error" role="alert">
+                            {saleError}
+                          </div>
+                        )}
+
+                        <label className="field">
+                          <span>Cash received (₱)</span>
+                          <div className="cash-input-wrap">
+                            <span className="cash-input-prefix" aria-hidden="true">
+                              ₱
+                            </span>
+                            <input
+                              type="text"
+                              inputMode="decimal"
+                              aria-label="Cash received"
+                              placeholder="0.00"
+                              disabled={confirmingSale || cancellingDraft}
+                              value={cashInput}
+                              onChange={(event) => {
+                                setCashInput(event.target.value);
+                                setSaleError(null);
+                              }}
+                            />
+                          </div>
+                        </label>
+
+                        <div className="quick-tender-row" aria-label="Quick cash amounts">
+                          <button
                             type="button"
                             className="button button--ghost button--sm"
-                            onClick={() => setCashInput(peso.toFixed(2))}
+                            disabled={confirmingSale || cancellingDraft}
+                            onClick={() => setCashInput((reviewTotalCentavos / 100).toFixed(2))}
                           >
-                            ₱{peso.toLocaleString("en-US")}
+                            Exact amount
                           </button>
-                        ))}
-                      </div>
+                          {[50, 100, 200, 500, 1000].map((peso) => (
+                            <button
+                              key={peso}
+                              type="button"
+                              className="button button--ghost button--sm"
+                              disabled={confirmingSale || cancellingDraft}
+                              onClick={() => setCashInput(peso.toFixed(2))}
+                            >
+                              ₱{peso.toLocaleString("en-US")}
+                            </button>
+                          ))}
+                        </div>
 
-                      {parsedCashCentavos === null ? (
-                        <div className="change-box change-box--idle" role="status">
-                          <span className="muted-sm">
-                            Enter cash received covering at least {formatCentavos(reviewTotalCentavos)}.
-                          </span>
-                        </div>
-                      ) : !cashSummary.sufficient ? (
-                        <div className="change-box change-box--short" role="status">
-                          <strong>Insufficient cash</strong>
-                          <span>
-                            Need {formatCentavos(cashSummary.shortfallCentavos)} more to cover{" "}
-                            {formatCentavos(reviewTotalCentavos)}.
-                          </span>
-                        </div>
-                      ) : (
-                        <div className="change-box change-box--ok" role="status">
-                          <span className="change-box__label">Change to give customer</span>
-                          <strong className="change-box__value">
-                            {formatCentavos(cashSummary.changeCentavos!)}
-                          </strong>
-                          <span className="muted-sm">
-                            {formatCentavos(parsedCashCentavos)} cash − {formatCentavos(reviewTotalCentavos)} total
-                          </span>
-                        </div>
-                      )}
+                        {parsedCashCentavos === null ? (
+                          <div className="change-box change-box--idle" role="status">
+                            <span className="muted-sm">
+                              Enter cash received covering at least {formatCentavos(reviewTotalCentavos)}.
+                            </span>
+                          </div>
+                        ) : !cashSummary.sufficient ? (
+                          <div className="change-box change-box--short" role="status">
+                            <strong>Insufficient cash</strong>
+                            <span>
+                              Need {formatCentavos(cashSummary.shortfallCentavos)} more to cover{" "}
+                              {formatCentavos(reviewTotalCentavos)}.
+                            </span>
+                          </div>
+                        ) : (
+                          <div className="change-box change-box--ok" role="status">
+                            <span className="change-box__label">Change to give customer</span>
+                            <strong className="change-box__value">
+                              {formatCentavos(cashSummary.changeCentavos!)}
+                            </strong>
+                            <span className="muted-sm">
+                              {formatCentavos(parsedCashCentavos)} cash − {formatCentavos(reviewTotalCentavos)} total
+                            </span>
+                          </div>
+                        )}
 
-                      <div className="pos-summary-actions">
-                        <button
-                          type="button"
-                          className="button button--primary button--block"
-                          disabled={!cashSummary.sufficient || confirmingSale || cancellingDraft}
-                          onClick={() => void handleConfirmPayment()}
-                        >
-                          {confirmingSale
-                            ? "Saving sale…"
-                            : `Confirm payment · ${formatCentavos(reviewTotalCentavos)}`}
-                        </button>
-                        <button
-                          type="button"
-                          className="button button--ghost button--block"
-                          disabled={confirmingSale || cancellingDraft}
-                          onClick={() => void handleBackToSelection()}
-                        >
-                          {cancellingDraft ? "Returning to refills…" : "Back to refill selection"}
-                        </button>
-                      </div>
-                    </article>
+                        <div className="pos-summary-actions">
+                          <button
+                            type="button"
+                            className="button button--primary button--block"
+                            disabled={!cashSummary.sufficient || confirmingSale || cancellingDraft}
+                            onClick={() => void handleConfirmPayment()}
+                          >
+                            {confirmingSale
+                              ? "Saving sale…"
+                              : `Confirm payment · ${formatCentavos(reviewTotalCentavos)}`}
+                          </button>
+
+                          <div className="cancel-unpaid-box">
+                            <label className="checkbox-field">
+                              <input
+                                type="checkbox"
+                                checked={confirmNoCashChecked}
+                                disabled={confirmingSale || cancellingDraft}
+                                onChange={(event) => setConfirmNoCashChecked(event.target.checked)}
+                              />
+                              <span>Confirm no cash was received from the customer</span>
+                            </label>
+                            <button
+                              type="button"
+                              className="button button--ghost button--block"
+                              disabled={!confirmNoCashChecked || confirmingSale || cancellingDraft}
+                              onClick={() => void handleCancelPaymentPending()}
+                            >
+                              {cancellingDraft ? "Cancelling unpaid checkout…" : "Cancel unpaid checkout"}
+                            </button>
+                          </div>
+                        </div>
+                      </article>
+                    )}
                   </div>
 
                   <aside className="side-stack">
@@ -1290,14 +1685,22 @@ export function PosPage() {
                           <dt>Total amount</dt>
                           <dd>{formatCentavos(reviewTotalCentavos)}</dd>
                         </div>
-                        <div className="detail-list__row">
-                          <dt>Cash received</dt>
-                          <dd>{parsedCashCentavos !== null ? formatCentavos(parsedCashCentavos) : "—"}</dd>
-                        </div>
-                        <div className="detail-list__row">
-                          <dt>Change</dt>
-                          <dd>{cashSummary.changeCentavos !== null ? formatCentavos(cashSummary.changeCentavos) : "—"}</dd>
-                        </div>
+                        {preparedCheckout?.status === "PAYMENT_PENDING" && (
+                          <>
+                            <div className="detail-list__row">
+                              <dt>Cash received</dt>
+                              <dd>{parsedCashCentavos !== null ? formatCentavos(parsedCashCentavos) : "—"}</dd>
+                            </div>
+                            <div className="detail-list__row">
+                              <dt>Change</dt>
+                              <dd>
+                                {cashSummary.changeCentavos !== null
+                                  ? formatCentavos(cashSummary.changeCentavos)
+                                  : "—"}
+                              </dd>
+                            </div>
+                          </>
+                        )}
                       </dl>
                     </article>
 
@@ -1505,27 +1908,20 @@ export function PosPage() {
                 <p className="callout__title">Unresolved checkouts block End Day</p>
                 <p className="callout__body">Resolve pending or review-required transactions before closing this day:</p>
                 <ul className="conflict-list">
-                  {serverUnresolved.map((c) => (
-                    <li key={c.reference}>
-                      <span className="mono-ref">{c.reference}</span> — {c.resolutionReason ?? c.status}
+                  {endDayGuard.blockingEntries.map((entry) => (
+                    <li key={entry.reference}>
+                      <span className="mono-ref">{entry.reference}</span> — {entry.label}
                     </li>
                   ))}
-                  {localBlockingRecovery &&
-                    !serverUnresolved.some((c) => c.reference === localBlockingRecovery.reference) && (
-                      <li>
-                        <span className="mono-ref">{localBlockingRecovery.reference}</span> — Pending workstation
-                        payment recovery ({localBlockingRecovery.initiatedBy})
-                      </li>
-                    )}
                 </ul>
               </div>
             )}
 
-            {!hasBlockingUnresolved && serverDrafts.length > 0 && (
+            {!hasBlockingUnresolved && clearableDrafts.length > 0 && (
               <div className="callout callout--warning" role="status">
                 <p className="callout__title">Unpaid checkout draft(s) open</p>
                 <ul className="conflict-list">
-                  {serverDrafts.map((draft) => (
+                  {clearableDrafts.map((draft) => (
                     <li key={draft.reference}>
                       <span className="mono-ref">{draft.reference}</span> · {formatCentavos(draft.totalCentavos)} (
                       {draft.createdBy})

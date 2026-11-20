@@ -10,13 +10,15 @@ import {
 
 export interface CheckoutRecoveryProps {
   record: PendingCheckoutRecovery;
+  allRecoveries?: PendingCheckoutRecovery[];
   currentUsername: string;
   checking: boolean;
   retrying: boolean;
   errorMessage: string | null;
+  onSelectReference?: (reference: string) => void;
   onCheckStatus(): void;
   onRetry(): void;
-  onContinueSaved(sale: SaleView): void;
+  onContinueSaved(reference: string, sale: SaleView): void;
 }
 
 function pillClassForTone(tone: RecoveryTone): string {
@@ -67,10 +69,12 @@ function StatusBadgeIcon({ tone }: { tone: RecoveryTone }) {
 
 export function CheckoutRecovery({
   record,
+  allRecoveries,
   currentUsername,
   checking,
   retrying,
   errorMessage,
+  onSelectReference,
   onCheckStatus,
   onRetry,
   onContinueSaved,
@@ -80,6 +84,42 @@ export function CheckoutRecovery({
   return (
     <div className="pos-layout">
       <div className="recovery-main">
+        {allRecoveries && allRecoveries.length > 1 && onSelectReference && (
+          <div
+            className="callout callout--warning recovery-switcher"
+            role="region"
+            aria-label="Pending checkouts on this device"
+          >
+            <p className="callout__title">
+              {allRecoveries.length} pending recoveries on this workstation
+            </p>
+            <p className="callout__body">
+              Select each transaction reference below to check its status and finish or verify it separately.
+            </p>
+            <div className="recovery-switcher__list">
+              {allRecoveries.map((item) => {
+                const selected = item.reference === record.reference;
+                return (
+                  <button
+                    key={item.reference}
+                    type="button"
+                    aria-pressed={selected}
+                    className={`recovery-switcher__btn ${
+                      selected ? "recovery-switcher__btn--active" : ""
+                    }`}
+                    onClick={() => onSelectReference(item.reference)}
+                  >
+                    <span className="mono-ref">{item.reference}</span>
+                    <span className="muted-sm">
+                      {formatCentavos(item.totalCentavos)} · {item.initiatedBy}
+                    </span>
+                  </button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
         <article className="card recovery-card" aria-live="polite">
           <div className="recovery-card__header">
             <StatusBadgeIcon tone={presentation.statusPillTone} />
@@ -150,7 +190,7 @@ export function CheckoutRecovery({
               <button
                 type="button"
                 className="button button--primary button--block"
-                onClick={() => onContinueSaved(presentation.sale!)}
+                onClick={() => onContinueSaved(record.reference, presentation.sale!)}
               >
                 Continue with saved sale
               </button>

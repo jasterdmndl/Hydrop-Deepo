@@ -9,7 +9,12 @@ import { createHash } from "node:crypto";
 export type WaterType = "PURIFIED" | "ALKALINE";
 export type ItemKind = "STANDARD" | "CUSTOM";
 export type DayState = "NOT_STARTED" | "OPEN" | "CLOSED" | "PREVIOUS_DAY_OPEN";
-export type CheckoutStatus = "DRAFT" | "SAVED" | "REVIEW_REQUIRED" | "CANCELLED_DRAFT";
+export type CheckoutStatus =
+  | "DRAFT"
+  | "PAYMENT_PENDING"
+  | "SAVED"
+  | "REVIEW_REQUIRED"
+  | "CANCELLED_DRAFT";
 export type SaleStatus = "ACTIVE" | "VOIDED";
 export type RecoveryState = "SAVED" | "SAFE_TO_RETRY" | "UNRESOLVED" | "REVIEW_REQUIRED";
 
@@ -115,6 +120,7 @@ export interface CheckoutView {
   totalVolumeLiters: number;
   cashReceivedCentavos: number | null;
   changeCentavos: number | null;
+  paymentStartedAt: string | null;
   paymentRecordedAt: string | null;
   resolutionReason: string | null;
   items: QuoteLineItem[];

@@ -3,7 +3,12 @@
 export type WaterType = "PURIFIED" | "ALKALINE";
 export type ItemKind = "STANDARD" | "CUSTOM";
 export type DayState = "NOT_STARTED" | "OPEN" | "CLOSED" | "PREVIOUS_DAY_OPEN";
-export type CheckoutStatus = "DRAFT" | "SAVED" | "REVIEW_REQUIRED" | "CANCELLED_DRAFT";
+export type CheckoutStatus =
+  | "DRAFT"
+  | "PAYMENT_PENDING"
+  | "SAVED"
+  | "REVIEW_REQUIRED"
+  | "CANCELLED_DRAFT";
 export type SaleStatus = "ACTIVE" | "VOIDED";
 export type RecoveryState = "SAVED" | "SAFE_TO_RETRY" | "UNRESOLVED" | "REVIEW_REQUIRED";
 
@@ -81,6 +86,7 @@ export interface CheckoutView {
   totalVolumeLiters: number;
   cashReceivedCentavos: number | null;
   changeCentavos: number | null;
+  paymentStartedAt: string | null;
   paymentRecordedAt: string | null;
   resolutionReason: string | null;
   items: QuoteLineItem[];
@@ -133,6 +139,11 @@ export interface CheckoutLookupView {
 }
 
 export interface PrepareCheckoutResponse {
+  checkout: CheckoutView;
+  replayed: boolean;
+}
+
+export interface BeginPaymentResponse {
   checkout: CheckoutView;
   replayed: boolean;
 }
@@ -235,12 +246,15 @@ export interface RecoveryPresentation {
 }
 
 export interface StorageLike {
+  readonly length: number;
+  key(index: number): string | null;
   getItem(key: string): string | null;
   setItem(key: string, value: string): void;
   removeItem(key: string): void;
 }
 
-export const PENDING_RECOVERY_STORAGE_KEY = "hydrop.pos.pendingRecovery.v1";
+export const PENDING_RECOVERY_KEY_PREFIX = "hydrop.pos.pendingRecovery.v2:";
+export const LEGACY_PENDING_RECOVERY_STORAGE_KEY = "hydrop.pos.pendingRecovery.v1";
 export const UNPAID_CART_STORAGE_PREFIX = "hydrop.pos.unpaidCart.v1:";
 
 const MANILA_OFFSET_MS = 8 * 60 * 60 * 1000;
@@ -382,27 +396,28 @@ function browserStorage(kind: "local" | "session"): StorageLike | null {
   }
 }
 
-export function savePendingRecovery(
-  record: PendingCheckoutRecovery,
-  storage: StorageLike | null = browserStorage("local"),
-): void {
-  if (!storage) return;
-  try {
-    storage.setItem(PENDING_RECOVERY_STORAGE_KEY, JSON.stringify(record));
-  } catch {
-    // Ignore storage quota errors in best-effort persistence.
-  }
+export function pendingRecoveryStorageKey(reference: string): string {
+  return `${PENDING_RECOVERY_KEY_PREFIX}${reference.trim().toUpperCase()}`;
 }
 
-export function loadPendingRecovery(
-  storage: StorageLike | null = browserStorage("local"),
-): PendingCheckoutRecovery | null {
-  if (!storage) return null;
+export function isPendingRecoveryStorageKey(key: string | null): boolean {
+  if (key === null) return true;
+  return (
+    key.startsWith(PENDING_RECOVERY_KEY_PREFIX) ||
+    key === LEGACY_PENDING_RECOVERY_STORAGE_KEY
+  );
+}
+
+function parsePendingRecovery(raw: string | null): PendingCheckoutRecovery | null {
+  if (!raw) return null;
   try {
-    const raw = storage.getItem(PENDING_RECOVERY_STORAGE_KEY);
-    if (!raw) return null;
     const parsed = JSON.parse(raw) as PendingCheckoutRecovery;
-    if (!parsed || typeof parsed.reference !== "string" || typeof parsed.initiatedBy !== "string") {
+    if (
+      !parsed ||
+      typeof parsed.reference !== "string" ||
+      !parsed.reference.trim() ||
+      typeof parsed.initiatedBy !== "string"
+    ) {
       return null;
     }
     return parsed;
@@ -411,10 +426,79 @@ export function loadPendingRecovery(
   }
 }
 
-export function clearPendingRecovery(storage: StorageLike | null = browserStorage("local")): void {
-  if (!storage) return;
+export function savePendingRecovery(
+  record: PendingCheckoutRecovery,
+  storage: StorageLike | null = browserStorage("local"),
+): void {
+  if (!storage || !record.reference.trim()) return;
   try {
-    storage.removeItem(PENDING_RECOVERY_STORAGE_KEY);
+    storage.setItem(pendingRecoveryStorageKey(record.reference), JSON.stringify(record));
+  } catch {
+    // Ignore storage quota errors in best-effort persistence.
+  }
+}
+
+export function loadPendingRecoveryByReference(
+  reference: string,
+  storage: StorageLike | null = browserStorage("local"),
+): PendingCheckoutRecovery | null {
+  if (!storage || !reference.trim()) return null;
+  const normalized = reference.trim().toUpperCase();
+  try {
+    const direct = parsePendingRecovery(storage.getItem(pendingRecoveryStorageKey(normalized)));
+    if (direct) return direct;
+    const legacy = parsePendingRecovery(storage.getItem(LEGACY_PENDING_RECOVERY_STORAGE_KEY));
+    if (legacy && legacy.reference.trim().toUpperCase() === normalized) {
+      return legacy;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+export function loadPendingRecoveries(
+  storage: StorageLike | null = browserStorage("local"),
+): PendingCheckoutRecovery[] {
+  if (!storage) return [];
+  try {
+    const byRef = new Map<string, PendingCheckoutRecovery>();
+    for (let i = 0; i < storage.length; i += 1) {
+      const key = storage.key(i);
+      if (!key || !key.startsWith(PENDING_RECOVERY_KEY_PREFIX)) continue;
+      const parsed = parsePendingRecovery(storage.getItem(key));
+      if (parsed) {
+        byRef.set(parsed.reference.trim().toUpperCase(), parsed);
+      }
+    }
+    const legacy = parsePendingRecovery(storage.getItem(LEGACY_PENDING_RECOVERY_STORAGE_KEY));
+    if (legacy) {
+      const refKey = legacy.reference.trim().toUpperCase();
+      if (!byRef.has(refKey)) {
+        byRef.set(refKey, legacy);
+      }
+    }
+    return Array.from(byRef.values()).sort((a, b) => {
+      if (a.attemptedAt !== b.attemptedAt) return a.attemptedAt < b.attemptedAt ? -1 : 1;
+      return a.reference.localeCompare(b.reference);
+    });
+  } catch {
+    return [];
+  }
+}
+
+export function removePendingRecovery(
+  reference: string,
+  storage: StorageLike | null = browserStorage("local"),
+): void {
+  if (!storage || !reference.trim()) return;
+  const normalized = reference.trim().toUpperCase();
+  try {
+    storage.removeItem(pendingRecoveryStorageKey(normalized));
+    const legacy = parsePendingRecovery(storage.getItem(LEGACY_PENDING_RECOVERY_STORAGE_KEY));
+    if (legacy && legacy.reference.trim().toUpperCase() === normalized) {
+      storage.removeItem(LEGACY_PENDING_RECOVERY_STORAGE_KEY);
+    }
   } catch {
     // Ignore storage access errors.
   }
@@ -671,4 +755,75 @@ export function stationStatusFromDay(day: PosDayResponse): {
         detail: "Start Day in POS when ready.",
       };
   }
+}
+
+export interface EndDayBlockingEntry {
+  reference: string;
+  label: string;
+  source: "server" | "local-confirming" | "local-recovery";
+}
+
+export interface EndDayGuardResult {
+  blocked: boolean;
+  blockingEntries: EndDayBlockingEntry[];
+  clearableDrafts: CheckoutView[];
+}
+
+export function evaluateEndDayGuard(input: {
+  businessDate: string | null;
+  serverUnresolved: CheckoutView[];
+  serverUnpaidDrafts: CheckoutView[];
+  localPendingRecoveries: PendingCheckoutRecovery[];
+  activeConfirming: PendingCheckoutRecovery | null;
+}): EndDayGuardResult {
+  const blockingEntries: EndDayBlockingEntry[] = [];
+  const blockingRefs = new Set<string>();
+  const matchesDay = (date: string) => input.businessDate === null || date === input.businessDate;
+
+  if (input.activeConfirming && matchesDay(input.activeConfirming.businessDate)) {
+    blockingEntries.push({
+      reference: input.activeConfirming.reference,
+      label: `Confirmation in progress (${input.activeConfirming.initiatedBy})`,
+      source: "local-confirming",
+    });
+    blockingRefs.add(input.activeConfirming.reference.trim().toUpperCase());
+  }
+
+  for (const recovery of input.localPendingRecoveries) {
+    const refKey = recovery.reference.trim().toUpperCase();
+    if (!matchesDay(recovery.businessDate) || blockingRefs.has(refKey)) {
+      continue;
+    }
+    blockingEntries.push({
+      reference: recovery.reference,
+      label: `Pending workstation payment recovery (${recovery.initiatedBy})`,
+      source: "local-recovery",
+    });
+    blockingRefs.add(refKey);
+  }
+
+  for (const checkout of input.serverUnresolved) {
+    const refKey = checkout.reference.trim().toUpperCase();
+    if (blockingRefs.has(refKey)) continue;
+    const label =
+      checkout.status === "PAYMENT_PENDING"
+        ? `Cash payment started (${checkout.createdBy})`
+        : checkout.resolutionReason ?? checkout.status;
+    blockingEntries.push({
+      reference: checkout.reference,
+      label,
+      source: "server",
+    });
+    blockingRefs.add(refKey);
+  }
+
+  const clearableDrafts = input.serverUnpaidDrafts.filter(
+    (d) => !blockingRefs.has(d.reference.trim().toUpperCase()),
+  );
+
+  return {
+    blocked: blockingEntries.length > 0,
+    blockingEntries,
+    clearableDrafts,
+  };
 }

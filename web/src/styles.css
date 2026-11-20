@@ -2844,3 +2844,41 @@ textarea:focus-visible {
     grid-template-columns: minmax(0, 1fr);
   }
 }
+
+.recovery-switcher__list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.recovery-switcher__btn {
+  min-height: 44px;
+  padding: 8px 12px;
+  border-radius: var(--radius-md);
+  border: 1px solid #f59e0b;
+  background: #ffffff;
+  font: inherit;
+  color: var(--navy-900);
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  cursor: pointer;
+}
+
+.recovery-switcher__btn--active {
+  border-color: var(--blue-600);
+  background: var(--blue-50);
+  box-shadow: inset 0 0 0 1px var(--blue-600);
+}
+
+.cancel-unpaid-box {
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: #f8fafc;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}

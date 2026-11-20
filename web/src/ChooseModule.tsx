@@ -5,7 +5,9 @@ import { LogoutErrorBanner, useAuth, useSignedInUser } from "./auth/AuthContext"
 import { idlePhase } from "./auth/idle";
 import type { RemindersResponse } from "./calendar/calendarView";
 import {
-  loadPendingRecovery,
+  isPendingRecoveryStorageKey,
+  loadPendingRecoveries,
+  type PendingCheckoutRecovery,
   type PosDayResponse,
   stationStatusFromDay,
 } from "./pos/posRecovery";
@@ -430,7 +432,9 @@ export function ChooseModule() {
   const [remindersError, setRemindersError] = useState(false);
   const [posDay, setPosDay] = useState<PosDayResponse | null>(null);
   const [posDayError, setPosDayError] = useState(false);
-  const [pendingRecovery] = useState(() => loadPendingRecovery());
+  const [pendingRecoveries, setPendingRecoveries] = useState<PendingCheckoutRecovery[]>(() =>
+    loadPendingRecoveries(),
+  );
 
   const loadReminders = useCallback(async () => {
     setRemindersError(false);
@@ -453,6 +457,14 @@ export function ChooseModule() {
   useEffect(() => {
     void loadReminders();
     void loadPosDay();
+    setPendingRecoveries(loadPendingRecoveries());
+    const onStorage = (event: StorageEvent) => {
+      if (isPendingRecoveryStorageKey(event.key)) {
+        setPendingRecoveries(loadPendingRecoveries());
+      }
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
   }, [loadReminders, loadPosDay]);
 
   const stationStatus = posDay ? stationStatusFromDay(posDay) : null;
@@ -523,8 +535,16 @@ export function ChooseModule() {
                     ) : (
                       <span className="module-card__note">Checking station day…</span>
                     )}
-                    {pendingRecovery && (
-                      <span className="pill pill--overdue">Pending recovery: {pendingRecovery.reference}</span>
+                    {pendingRecoveries.length === 1 && (
+                      <span className="pill pill--overdue">
+                        Pending recovery: {pendingRecoveries[0]!.reference}
+                      </span>
+                    )}
+                    {pendingRecoveries.length > 1 && (
+                      <span className="pill pill--overdue">
+                        {pendingRecoveries.length} pending recoveries (
+                        {pendingRecoveries.map((r) => r.reference).join(", ")})
+                      </span>
                     )}
                   </div>
                 )}

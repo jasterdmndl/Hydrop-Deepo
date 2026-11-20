@@ -1,19 +1,23 @@
 import { describe, expect, it } from "vitest";
 import {
   cartLinesSignature,
-  clearPendingRecovery,
   clearUnpaidCart,
   computeCashSummary,
+  evaluateEndDayGuard,
   formatCentavos,
-  loadPendingRecovery,
+  LEGACY_PENDING_RECOVERY_STORAGE_KEY,
+  loadPendingRecoveries,
+  loadPendingRecoveryByReference,
   loadUnpaidCart,
   parseLitersInput,
   parsePesoInputToCentavos,
+  removePendingRecovery,
   resolveRecoveryPresentation,
   savePendingRecovery,
   saveUnpaidCart,
   type CartDraftLine,
   type CheckoutLookupView,
+  type CheckoutView,
   type PendingCheckoutRecovery,
   type QuoteLineItem,
   type SaleView,
@@ -23,6 +27,10 @@ import {
 function makeMemoryStorage(): StorageLike {
   const store = new Map<string, string>();
   return {
+    get length() {
+      return store.size;
+    },
+    key: (index) => Array.from(store.keys())[index] ?? null,
     getItem: (key) => store.get(key) ?? null,
     setItem: (key, value) => {
       store.set(key, value);
@@ -150,6 +158,7 @@ function makeLookup(overrides: Partial<CheckoutLookupView>): CheckoutLookupView 
       totalVolumeLiters: base.totalVolumeLiters,
       cashReceivedCentavos: null,
       changeCentavos: null,
+      paymentStartedAt: null,
       paymentRecordedAt: null,
       resolutionReason: null,
       items: base.quoteItems,
@@ -475,10 +484,137 @@ describe("account-scoped unpaid cart and workstation recovery storage", () => {
     // Workstation pending recovery survives simulated page refresh / account switch.
     const pending = makePendingRecord();
     savePendingRecovery(pending, localStore);
-    const loaded = loadPendingRecovery(localStore);
-    expect(loaded).toEqual(pending);
+    expect(loadPendingRecoveryByReference(pending.reference, localStore)).toEqual(pending);
+    expect(loadPendingRecoveries(localStore)).toEqual([pending]);
 
-    clearPendingRecovery(localStore);
-    expect(loadPendingRecovery(localStore)).toBeNull();
+    removePendingRecovery(pending.reference, localStore);
+    expect(loadPendingRecoveryByReference(pending.reference, localStore)).toBeNull();
+    expect(loadPendingRecoveries(localStore)).toEqual([]);
+  });
+
+  it("preserves multiple concurrent pending references across two tabs and clears only the resolved reference", () => {
+    const localStore = makeMemoryStorage();
+
+    const first = makePendingRecord({
+      reference: "HD-1109-001",
+      totalCentavos: 5000,
+      cashReceivedCentavos: 10000,
+      changeCentavos: 5000,
+      attemptedAt: "2026-11-09T09:10:00+08:00",
+    });
+    const second = makePendingRecord({
+      reference: "HD-1109-002",
+      totalCentavos: 7000,
+      cashReceivedCentavos: 20000,
+      changeCentavos: 13000,
+      attemptedAt: "2026-11-09T09:12:00+08:00",
+    });
+    // Also include a legacy v1 record for a third reference to ensure selective migration/removal.
+    const legacyThird = makePendingRecord({
+      reference: "HD-1109-003",
+      totalCentavos: 2500,
+      cashReceivedCentavos: 5000,
+      changeCentavos: 2500,
+      attemptedAt: "2026-11-09T09:14:00+08:00",
+    });
+    localStore.setItem(LEGACY_PENDING_RECOVERY_STORAGE_KEY, JSON.stringify(legacyThird));
+
+    savePendingRecovery(first, localStore);
+    savePendingRecovery(second, localStore);
+
+    expect(loadPendingRecoveries(localStore).map((r) => r.reference)).toEqual([
+      "HD-1109-001",
+      "HD-1109-002",
+      "HD-1109-003",
+    ]);
+
+    // Resolving/removing HD-1109-002 must leave HD-1109-001 (and HD-1109-003) completely intact.
+    removePendingRecovery("HD-1109-002", localStore);
+    expect(loadPendingRecoveries(localStore).map((r) => r.reference)).toEqual([
+      "HD-1109-001",
+      "HD-1109-003",
+    ]);
+    expect(loadPendingRecoveryByReference("HD-1109-001", localStore)).toMatchObject({
+      reference: "HD-1109-001",
+      totalCentavos: 5000,
+      cashReceivedCentavos: 10000,
+      changeCentavos: 5000,
+      initiatedBy: "cashier1",
+    });
+
+    // Removing HD-1109-001 must leave legacy HD-1109-003 untouched; removing HD-1109-003 clears it cleanly.
+    removePendingRecovery("HD-1109-001", localStore);
+    expect(loadPendingRecoveries(localStore).map((r) => r.reference)).toEqual(["HD-1109-003"]);
+    removePendingRecovery("HD-1109-003", localStore);
+    expect(loadPendingRecoveries(localStore)).toEqual([]);
+  });
+
+  it("blocks End Day immediately while confirmation is active, on pending local recovery, or on server PAYMENT_PENDING", () => {
+    const confirming = makePendingRecord({ reference: "HD-1109-010", businessDate: "2026-11-09" });
+    const draftSameRef: CheckoutView = {
+      ...makeLookup({}).checkout,
+      reference: "HD-1109-010",
+      businessDate: "2026-11-09",
+      status: "DRAFT",
+    };
+    const unpaidDraftOther: CheckoutView = {
+      ...makeLookup({}).checkout,
+      reference: "HD-1109-011",
+      businessDate: "2026-11-09",
+      status: "DRAFT",
+    };
+
+    // Even if server still reports HD-1109-010 as unpaid DRAFT while confirm is held in browser,
+    // End Day must block it and NEVER list it under clearableDrafts.
+    const duringConfirm = evaluateEndDayGuard({
+      businessDate: "2026-11-09",
+      serverUnresolved: [],
+      serverUnpaidDrafts: [draftSameRef, unpaidDraftOther],
+      localPendingRecoveries: [confirming],
+      activeConfirming: confirming,
+    });
+    expect(duringConfirm.blocked).toBe(true);
+    expect(duringConfirm.blockingEntries).toEqual([
+      {
+        reference: "HD-1109-010",
+        label: "Confirmation in progress (cashier1)",
+        source: "local-confirming",
+      },
+    ]);
+    expect(duringConfirm.clearableDrafts.map((d) => d.reference)).toEqual(["HD-1109-011"]);
+
+    // When local storage is empty (e.g., another device), server PAYMENT_PENDING blocks End Day.
+    const serverPendingOnly: CheckoutView = {
+      ...draftSameRef,
+      status: "PAYMENT_PENDING",
+      paymentStartedAt: "2026-11-09T09:15:00+08:00",
+    };
+    const fromServerOnly = evaluateEndDayGuard({
+      businessDate: "2026-11-09",
+      serverUnresolved: [serverPendingOnly],
+      serverUnpaidDrafts: [unpaidDraftOther],
+      localPendingRecoveries: [],
+      activeConfirming: null,
+    });
+    expect(fromServerOnly.blocked).toBe(true);
+    expect(fromServerOnly.blockingEntries).toEqual([
+      {
+        reference: "HD-1109-010",
+        label: "Cash payment started (cashier1)",
+        source: "server",
+      },
+    ]);
+
+    // When neither local nor server has unresolved items, genuine unpaid drafts remain clearable.
+    const onlyUnpaidDraft = evaluateEndDayGuard({
+      businessDate: "2026-11-09",
+      serverUnresolved: [],
+      serverUnpaidDrafts: [unpaidDraftOther],
+      localPendingRecoveries: [],
+      activeConfirming: null,
+    });
+    expect(onlyUnpaidDraft.blocked).toBe(false);
+    expect(onlyUnpaidDraft.blockingEntries).toEqual([]);
+    expect(onlyUnpaidDraft.clearableDrafts.map((d) => d.reference)).toEqual(["HD-1109-011"]);
   });
 });

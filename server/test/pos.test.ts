@@ -1307,5 +1307,292 @@ describe("POS station day and refill sales", () => {
         await rm(dir, { recursive: true, force: true });
       }
     });
+
+    it("protects PAYMENT_PENDING checkouts from End Day clearing across missing confirmation and server restart while still clearing explicitly unpaid drafts", async () => {
+      const dir = await mkdtemp(path.join(os.tmpdir(), "hydrop-pos-protected-restart-"));
+      const clock = new ManualClock("2026-11-09T09:00:00+08:00");
+      try {
+        const first = await createTestContext({ dataDir: dir, clock });
+        const o1 = await activatedAccount(first, "owner1", "OWNER");
+        const c1 = await activatedAccount(first, "cashier1", "CASHIER");
+
+        await startDay(first, o1, { requestKey: "prot-day" });
+
+        const prepProtected = await prepareCheckout(first, c1, {
+          prepareKey: "prot-checkout",
+          items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 2 }],
+        });
+        expect(prepProtected.status).toBe(201);
+        const refProtected = prepProtected.body.checkout.reference as string;
+
+        const prepDraft = await prepareCheckout(first, c1, {
+          prepareKey: "unpaid-draft",
+          items: [{ kind: "STANDARD", waterType: "ALKALINE", quantity: 1 }],
+        });
+        expect(prepDraft.status).toBe(201);
+        const refDraft = prepDraft.body.checkout.reference as string;
+
+        // Wrong operator cannot mark another operator's draft as PAYMENT_PENDING.
+        const wrongBegin = await request(first.app)
+          .post(`/api/pos/checkouts/${encodeURIComponent(refProtected)}/begin-payment`)
+          .set("Cookie", o1.cookie)
+          .set("X-CSRF-Token", o1.csrfToken)
+          .send({});
+        expect(wrongBegin.status).toBe(403);
+        expect(wrongBegin.body.error.code).toBe("FORBIDDEN");
+
+        // Initiating cashier marks checkout PAYMENT_PENDING BEFORE being instructed to take cash.
+        const begun = await request(first.app)
+          .post(`/api/pos/checkouts/${encodeURIComponent(refProtected)}/begin-payment`)
+          .set("Cookie", c1.cookie)
+          .set("X-CSRF-Token", c1.csrfToken)
+          .send({});
+        expect(begun.status).toBe(200);
+        expect(begun.body.replayed).toBe(false);
+        expect(begun.body.checkout).toMatchObject({
+          reference: refProtected,
+          status: "PAYMENT_PENDING",
+          paymentStartedAt: "2026-11-09T09:00:00+08:00",
+        });
+
+        // Replaying begin-payment is idempotent.
+        const begunReplay = await request(first.app)
+          .post(`/api/pos/checkouts/${encodeURIComponent(refProtected)}/begin-payment`)
+          .set("Cookie", c1.cookie)
+          .set("X-CSRF-Token", c1.csrfToken)
+          .send({});
+        expect(begunReplay.status).toBe(200);
+        expect(begunReplay.body.replayed).toBe(true);
+
+        // Day status places refProtected under unresolvedCheckouts (not unpaidDrafts).
+        const dayBeforeRestart = await request(first.app).get("/api/pos/day").set("Cookie", o1.cookie);
+        expect(dayBeforeRestart.status).toBe(200);
+        expect(dayBeforeRestart.body.unresolvedCheckouts.map((c: any) => c.reference)).toEqual([
+          refProtected,
+        ]);
+        expect(dayBeforeRestart.body.unpaidDrafts.map((c: any) => c.reference)).toEqual([refDraft]);
+
+        // Even with NO confirm ever sent, Owner End Day(clearUnpaidDrafts: true) MUST reject.
+        const endBlockedBeforeRestart = await endDay(first, o1, {
+          requestKey: "end-before-restart",
+          clearUnpaidDrafts: true,
+        });
+        expect(endBlockedBeforeRestart.status).toBe(409);
+        expect(endBlockedBeforeRestart.body.error.code).toBe("UNRESOLVED_CHECKOUTS");
+        expect(endBlockedBeforeRestart.body.blockingCheckouts.map((c: any) => c.reference)).toEqual([
+          refProtected,
+        ]);
+
+        // Plain cancel without confirmNoCashTaken is rejected once payment has started.
+        const plainCancel = await cancelCheckout(first, c1, refProtected, {
+          reason: "Accidental click",
+        });
+        expect(plainCancel.status).toBe(409);
+        expect(plainCancel.body.error.code).toBe("CHECKOUT_NOT_CANCELLABLE");
+
+        await first.close();
+
+        // Full server restart wipes all in-memory state (inFlight); durable DB protection must hold!
+        clock.advance(2 * 60_000);
+        const second = await createTestContext({ dataDir: dir, clock });
+        try {
+          const o2 = await signIn(second.app, "owner1", o1.password);
+          const c2 = await signIn(second.app, "cashier1", c1.password);
+
+          const dayAfterRestart = await request(second.app).get("/api/pos/day").set("Cookie", o2.cookie);
+          expect(dayAfterRestart.status).toBe(200);
+          expect(dayAfterRestart.body.unresolvedCheckouts.map((c: any) => c.reference)).toEqual([
+            refProtected,
+          ]);
+          expect(dayAfterRestart.body.unpaidDrafts.map((c: any) => c.reference)).toEqual([refDraft]);
+
+          // End Day with clearUnpaidDrafts: true still refuses to clear refProtected!
+          const endBlockedAfterRestart = await endDay(second, o2, {
+            requestKey: "end-after-restart",
+            clearUnpaidDrafts: true,
+          });
+          expect(endBlockedAfterRestart.status).toBe(409);
+          expect(endBlockedAfterRestart.body.error.code).toBe("UNRESOLVED_CHECKOUTS");
+          expect(
+            endBlockedAfterRestart.body.blockingCheckouts.map((c: any) => c.reference),
+          ).toEqual([refProtected]);
+
+          // Owner cannot hijack retry; Cashier can inspect SAFE_TO_RETRY and finish the sale.
+          const ownerLookup = await request(second.app)
+            .get(`/api/pos/checkouts/${refProtected}`)
+            .set("Cookie", o2.cookie);
+          expect(ownerLookup.status).toBe(200);
+          expect(ownerLookup.body).toMatchObject({
+            recoveryState: "UNRESOLVED",
+            reason: "OWNED_BY_OTHER_ACCOUNT",
+            canRetry: false,
+          });
+
+          const cashierLookup = await request(second.app)
+            .get(`/api/pos/checkouts/${refProtected}`)
+            .set("Cookie", c2.cookie);
+          expect(cashierLookup.status).toBe(200);
+          expect(cashierLookup.body).toMatchObject({
+            recoveryState: "SAFE_TO_RETRY",
+            reason: "NOT_SAVED",
+            canRetry: true,
+            ownedByCurrentUser: true,
+          });
+
+          const retried = await confirmCheckout(second.app, c2, refProtected, {
+            cashReceivedCentavos: 10000,
+          });
+          expect(retried.status).toBe(201);
+          expect(retried.body.sale).toMatchObject({
+            reference: refProtected,
+            totalCentavos: 5000,
+            cashReceivedCentavos: 10000,
+            changeCentavos: 5000,
+          });
+
+          // begin-payment after SAVED rejects cleanly with CHECKOUT_ALREADY_SAVED.
+          const beginAfterSaved = await request(second.app)
+            .post(`/api/pos/checkouts/${encodeURIComponent(refProtected)}/begin-payment`)
+            .set("Cookie", c2.cookie)
+            .set("X-CSRF-Token", c2.csrfToken)
+            .send({});
+          expect(beginAfterSaved.status).toBe(409);
+          expect(beginAfterSaved.body.error.code).toBe("CHECKOUT_ALREADY_SAVED");
+
+          // End Day now clears only the genuinely unpaid DRAFT and closes the day cleanly.
+          const endCleared = await endDay(second, o2, {
+            requestKey: "end-after-recovery",
+            clearUnpaidDrafts: true,
+          });
+          expect(endCleared.status).toBe(200);
+          expect(endCleared.body.clearedDraftReferences).toEqual([refDraft]);
+          expect(endCleared.body.summary).toMatchObject({
+            totalSalesCentavos: 5000,
+            validTransactionCount: 1,
+          });
+        } finally {
+          await second.close();
+        }
+      } finally {
+        await rm(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("supports explicit same-day no-cash cancellation of PAYMENT_PENDING and keeps concurrent begin-payment vs End Day strictly consistent", async () => {
+      await startDay(ctx, owner, { requestKey: "cancel-pp-day" });
+
+      const prepNoCash = await prepareCheckout(ctx, cashier, {
+        prepareKey: "pp-no-cash",
+        items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 1 }],
+      });
+      const refNoCash = prepNoCash.body.checkout.reference as string;
+
+      await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(refNoCash)}/begin-payment`)
+        .set("Cookie", cashier.cookie)
+        .set("X-CSRF-Token", cashier.csrfToken)
+        .send({});
+
+      // Wrong operator still rejected even with confirmNoCashTaken: true
+      const ownerCancel = await cancelCheckout(ctx, owner, refNoCash, {
+        confirmNoCashTaken: true,
+      });
+      expect(ownerCancel.status).toBe(403);
+      expect(ownerCancel.body.error.code).toBe("FORBIDDEN");
+
+      // Initiating cashier confirms no cash was taken -> cancelled
+      const cashierCancel = await cancelCheckout(ctx, cashier, refNoCash, {
+        confirmNoCashTaken: true,
+        reason: "Customer changed mind before paying",
+      });
+      expect(cashierCancel.status).toBe(200);
+      expect(cashierCancel.body.replayed).toBe(false);
+      expect(cashierCancel.body.checkout).toMatchObject({
+        reference: refNoCash,
+        status: "CANCELLED_DRAFT",
+        resolutionReason: "Customer changed mind before paying",
+      });
+
+      const cancelReplay = await cancelCheckout(ctx, cashier, refNoCash, {
+        confirmNoCashTaken: true,
+      });
+      expect(cancelReplay.status).toBe(200);
+      expect(cancelReplay.body.replayed).toBe(true);
+
+      // Concurrent begin-payment vs End Day(clearUnpaidDrafts: true)
+      const prepRace = await prepareCheckout(ctx, cashier, {
+        prepareKey: "pp-race",
+        items: [{ kind: "STANDARD", waterType: "ALKALINE", quantity: 1 }],
+      });
+      const refRace = prepRace.body.checkout.reference as string;
+
+      const [beginRes, endRes] = await Promise.all([
+        request(ctx.app)
+          .post(`/api/pos/checkouts/${encodeURIComponent(refRace)}/begin-payment`)
+          .set("Cookie", cashier.cookie)
+          .set("X-CSRF-Token", cashier.csrfToken)
+          .send({}),
+        endDay(ctx, owner, { requestKey: "race-end", clearUnpaidDrafts: true }),
+      ]);
+
+      if (endRes.status === 200) {
+        expect(endRes.body.clearedDraftReferences).toEqual([refRace]);
+        expect(beginRes.status).toBe(409);
+      } else {
+        expect(beginRes.status).toBe(200);
+        expect(endRes.status).toBe(409);
+        expect(endRes.body.error.code).toBe("UNRESOLVED_CHECKOUTS");
+        expect(endRes.body.blockingCheckouts.map((c: any) => c.reference)).toEqual([refRace]);
+      }
+    });
+
+    it("keeps cross-midnight PAYMENT_PENDING un-cancellable and blocking End Day without backdating or auto-clearing", async () => {
+      ctx.clock.set("2026-11-18T23:55:00+08:00");
+      owner = await reauth(ctx, "owner1", owner);
+      cashier = await reauth(ctx, "cashier1", cashier);
+      await startDay(ctx, cashier, { requestKey: "midnight-pp-day" });
+
+      const prep = await prepareCheckout(ctx, cashier, {
+        prepareKey: "midnight-pp-checkout",
+        items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 2 }],
+      });
+      const ref = prep.body.checkout.reference as string;
+
+      const begun = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(ref)}/begin-payment`)
+        .set("Cookie", cashier.cookie)
+        .set("X-CSRF-Token", cashier.csrfToken)
+        .send({});
+      expect(begun.status).toBe(200);
+
+      // Cross Manila midnight without confirming
+      ctx.clock.set("2026-11-19T00:05:00+08:00");
+      owner = await reauth(ctx, "owner1", owner);
+      cashier = await reauth(ctx, "cashier1", cashier);
+
+      const lookup = await request(ctx.app).get(`/api/pos/checkouts/${ref}`).set("Cookie", owner.cookie);
+      expect(lookup.status).toBe(200);
+      expect(lookup.body).toMatchObject({
+        recoveryState: "REVIEW_REQUIRED",
+        reason: "BUSINESS_DATE_CROSSED",
+        canRetry: false,
+      });
+
+      // Even confirmNoCashTaken cannot cancel a prior-day PAYMENT_PENDING checkout
+      const cancelPrior = await cancelCheckout(ctx, cashier, ref, {
+        confirmNoCashTaken: true,
+      });
+      expect(cancelPrior.status).toBe(409);
+      expect(cancelPrior.body.error.code).toBe("CHECKOUT_NOT_CANCELLABLE");
+
+      // End Day with clearUnpaidDrafts cannot silently drop it (prior-day settlement awaits business decision)
+      const endBlocked = await endDay(ctx, owner, {
+        requestKey: "midnight-pp-end",
+        clearUnpaidDrafts: true,
+      });
+      expect(endBlocked.status).toBe(409);
+      expect(endBlocked.body.error.code).toBe("UNRESOLVED_CHECKOUTS");
+      expect(endBlocked.body.blockingCheckouts.map((c: any) => c.reference)).toEqual([ref]);
+    });
   });
 });

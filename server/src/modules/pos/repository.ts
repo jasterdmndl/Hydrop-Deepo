@@ -62,6 +62,7 @@ export interface CheckoutDbRow {
   totalVolumeMl: number | string;
   cashReceivedCentavos: number | string | null;
   changeCentavos: number | string | null;
+  paymentStartedAt: Date | string | null;
   paymentRecordedAt: Date | string | null;
   resolutionReason: string | null;
   createdAt: Date | string;
@@ -187,6 +188,7 @@ export function toCheckoutView(row: CheckoutDbRow): CheckoutView {
     totalVolumeLiters: mlToLiters(totalVolumeMl),
     cashReceivedCentavos: row.cashReceivedCentavos === null ? null : Number(row.cashReceivedCentavos),
     changeCentavos: row.changeCentavos === null ? null : Number(row.changeCentavos),
+    paymentStartedAt: row.paymentStartedAt ? formatManilaIso(toDate(row.paymentStartedAt)) : null,
     paymentRecordedAt: row.paymentRecordedAt ? formatManilaIso(toDate(row.paymentRecordedAt)) : null,
     resolutionReason: row.resolutionReason,
     items: parseQuoteSnapshot(row.quoteSnapshot),
@@ -233,6 +235,7 @@ const CHECKOUT_SELECT = `
          c.total_volume_ml AS "totalVolumeMl",
          c.cash_received_centavos AS "cashReceivedCentavos",
          c.change_centavos AS "changeCentavos",
+         c.payment_started_at AS "paymentStartedAt",
          c.payment_recorded_at AS "paymentRecordedAt",
          c.resolution_reason AS "resolutionReason",
          c.created_at AS "createdAt",
@@ -608,7 +611,7 @@ export const posRepository = {
   async listNonTerminalCheckoutsForDay(db: Queryable, dayId: string): Promise<CheckoutDbRow[]> {
     const { rows } = await db.query<CheckoutDbRow>(
       `${CHECKOUT_SELECT}
-        WHERE c.business_day_id = $1 AND c.status IN ('DRAFT', 'REVIEW_REQUIRED')
+        WHERE c.business_day_id = $1 AND c.status IN ('DRAFT', 'PAYMENT_PENDING', 'REVIEW_REQUIRED')
         ORDER BY c.created_at ASC, c.reference ASC`,
       [dayId],
     );
@@ -618,7 +621,7 @@ export const posRepository = {
   async lockNonTerminalCheckoutsForDay(tx: Queryable, dayId: string): Promise<CheckoutDbRow[]> {
     await tx.query(
       `SELECT id FROM pos_checkouts
-        WHERE business_day_id = $1 AND status IN ('DRAFT', 'REVIEW_REQUIRED')
+        WHERE business_day_id = $1 AND status IN ('DRAFT', 'PAYMENT_PENDING', 'REVIEW_REQUIRED')
         FOR UPDATE`,
       [dayId],
     );
@@ -692,6 +695,21 @@ export const posRepository = {
         input.changeCentavos,
         input.now,
       ],
+    );
+    return (await this.findCheckoutByReference(tx, input.reference))!;
+  },
+
+  async markCheckoutPaymentPending(
+    tx: Queryable,
+    input: { checkoutId: string; reference: string; now: Date },
+  ): Promise<CheckoutDbRow> {
+    await tx.query(
+      `UPDATE pos_checkouts
+          SET status = 'PAYMENT_PENDING',
+              payment_started_at = COALESCE(payment_started_at, $2),
+              updated_at = $2
+        WHERE id = $1`,
+      [input.checkoutId, input.now],
     );
     return (await this.findCheckoutByReference(tx, input.reference))!;
   },

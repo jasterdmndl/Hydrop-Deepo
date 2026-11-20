@@ -79,9 +79,12 @@ const confirmCheckoutBody = z
   })
   .strict();
 
+const beginPaymentBody = z.object({}).strict();
+
 const cancelCheckoutBody = z
   .object({
     reason: z.string().trim().min(1).max(200).optional(),
+    confirmNoCashTaken: z.boolean().optional(),
   })
   .strict();
 
@@ -153,6 +156,9 @@ export function posRoutes(db: Database): Router {
       for (const row of nonTerminal) {
         if (row.status === "REVIEW_REQUIRED") {
           unresolvedCheckouts.push(toCheckoutView(row));
+        } else if (row.status === "PAYMENT_PENDING") {
+          const active = inFlight.get(row.reference);
+          unresolvedCheckouts.push(active ? active.checkoutView : toCheckoutView(row));
         } else if (row.status === "DRAFT") {
           const active = inFlight.get(row.reference);
           if (active) {
@@ -336,6 +342,10 @@ export function posRoutes(db: Database): Router {
       for (const row of nonTerminal) {
         if (row.status === "REVIEW_REQUIRED") {
           blockingCheckouts.push(toCheckoutView(row));
+          seenBlockingRefs.add(row.reference);
+        } else if (row.status === "PAYMENT_PENDING") {
+          const active = inFlightByRef.get(row.reference);
+          blockingCheckouts.push(active ? active.checkoutView : toCheckoutView(row));
           seenBlockingRefs.add(row.reference);
         } else if (row.status === "DRAFT") {
           const active = inFlightByRef.get(row.reference);
@@ -552,6 +562,125 @@ export function posRoutes(db: Database): Router {
     });
   });
 
+  router.post("/checkouts/:reference/begin-payment", async (req, res) => {
+    const reference = paramReference(req.params.reference);
+    if (!reference) {
+      sendError(res, 404, "NOT_FOUND", "Checkout reference not found.");
+      return;
+    }
+
+    const parsed = beginPaymentBody.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid start-payment request.");
+      return;
+    }
+
+    const preCheck = await repo.findCheckoutByReference(db, reference);
+    if (!preCheck) {
+      sendError(res, 404, "NOT_FOUND", "Checkout reference not found.");
+      return;
+    }
+
+    if (preCheck.createdByUserId !== req.auth!.user.id) {
+      sendError(
+        res,
+        403,
+        "FORBIDDEN",
+        "Only the operator who prepared this checkout can start cash payment.",
+      );
+      return;
+    }
+
+    const todayDate = formatManilaDate(req.now);
+    const outcome = await db.transaction(async (tx) => {
+      const day = await repo.lockDayById(tx, preCheck.businessDayId);
+      const checkoutRow = await repo.lockCheckoutByReference(tx, reference);
+      if (!day || !checkoutRow) {
+        return { kind: "not-found" as const };
+      }
+
+      if (checkoutRow.createdByUserId !== req.auth!.user.id) {
+        return { kind: "forbidden" as const };
+      }
+
+      if (checkoutRow.status === "SAVED") {
+        return { kind: "already-saved" as const };
+      }
+      if (checkoutRow.status === "CANCELLED_DRAFT") {
+        return { kind: "cancelled" as const };
+      }
+      if (checkoutRow.status === "REVIEW_REQUIRED") {
+        return { kind: "review-required" as const, checkout: toCheckoutView(checkoutRow) };
+      }
+      if (day.closedAt !== null) {
+        return { kind: "day-closed" as const };
+      }
+      if (day.businessDate !== todayDate) {
+        return { kind: "previous-day-open" as const };
+      }
+      if (checkoutRow.status === "PAYMENT_PENDING") {
+        return { kind: "replayed" as const, checkout: toCheckoutView(checkoutRow) };
+      }
+
+      const updated = await repo.markCheckoutPaymentPending(tx, {
+        checkoutId: checkoutRow.id,
+        reference,
+        now: req.now,
+      });
+      return { kind: "started" as const, checkout: toCheckoutView(updated) };
+    });
+
+    if (outcome.kind === "not-found") {
+      sendError(res, 404, "NOT_FOUND", "Checkout reference not found.");
+      return;
+    }
+    if (outcome.kind === "forbidden") {
+      sendError(
+        res,
+        403,
+        "FORBIDDEN",
+        "Only the operator who prepared this checkout can start cash payment.",
+      );
+      return;
+    }
+    if (outcome.kind === "already-saved") {
+      sendError(res, 409, "CHECKOUT_ALREADY_SAVED", "This checkout is already saved.");
+      return;
+    }
+    if (outcome.kind === "cancelled") {
+      sendError(res, 409, "CHECKOUT_CANCELLED", "This checkout draft was already cancelled.");
+      return;
+    }
+    if (outcome.kind === "review-required") {
+      res.status(409).json({
+        error: {
+          code: "CHECKOUT_REVIEW_REQUIRED",
+          message: "This checkout requires Owner review and cannot accept new cash payment.",
+        },
+        checkout: outcome.checkout,
+      });
+      return;
+    }
+    if (outcome.kind === "day-closed") {
+      sendError(res, 409, "DAY_ALREADY_CLOSED", "Today's business day is already closed.");
+      return;
+    }
+    if (outcome.kind === "previous-day-open") {
+      sendError(
+        res,
+        409,
+        "PREVIOUS_DAY_OPEN",
+        "Close the previous open business day before accepting payment for a new sale.",
+      );
+      return;
+    }
+
+    res.status(200).json({
+      checkout: outcome.checkout,
+      replayed: outcome.kind === "replayed",
+    });
+  });
+
   router.get("/checkouts/:reference", async (req, res) => {
     const reference = paramReference(req.params.reference);
     if (!reference) {
@@ -636,7 +765,10 @@ export function posRoutes(db: Database): Router {
       return;
     }
 
-    if (preCheck.status === "DRAFT" && body.cashReceivedCentavos < preCheckoutView.totalCentavos) {
+    if (
+      (preCheck.status === "DRAFT" || preCheck.status === "PAYMENT_PENDING") &&
+      body.cashReceivedCentavos < preCheckoutView.totalCentavos
+    ) {
       sendError(res, 400, "INSUFFICIENT_CASH", "Cash received must cover the total sale amount.");
       return;
     }
@@ -845,6 +977,7 @@ export function posRoutes(db: Database): Router {
       return;
     }
 
+    const todayDate = formatManilaDate(req.now);
     const outcome = await db.transaction(async (tx) => {
       const day = await repo.lockDayById(tx, preCheck.businessDayId);
       const checkoutRow = await repo.lockCheckoutByReference(tx, reference);
@@ -864,7 +997,34 @@ export function posRoutes(db: Database): Router {
         return { kind: "replayed" as const, checkout: toCheckoutView(checkoutRow) };
       }
 
-      if (day.closedAt !== null || checkoutRow.status !== "DRAFT") {
+      if (day.closedAt !== null) {
+        return { kind: "not-cancellable" as const };
+      }
+
+      if (checkoutRow.status === "PAYMENT_PENDING") {
+        if (day.businessDate !== todayDate) {
+          return {
+            kind: "not-cancellable" as const,
+            message: "Prior-day payment-protected checkouts cannot be cancelled and require Owner review.",
+          };
+        }
+        if (parsed.data.confirmNoCashTaken !== true) {
+          return {
+            kind: "not-cancellable" as const,
+            message:
+              "Confirm that no cash was received from the customer before cancelling a checkout in cash collection.",
+          };
+        }
+        const updated = await repo.markCheckoutCancelled(tx, {
+          checkoutId: checkoutRow.id,
+          reference,
+          reason: parsed.data.reason ?? "NO_CASH_TAKEN_CANCELLED",
+          now: req.now,
+        });
+        return { kind: "cancelled" as const, checkout: toCheckoutView(updated) };
+      }
+
+      if (checkoutRow.status !== "DRAFT") {
         return { kind: "not-cancellable" as const };
       }
 
@@ -895,7 +1055,7 @@ export function posRoutes(db: Database): Router {
         res,
         409,
         "CHECKOUT_NOT_CANCELLABLE",
-        "This checkout can no longer be cancelled.",
+        outcome.message ?? "This checkout can no longer be cancelled.",
       );
       return;
     }
