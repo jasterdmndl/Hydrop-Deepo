@@ -25,8 +25,9 @@ export function modulesFor(role: Role): ModuleEntry[] {
     {
       key: "pos",
       name: "POS",
-      description: "Record refills and merchandise sales.",
-      state: "coming-later",
+      description: "Select refills, receive cash, and review transaction history.",
+      state: "open",
+      path: "/pos",
     },
     {
       key: "dashboard",

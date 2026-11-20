@@ -6,6 +6,7 @@ import { postAuthRedirectPath } from "./auth/idle";
 import { LoginPage } from "./auth/LoginPage";
 import { CalendarPage } from "./calendar/CalendarPage";
 import { ChooseModule } from "./ChooseModule";
+import { PosPage } from "./pos/PosPage";
 
 function AppRoutes() {
   const { state } = useAuth();
@@ -48,6 +49,7 @@ function AppRoutes() {
   return (
     <Routes>
       <Route path="/" element={<ChooseModule />} />
+      <Route path="/pos" element={<PosPage />} />
       <Route path="/calendar" element={<CalendarPage />} />
       <Route path="*" element={<Navigate to="/" replace />} />
     </Routes>
