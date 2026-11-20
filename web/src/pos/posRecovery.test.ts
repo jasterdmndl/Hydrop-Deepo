@@ -5,12 +5,15 @@ import {
   computeCashSummary,
   evaluateEndDayGuard,
   formatCentavos,
+  isPosSyncStorageKey,
   LEGACY_PENDING_RECOVERY_STORAGE_KEY,
   loadPendingRecoveries,
   loadPendingRecoveryByReference,
   loadUnpaidCart,
+  notifyPosStateChanged,
   parseLitersInput,
   parsePesoInputToCentavos,
+  POS_SYNC_STORAGE_KEY,
   removePendingRecovery,
   resolveRecoveryPresentation,
   savePendingRecovery,
@@ -616,5 +619,22 @@ describe("account-scoped unpaid cart and workstation recovery storage", () => {
     expect(onlyUnpaidDraft.blocked).toBe(false);
     expect(onlyUnpaidDraft.blockingEntries).toEqual([]);
     expect(onlyUnpaidDraft.clearableDrafts.map((d) => d.reference)).toEqual(["HD-1109-011"]);
+  });
+
+  it("emits POS state sync notifications without interfering with recovery or cart storage", () => {
+    const localStore = makeMemoryStorage();
+    const sessionStore = makeMemoryStorage();
+
+    expect(isPosSyncStorageKey(POS_SYNC_STORAGE_KEY)).toBe(true);
+    expect(isPosSyncStorageKey(null)).toBe(true);
+    expect(isPosSyncStorageKey("unrelated-key")).toBe(false);
+
+    notifyPosStateChanged("sale-saved", localStore);
+    const raw = localStore.getItem(POS_SYNC_STORAGE_KEY);
+    expect(raw).not.toBeNull();
+    expect(JSON.parse(raw!)).toMatchObject({ reason: "sale-saved" });
+
+    expect(loadPendingRecoveries(localStore)).toEqual([]);
+    expect(loadUnpaidCart("cashier1", sessionStore)).toBeNull();
   });
 });

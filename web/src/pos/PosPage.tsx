@@ -24,6 +24,7 @@ import {
   isPendingRecoveryStorageKey,
   loadPendingRecoveries,
   loadUnpaidCart,
+  notifyPosStateChanged,
   parseLitersInput,
   parsePesoInputToCentavos,
   type PendingCheckoutRecovery,
@@ -480,6 +481,7 @@ export function PosPage() {
         body: { requestKey: key },
       });
       setDayStatus(started);
+      notifyPosStateChanged("day-started");
       setStartRequestKey(null);
       setLastClosedSummary(null);
     } catch (err) {
@@ -539,6 +541,7 @@ export function PosPage() {
       }
       setLastClosedSummary(closed.summary);
       setEndDayOpen(false);
+      notifyPosStateChanged("day-ended");
       setCloseRequestKey(null);
       await loadPosState();
     } catch (err) {
@@ -630,6 +633,7 @@ export function PosPage() {
           : prev,
       );
       setPreparedCheckout(res.checkout);
+      notifyPosStateChanged("payment-started");
       setConfirmNoCashChecked(false);
     } catch (err) {
       setSaleError(
@@ -699,6 +703,7 @@ export function PosPage() {
         body: { confirmNoCashTaken: true, reason: "No cash received" },
       });
       removePendingRecovery(preparedCheckout.reference);
+      notifyPosStateChanged("payment-cancelled");
       setPendingRecoveries(loadPendingRecoveries());
       clearUnpaidCart(user.username);
       setPreparedCheckout(null);
@@ -788,6 +793,7 @@ export function PosPage() {
         },
       );
       removePendingRecovery(pendingRecord.reference);
+      notifyPosStateChanged("sale-saved");
       activeConfirmingRef.current = null;
       setActiveConfirming(null);
       const remaining = loadPendingRecoveries();
@@ -904,6 +910,7 @@ export function PosPage() {
         },
       );
       removePendingRecovery(target.reference);
+      notifyPosStateChanged("sale-saved");
       activeConfirmingRef.current = null;
       setActiveConfirming(null);
       clearUnpaidCart(user.username);
@@ -944,6 +951,7 @@ export function PosPage() {
 
   function handleContinueSavedSale(reference: string, sale: SaleView) {
     removePendingRecovery(reference);
+    notifyPosStateChanged("sale-saved");
     clearUnpaidCart(user.username);
     const remaining = loadPendingRecoveries();
     setPendingRecoveries(remaining);

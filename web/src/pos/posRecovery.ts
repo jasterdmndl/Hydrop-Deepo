@@ -256,6 +256,7 @@ export interface StorageLike {
 export const PENDING_RECOVERY_KEY_PREFIX = "hydrop.pos.pendingRecovery.v2:";
 export const LEGACY_PENDING_RECOVERY_STORAGE_KEY = "hydrop.pos.pendingRecovery.v1";
 export const UNPAID_CART_STORAGE_PREFIX = "hydrop.pos.unpaidCart.v1:";
+export const POS_SYNC_STORAGE_KEY = "hydrop.pos.daySync.v1";
 
 const MANILA_OFFSET_MS = 8 * 60 * 60 * 1000;
 
@@ -406,6 +407,29 @@ export function isPendingRecoveryStorageKey(key: string | null): boolean {
     key.startsWith(PENDING_RECOVERY_KEY_PREFIX) ||
     key === LEGACY_PENDING_RECOVERY_STORAGE_KEY
   );
+}
+
+export function isPosSyncStorageKey(key: string | null): boolean {
+  return key === null || key === POS_SYNC_STORAGE_KEY;
+}
+
+export function notifyPosStateChanged(
+  reason: string,
+  storage: StorageLike | null = browserStorage("local"),
+): void {
+  if (!storage) return;
+  try {
+    storage.setItem(
+      POS_SYNC_STORAGE_KEY,
+      JSON.stringify({
+        reason,
+        at: Date.now(),
+        nonce: Math.random().toString(36).slice(2),
+      }),
+    );
+  } catch {
+    // Ignore storage access errors in best-effort cross-tab notification.
+  }
 }
 
 function parsePendingRecovery(raw: string | null): PendingCheckoutRecovery | null {
