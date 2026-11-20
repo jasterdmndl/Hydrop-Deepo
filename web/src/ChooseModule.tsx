@@ -4,6 +4,13 @@ import { api, ApiError } from "./api";
 import { LogoutErrorBanner, useAuth, useSignedInUser } from "./auth/AuthContext";
 import { idlePhase } from "./auth/idle";
 import type { RemindersResponse } from "./calendar/calendarView";
+import {
+  isPendingRecoveryStorageKey,
+  loadPendingRecoveries,
+  type PendingCheckoutRecovery,
+  type PosDayResponse,
+  stationStatusFromDay,
+} from "./pos/posRecovery";
 
 export type ModuleState = "open" | "read-only" | "locked" | "coming-later";
 
@@ -17,6 +24,7 @@ export interface ModuleEntry {
 
 export interface StationStatus {
   isOpen: boolean;
+  tone?: "open" | "closed" | "warning";
   label: string;
   detail?: string;
 }
@@ -100,17 +108,19 @@ export interface AppShellProps {
   activeKey: "home" | ModuleEntry["key"];
   sectionName?: string;
   modulesData?: ModulesResponse | null;
+  stationStatusOverride?: StationStatus | null;
   children: ReactNode;
 }
 
 const DRAWER_MEDIA_QUERY = "(max-width: 799px), (orientation: portrait) and (max-width: 900px)";
 const FOCUSABLE_SELECTOR = 'a[href], button:not(:disabled), [tabindex]:not([tabindex="-1"])';
 
-export function AppShell({ activeKey, sectionName, modulesData, children }: AppShellProps) {
+export function AppShell({ activeKey, sectionName, modulesData, stationStatusOverride, children }: AppShellProps) {
   const user = useSignedInUser();
   const { state, clockOffset, logout, loggingOut, logoutError } = useAuth();
   const location = useLocation();
   const [fetchedModules, setFetchedModules] = useState<ModulesResponse | null>(null);
+  const [fetchedStationStatus, setFetchedStationStatus] = useState<StationStatus | null>(null);
   const [isDrawerMode, setIsDrawerMode] = useState(() =>
     typeof window !== "undefined" && typeof window.matchMedia === "function"
       ? window.matchMedia(DRAWER_MEDIA_QUERY).matches
@@ -228,8 +238,24 @@ export function AppShell({ activeKey, sectionName, modulesData, children }: AppS
   }, [modulesData]);
 
   const effective = modulesData !== undefined ? modulesData : fetchedModules;
+  const effectiveModuleStation = effective?.stationStatus ?? null;
+
+  useEffect(() => {
+    if (stationStatusOverride !== undefined || effectiveModuleStation !== null) return;
+    let cancelled = false;
+    api<PosDayResponse>("/api/pos/day", { background: true })
+      .then((day) => {
+        if (!cancelled) setFetchedStationStatus(stationStatusFromDay(day));
+      })
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [stationStatusOverride, effectiveModuleStation]);
+
   const modules = effective?.modules ?? [];
-  const stationStatus = effective?.stationStatus ?? null;
+  const stationStatus =
+    stationStatusOverride !== undefined ? stationStatusOverride : (effectiveModuleStation ?? fetchedStationStatus);
   const todayManila = formatManilaToday();
   const drawerActive = isDrawerMode && drawerOpen;
 
@@ -315,7 +341,15 @@ export function AppShell({ activeKey, sectionName, modulesData, children }: AppS
 
           {stationStatus !== null && (
             <div className="station-card" role="status">
-              <span className={`station-pill ${stationStatus.isOpen ? "station-pill--open" : "station-pill--closed"}`}>
+              <span
+                className={`station-pill ${
+                  stationStatus.tone === "warning"
+                    ? "station-pill--warning"
+                    : stationStatus.isOpen
+                      ? "station-pill--open"
+                      : "station-pill--closed"
+                }`}
+              >
                 {stationStatus.label}
               </span>
               {stationStatus.detail && <p className="station-card__detail">{stationStatus.detail}</p>}
@@ -396,6 +430,11 @@ export function ChooseModule() {
   const { data, loading, error, reload } = useModulesData();
   const [reminders, setReminders] = useState<RemindersResponse | null>(null);
   const [remindersError, setRemindersError] = useState(false);
+  const [posDay, setPosDay] = useState<PosDayResponse | null>(null);
+  const [posDayError, setPosDayError] = useState(false);
+  const [pendingRecoveries, setPendingRecoveries] = useState<PendingCheckoutRecovery[]>(() =>
+    loadPendingRecoveries(),
+  );
 
   const loadReminders = useCallback(async () => {
     setRemindersError(false);
@@ -406,12 +445,32 @@ export function ChooseModule() {
     }
   }, []);
 
+  const loadPosDay = useCallback(async () => {
+    setPosDayError(false);
+    try {
+      setPosDay(await api<PosDayResponse>("/api/pos/day", { background: true }));
+    } catch {
+      setPosDayError(true);
+    }
+  }, []);
+
   useEffect(() => {
     void loadReminders();
-  }, [loadReminders]);
+    void loadPosDay();
+    setPendingRecoveries(loadPendingRecoveries());
+    const onStorage = (event: StorageEvent) => {
+      if (isPendingRecoveryStorageKey(event.key)) {
+        setPendingRecoveries(loadPendingRecoveries());
+      }
+    };
+    window.addEventListener("storage", onStorage);
+    return () => window.removeEventListener("storage", onStorage);
+  }, [loadReminders, loadPosDay]);
+
+  const stationStatus = posDay ? stationStatusFromDay(posDay) : null;
 
   return (
-    <AppShell activeKey="home" modulesData={data}>
+    <AppShell activeKey="home" modulesData={data} stationStatusOverride={stationStatus}>
       <section className="page-header">
         <div>
           <h1>Choose Module</h1>
@@ -431,6 +490,7 @@ export function ChooseModule() {
             onClick={() => {
               void reload();
               void loadReminders();
+              void loadPosDay();
             }}
           >
             Retry
@@ -456,6 +516,38 @@ export function ChooseModule() {
                   <span className={`badge badge--${mod.state}`}>{moduleBadgeText(mod.state)}</span>
                 </div>
                 <p className="module-card__desc">{mod.description}</p>
+                {mod.key === "pos" && (
+                  <div className="module-card__reminders" aria-label="Station business day summary">
+                    {posDay ? (
+                      <span
+                        className={`pill ${
+                          posDay.state === "OPEN"
+                            ? "pill--completed"
+                            : posDay.state === "PREVIOUS_DAY_OPEN"
+                              ? "pill--overdue"
+                              : "pill--neutral"
+                        }`}
+                      >
+                        {stationStatusFromDay(posDay).label}
+                      </span>
+                    ) : posDayError ? (
+                      <span className="module-card__note">Could not load station status.</span>
+                    ) : (
+                      <span className="module-card__note">Checking station day…</span>
+                    )}
+                    {pendingRecoveries.length === 1 && (
+                      <span className="pill pill--overdue">
+                        Pending recovery: {pendingRecoveries[0]!.reference}
+                      </span>
+                    )}
+                    {pendingRecoveries.length > 1 && (
+                      <span className="pill pill--overdue">
+                        {pendingRecoveries.length} pending recoveries (
+                        {pendingRecoveries.map((r) => r.reference).join(", ")})
+                      </span>
+                    )}
+                  </div>
+                )}
                 {mod.key === "calendar" && (
                   <div className="module-card__reminders" aria-label="Activity Calendar reminder summary">
                     {reminders ? (
