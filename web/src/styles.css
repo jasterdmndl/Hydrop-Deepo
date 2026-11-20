@@ -955,7 +955,6 @@ textarea:focus-visible {
 
 .content {
   padding: 24px 28px 36px;
-  max-width: 1240px;
   width: 100%;
   min-width: 0;
   display: flex;
@@ -2979,7 +2978,6 @@ textarea:focus-visible {
 }
 
 .shell--home .content {
-  max-width: 1280px;
   padding: 24px 24px 32px;
   gap: 20px;
 }
@@ -3355,5 +3353,64 @@ textarea:focus-visible {
 
   .home-card {
     padding: 18px;
+  }
+}
+
+/* Wide workspace scaling (e.g. 1600px-1920px+ desktop monitors) */
+
+@container workspace (min-width: 1280px) {
+  .calendar-layout,
+  .two-col-layout {
+    grid-template-columns: minmax(0, 1fr) clamp(380px, 32cqi, 440px);
+  }
+
+  .pos-layout {
+    grid-template-columns: minmax(0, 1fr) clamp(420px, 36cqi, 460px);
+  }
+
+  .pos-history-filters__grid {
+    max-width: 1120px;
+  }
+
+  .form-card > .form-card__title-row,
+  .form-card > .alert,
+  .form-card > .callout,
+  .form-card > .field,
+  .form-card > .field-row,
+  .form-card > .checkbox-field,
+  .form-card > .form-card__footer,
+  .pos-cash-card > .detail-card__header,
+  .pos-cash-card > .callout,
+  .pos-cash-card > .alert,
+  .pos-cash-card > .field,
+  .pos-cash-card > .quick-tender-row,
+  .pos-cash-card > .change-box,
+  .pos-cash-card > .pos-summary-actions,
+  .recovery-card > .recovery-card__header,
+  .recovery-card > .callout,
+  .recovery-card > .detail-list,
+  .recovery-card > .alert,
+  .recovery-card > .recovery-actions {
+    width: 100%;
+    max-width: 780px;
+  }
+
+  .page-subtitle,
+  .callout__body,
+  .home-attention__body {
+    max-width: 85ch;
+  }
+
+  .home-module-grid {
+    gap: 20px;
+  }
+
+  .home-card {
+    padding: 26px 24px 24px;
+  }
+
+  .home-card__action {
+    padding: 0 18px;
+    font-size: 0.9rem;
   }
 }
