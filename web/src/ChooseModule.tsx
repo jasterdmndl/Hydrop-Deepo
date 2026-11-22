@@ -856,9 +856,17 @@ export function ChooseModule() {
                     {mod.key === "dashboard" && (
                       <span
                         id="dashboard-availability-reason"
-                        className="home-card__status-text home-card__status-text--muted"
+                        className={`home-card__status-text ${
+                          mod.state === "open"
+                            ? "home-card__status-text--accent"
+                            : "home-card__status-text--muted"
+                        }`}
                       >
-                        {mod.state === "locked" ? "Restricted to Owner account." : "Planned for a later slice."}
+                        {mod.state === "locked"
+                          ? "Restricted to Owner account."
+                          : mod.state === "open"
+                            ? "Sales reports & current stocks"
+                            : "Planned for a later slice."}
                       </span>
                     )}
 
@@ -929,13 +937,15 @@ export function ChooseModule() {
                           ? posDay?.state === "OPEN"
                             ? "Start a sale"
                             : "Open POS"
-                          : mod.key === "inventory"
-                            ? mod.state === "read-only"
-                              ? "View inventory"
-                              : "Open inventory"
-                            : mod.state === "read-only"
-                              ? "View calendar"
-                              : "Open calendar"}
+                          : mod.key === "dashboard"
+                            ? "View dashboard"
+                            : mod.key === "inventory"
+                              ? mod.state === "read-only"
+                                ? "View inventory"
+                                : "Open inventory"
+                              : mod.state === "read-only"
+                                ? "View calendar"
+                                : "Open calendar"}
                       </span>
                     </Link>
                   ) : (

@@ -110,7 +110,9 @@ describe("shared sign-in and module entry", () => {
       expect(byKey(cashierModules.body).calendar).toMatchObject({ state: "read-only", path: "/calendar" });
       expect(byKey(ownerModules.body).inventory).toMatchObject({ state: "open", path: "/inventory" });
       expect(byKey(cashierModules.body).inventory).toMatchObject({ state: "read-only", path: "/inventory" });
+      expect(byKey(ownerModules.body).dashboard).toMatchObject({ state: "open", path: "/dashboard" });
       expect(byKey(cashierModules.body).dashboard.state).toBe("locked");
+      expect(byKey(cashierModules.body).dashboard.path).toBeUndefined();
       expect(Object.keys(byKey(ownerModules.body))).toEqual(["pos", "dashboard", "calendar", "inventory"]);
       // Station status appears only once the business-day feature exists.
       expect(ownerModules.body.stationStatus).toBeNull();
@@ -135,7 +137,13 @@ describe("shared sign-in and module entry", () => {
     });
 
     it("rejects module requests without a session", async () => {
-      for (const url of ["/api/modules", "/api/calendar/access", "/api/inventory/items", "/api/auth/session"]) {
+      for (const url of [
+        "/api/modules",
+        "/api/dashboard/sales",
+        "/api/calendar/access",
+        "/api/inventory/items",
+        "/api/auth/session",
+      ]) {
         const res = await request(ctx.app).get(url);
         expect(res.status).toBe(401);
         expect(res.body.error.code).toBe("UNAUTHENTICATED");

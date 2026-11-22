@@ -6,6 +6,7 @@ import { postAuthRedirectPath } from "./auth/idle";
 import { LoginPage } from "./auth/LoginPage";
 import { CalendarPage } from "./calendar/CalendarPage";
 import { ChooseModule, WorkspaceSidebarProvider } from "./ChooseModule";
+import { DashboardPage } from "./dashboard/DashboardPage";
 import { InventoryPage } from "./inventory/InventoryPage";
 import { PosPage } from "./pos/PosPage";
 
@@ -51,6 +52,10 @@ function AppRoutes() {
     <WorkspaceSidebarProvider key={state.user.username}>
       <Routes>
         <Route path="/" element={<ChooseModule />} />
+        <Route
+          path="/dashboard"
+          element={state.user.role === "OWNER" ? <DashboardPage /> : <Navigate to="/" replace />}
+        />
         <Route path="/pos" element={<PosPage />} />
         <Route path="/calendar" element={<CalendarPage />} />
         <Route path="/inventory" element={<InventoryPage />} />

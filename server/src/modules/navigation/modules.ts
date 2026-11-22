@@ -32,9 +32,10 @@ export function modulesFor(role: Role): ModuleEntry[] {
     {
       key: "dashboard",
       name: "Dashboard",
-      description: "Sales summaries and recommendations.",
-      // Dashboard remains locked for Cashier with no sales-summary preview.
-      state: role === "OWNER" ? "coming-later" : "locked",
+      description: "View sales summaries, station reminders, and current stock levels.",
+      // Dashboard remains locked for Cashier with no sales-summary preview (DEC-076, NAV-001).
+      state: role === "OWNER" ? "open" : "locked",
+      ...(role === "OWNER" ? { path: "/dashboard" } : {}),
     },
     {
       key: "calendar",

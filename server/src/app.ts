@@ -5,6 +5,7 @@ import express, { type ErrorRequestHandler, type Express } from "express";
 import helmet from "helmet";
 import type { Database } from "./db/database.js";
 import { calendarRoutes } from "./modules/calendar/routes.js";
+import { dashboardRoutes } from "./modules/dashboard/routes.js";
 import { cookieSettings, moduleAccess, requestClock } from "./modules/auth/guards.js";
 import { authRoutes } from "./modules/auth/routes.js";
 import { AuthService } from "./modules/auth/service.js";
@@ -46,6 +47,7 @@ export function createApp(options: AppOptions): Express {
   api.use("/auth", authRoutes(auth, cookies));
   api.use("/modules", moduleAccess(auth, cookies), navigationRoutes());
   api.use("/calendar", moduleAccess(auth, cookies), calendarRoutes(options.db));
+  api.use("/dashboard", moduleAccess(auth, cookies), dashboardRoutes(options.db));
   api.use("/pos", moduleAccess(auth, cookies), posRoutes(options.db));
   api.use("/inventory", moduleAccess(auth, cookies), inventoryRoutes(options.db));
   api.use((_req, res) => sendError(res, 404, "NOT_FOUND", "Not found."));
