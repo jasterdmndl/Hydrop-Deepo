@@ -220,7 +220,9 @@ function homeCardDescription(mod: ModuleEntry): string {
         ? "View scheduled station activities and completion history. Only the Owner can schedule or record work."
         : "Keep track of station activities, schedule work, and record completion.";
     case "inventory":
-      return "Track stock on hand, receiving, and operating supplies used.";
+      return mod.state === "read-only"
+        ? "View Round and Slim container stock on hand. Only the Owner can record opening counts."
+        : "View Round and Slim container stock on hand and record opening counts.";
   }
 }
 
@@ -863,9 +865,15 @@ export function ChooseModule() {
                     {mod.key === "inventory" && (
                       <span
                         id="inventory-availability-reason"
-                        className="home-card__status-text home-card__status-text--muted"
+                        className={`home-card__status-text ${
+                          mod.state === "coming-later"
+                            ? "home-card__status-text--muted"
+                            : "home-card__status-text--accent"
+                        }`}
                       >
-                        Planned for a later slice.
+                        {mod.state === "coming-later"
+                          ? "Planned for a later slice."
+                          : "Round & Slim container opening stock"}
                       </span>
                     )}
 
@@ -921,9 +929,13 @@ export function ChooseModule() {
                           ? posDay?.state === "OPEN"
                             ? "Start a sale"
                             : "Open POS"
-                          : mod.state === "read-only"
-                            ? "View calendar"
-                            : "Open calendar"}
+                          : mod.key === "inventory"
+                            ? mod.state === "read-only"
+                              ? "View inventory"
+                              : "Open inventory"
+                            : mod.state === "read-only"
+                              ? "View calendar"
+                              : "Open calendar"}
                       </span>
                     </Link>
                   ) : (

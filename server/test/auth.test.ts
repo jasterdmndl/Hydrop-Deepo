@@ -108,6 +108,8 @@ describe("shared sign-in and module entry", () => {
 
       expect(byKey(ownerModules.body).calendar).toMatchObject({ state: "open", path: "/calendar" });
       expect(byKey(cashierModules.body).calendar).toMatchObject({ state: "read-only", path: "/calendar" });
+      expect(byKey(ownerModules.body).inventory).toMatchObject({ state: "open", path: "/inventory" });
+      expect(byKey(cashierModules.body).inventory).toMatchObject({ state: "read-only", path: "/inventory" });
       expect(byKey(cashierModules.body).dashboard.state).toBe("locked");
       expect(Object.keys(byKey(ownerModules.body))).toEqual(["pos", "dashboard", "calendar", "inventory"]);
       // Station status appears only once the business-day feature exists.
@@ -117,10 +119,15 @@ describe("shared sign-in and module entry", () => {
       const cashierAccess = await request(ctx.app).get("/api/calendar/access").set("Cookie", cashier.cookie);
       expect(ownerAccess.body).toEqual({ canView: true, canManage: true });
       expect(cashierAccess.body).toEqual({ canView: true, canManage: false });
+
+      const ownerInvAccess = await request(ctx.app).get("/api/inventory/access").set("Cookie", owner.cookie);
+      const cashierInvAccess = await request(ctx.app).get("/api/inventory/access").set("Cookie", cashier.cookie);
+      expect(ownerInvAccess.body).toEqual({ canView: true, canInitializeOpeningStock: true });
+      expect(cashierInvAccess.body).toEqual({ canView: true, canInitializeOpeningStock: false });
     });
 
     it("rejects module requests without a session", async () => {
-      for (const url of ["/api/modules", "/api/calendar/access", "/api/auth/session"]) {
+      for (const url of ["/api/modules", "/api/calendar/access", "/api/inventory/items", "/api/auth/session"]) {
         const res = await request(ctx.app).get(url);
         expect(res.status).toBe(401);
         expect(res.body.error.code).toBe("UNAUTHENTICATED");
