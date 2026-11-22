@@ -47,8 +47,9 @@ export function modulesFor(role: Role): ModuleEntry[] {
     {
       key: "inventory",
       name: "Inventory",
-      description: "Stock on hand, receiving, and supplies used.",
-      state: "coming-later",
+      description: "View container stock on hand and record opening counts.",
+      state: role === "OWNER" ? "open" : "read-only",
+      path: "/inventory",
     },
   ];
 }

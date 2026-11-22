@@ -6,6 +6,7 @@ import { postAuthRedirectPath } from "./auth/idle";
 import { LoginPage } from "./auth/LoginPage";
 import { CalendarPage } from "./calendar/CalendarPage";
 import { ChooseModule, WorkspaceSidebarProvider } from "./ChooseModule";
+import { InventoryPage } from "./inventory/InventoryPage";
 import { PosPage } from "./pos/PosPage";
 
 function AppRoutes() {
@@ -52,6 +53,7 @@ function AppRoutes() {
         <Route path="/" element={<ChooseModule />} />
         <Route path="/pos" element={<PosPage />} />
         <Route path="/calendar" element={<CalendarPage />} />
+        <Route path="/inventory" element={<InventoryPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </WorkspaceSidebarProvider>
