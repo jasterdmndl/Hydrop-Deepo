@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   cartLinesSignature,
   clearUnpaidCart,
+  clearUnpaidCartIfMatchesReference,
   computeCashSummary,
   evaluateEndDayGuard,
   formatCentavos,
@@ -495,6 +496,78 @@ describe("account-scoped unpaid cart and workstation recovery storage", () => {
     expect(loadPendingRecoveries(localStore)).toEqual([]);
   });
 
+  it("clears a stored unpaid cart only when its preparedCheckout reference matches the resolved reference", () => {
+    const sessionStore = makeMemoryStorage();
+    const lines: CartDraftLine[] = [
+      {
+        id: "std-PURIFIED",
+        kind: "STANDARD",
+        waterType: "PURIFIED",
+        displayName: "Purified refill · 25 L",
+        unitVolumeMl: 25000,
+        unitVolumeLiters: 25,
+        unitPriceCentavos: 2500,
+        quantity: 1,
+      },
+    ];
+
+    // Unrelated cart without preparedCheckout must be preserved.
+    saveUnpaidCart(
+      {
+        ownerUsername: "owner1",
+        businessDate: "2026-11-22",
+        lines,
+        preparedCheckout: null,
+        prepareKey: null,
+        prepareSignature: null,
+      },
+      sessionStore,
+    );
+    expect(clearUnpaidCartIfMatchesReference("owner1", "HD-1121-001", sessionStore)).toBe(false);
+    expect(loadUnpaidCart("owner1", sessionStore)?.lines).toEqual(lines);
+
+    // Unrelated cart with a different preparedCheckout reference must also be preserved.
+    const otherCheckout: CheckoutView = {
+      ...makeLookup({}).checkout,
+      reference: "HD-1122-001",
+      businessDate: "2026-11-22",
+      status: "DRAFT",
+    };
+    saveUnpaidCart(
+      {
+        ownerUsername: "owner1",
+        businessDate: "2026-11-22",
+        lines,
+        preparedCheckout: otherCheckout,
+        prepareKey: "prep-other",
+        prepareSignature: cartLinesSignature(lines),
+      },
+      sessionStore,
+    );
+    expect(clearUnpaidCartIfMatchesReference("owner1", "HD-1121-001", sessionStore)).toBe(false);
+    expect(loadUnpaidCart("owner1", sessionStore)?.preparedCheckout?.reference).toBe("HD-1122-001");
+
+    // Cart tied to the resolved reference (case/whitespace insensitive) must be discarded.
+    const tiedCheckout: CheckoutView = {
+      ...otherCheckout,
+      reference: "HD-1121-001",
+      businessDate: "2026-11-21",
+    };
+    saveUnpaidCart(
+      {
+        ownerUsername: "owner1",
+        businessDate: "2026-11-22",
+        lines,
+        preparedCheckout: tiedCheckout,
+        prepareKey: "prep-tied",
+        prepareSignature: cartLinesSignature(lines),
+      },
+      sessionStore,
+    );
+    expect(clearUnpaidCartIfMatchesReference("owner1", " hd-1121-001 ", sessionStore)).toBe(true);
+    expect(loadUnpaidCart("owner1", sessionStore)).toBeNull();
+  });
+
   it("preserves multiple concurrent pending references across two tabs and clears only the resolved reference", () => {
     const localStore = makeMemoryStorage();
 
@@ -636,5 +709,185 @@ describe("account-scoped unpaid cart and workstation recovery storage", () => {
 
     expect(loadPendingRecoveries(localStore)).toEqual([]);
     expect(loadUnpaidCart("cashier1", sessionStore)).toBeNull();
+  });
+
+  it("gates prior-day settlement eligibility to Owner and presents SETTLED_PRIOR_DAY without repeat collection", () => {
+    const priorDayReview = makePendingRecord({
+      reference: "HD-1109-050",
+      businessDate: "2026-11-09",
+      totalCentavos: 5000,
+      cashReceivedCentavos: 10000,
+      changeCentavos: 5000,
+      lastLookup: makeLookup({
+        recoveryState: "REVIEW_REQUIRED",
+        reason: "BUSINESS_DATE_CROSSED",
+        canRetry: false,
+        canSettlePriorDay: true,
+        ownedByCurrentUser: false,
+        checkout: {
+          ...makeLookup({}).checkout,
+          reference: "HD-1109-050",
+          businessDate: "2026-11-09",
+          status: "REVIEW_REQUIRED",
+          totalCentavos: 5000,
+          cashReceivedCentavos: 10000,
+          changeCentavos: 5000,
+          resolutionReason: "BUSINESS_DATE_CROSSED",
+        },
+      }),
+    });
+
+    const ownerView = resolveRecoveryPresentation(
+      priorDayReview,
+      "owner1",
+      "OWNER",
+      "2026-11-10",
+    );
+    expect(ownerView).toMatchObject({
+      screen: "REVIEW_REQUIRED",
+      canSettlePriorDay: true,
+      canRetry: false,
+    });
+
+    const cashierFallback = resolveRecoveryPresentation(
+      makePendingRecord({
+        ...priorDayReview,
+        lastLookup: {
+          ...priorDayReview.lastLookup!,
+          canSettlePriorDay: undefined,
+        },
+      }),
+      "cashier1",
+      "CASHIER",
+      "2026-11-10",
+    );
+    expect(cashierFallback.canSettlePriorDay).toBe(false);
+
+    const sameDayOwner = resolveRecoveryPresentation(
+      makePendingRecord({
+        ...priorDayReview,
+        lastLookup: {
+          ...priorDayReview.lastLookup!,
+          canSettlePriorDay: undefined,
+        },
+      }),
+      "owner1",
+      "OWNER",
+      "2026-11-09",
+    );
+    expect(sameDayOwner.canSettlePriorDay).toBe(false);
+
+    const settledPresentation = resolveRecoveryPresentation(
+      makePendingRecord({
+        reference: "HD-1109-050",
+        businessDate: "2026-11-09",
+        totalCentavos: 5000,
+        cashReceivedCentavos: 10000,
+        changeCentavos: 5000,
+        lastLookup: makeLookup({
+          recoveryState: "SETTLED_PRIOR_DAY",
+          reason: "SETTLED_PRIOR_DAY_PAID_AND_DELIVERED",
+          canRetry: false,
+          canSettlePriorDay: false,
+          checkout: {
+            ...makeLookup({}).checkout,
+            reference: "HD-1109-050",
+            businessDate: "2026-11-09",
+            status: "SETTLED_PRIOR_DAY",
+            totalCentavos: 5000,
+            cashReceivedCentavos: 10000,
+            changeCentavos: 5000,
+          },
+          settlement: {
+            checkoutReference: "HD-1109-050",
+            originalBusinessDate: "2026-11-09",
+            settlementDate: "2026-11-10",
+            outcome: "PAID_AND_DELIVERED",
+            netAmountKeptCentavos: 5000,
+            cashReceivedCentavos: 10000,
+            changeCentavos: 5000,
+            totalContainers: 2,
+            totalVolumeMl: 50000,
+            totalVolumeLiters: 50,
+            items: [SAMPLE_ITEMS[0]!],
+            originalActor: "cashier1",
+            originalPaymentRecordedAt: "2026-11-09T23:55:00+08:00",
+            paymentKeptConfirmed: true,
+            refillDeliveredConfirmed: true,
+            settledBy: "owner1",
+            settledAt: "2026-11-10T08:15:00+08:00",
+            note: null,
+          },
+        }),
+      }),
+      "owner1",
+      "OWNER",
+      "2026-11-10",
+    );
+
+    expect(settledPresentation).toMatchObject({
+      screen: "SETTLED_PRIOR_DAY",
+      canContinueSettled: true,
+      canRetry: false,
+      canSettlePriorDay: false,
+      statusPillLabel: "Settled · prior day",
+      calloutTitle: "No further payment collected",
+      amounts: {
+        totalCentavos: 5000,
+        cashReceivedCentavos: 10000,
+        changeCentavos: 5000,
+        totalContainers: 2,
+        totalVolumeLiters: 50,
+      },
+    });
+    expect(settledPresentation.settlement?.settlementDate).toBe("2026-11-10");
+  });
+
+  it("refreshes prior-day settlement permission strictly from current role on account switch in both directions", () => {
+    const cachedOwnerTrue = makePendingRecord({
+      reference: "HD-1109-051",
+      businessDate: "2026-11-09",
+      lastLookup: makeLookup({
+        recoveryState: "REVIEW_REQUIRED",
+        reason: "BUSINESS_DATE_CROSSED",
+        canRetry: false,
+        canSettlePriorDay: true,
+        ownedByCurrentUser: false,
+        checkedAt: "2026-11-10T08:15:00+08:00",
+        checkout: {
+          ...makeLookup({}).checkout,
+          reference: "HD-1109-051",
+          businessDate: "2026-11-09",
+          status: "REVIEW_REQUIRED",
+          resolutionReason: "BUSINESS_DATE_CROSSED",
+        },
+      }),
+    });
+
+    // Cached Owner true must NOT expose settle button when switched to Cashier.
+    expect(
+      resolveRecoveryPresentation(cachedOwnerTrue, "cashier1", "CASHIER", "2026-11-10")
+        .canSettlePriorDay,
+    ).toBe(false);
+    expect(
+      resolveRecoveryPresentation(cachedOwnerTrue, "cashier1", "CASHIER").canSettlePriorDay,
+    ).toBe(false);
+
+    const cachedCashierFalse = makePendingRecord({
+      ...cachedOwnerTrue,
+      lastLookup: {
+        ...cachedOwnerTrue.lastLookup!,
+        canSettlePriorDay: false,
+      },
+    });
+
+    // Cached Cashier false MUST unlock settle control when switched to Owner (with or without todayDate).
+    expect(
+      resolveRecoveryPresentation(cachedCashierFalse, "owner1", "OWNER", "2026-11-10")
+        .canSettlePriorDay,
+    ).toBe(true);
+    expect(
+      resolveRecoveryPresentation(cachedCashierFalse, "owner1", "OWNER").canSettlePriorDay,
+    ).toBe(true);
   });
 });

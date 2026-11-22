@@ -9,6 +9,7 @@ import {
   formatSaleReference,
   type ItemKind,
   mlToLiters,
+  type PriorDaySettlementView,
   type QuoteLineItem,
   type SaleActionView,
   type SaleStatus,
@@ -65,6 +66,7 @@ export interface CheckoutDbRow {
   paymentStartedAt: Date | string | null;
   paymentRecordedAt: Date | string | null;
   resolutionReason: string | null;
+  cancellationOrigin: "EXPLICIT_OPERATOR" | "AUTO_END_DAY" | null;
   createdAt: Date | string;
   updatedAt: Date | string;
   dayClosedAt: Date | string | null;
@@ -108,6 +110,30 @@ interface SaleActionDbRow {
   actorUsername: string;
   note: string | null;
   recordedAt: Date | string;
+}
+
+interface PriorDaySettlementDbRow {
+  id: string;
+  checkoutId: string;
+  checkoutReference: string;
+  originalBusinessDayId: string;
+  originalBusinessDate: string;
+  settlementDate: string;
+  outcome: "PAID_AND_DELIVERED";
+  netAmountKeptCentavos: number | string;
+  cashReceivedCentavos: number | string | null;
+  changeCentavos: number | string | null;
+  totalContainers: number | string;
+  totalVolumeMl: number | string;
+  itemsSnapshot: unknown;
+  originalActorUsername: string;
+  originalPaymentStartedAt: Date | string | null;
+  originalPaymentRecordedAt: Date | string | null;
+  paymentKeptConfirmed: boolean;
+  refillDeliveredConfirmed: boolean;
+  settledByUsername: string;
+  settledAt: Date | string;
+  note: string | null;
 }
 
 function toDate(value: Date | string): Date {
@@ -195,6 +221,35 @@ export function toCheckoutView(row: CheckoutDbRow): CheckoutView {
   };
 }
 
+export function toPriorDaySettlementView(row: PriorDaySettlementDbRow): PriorDaySettlementView {
+  const totalVolumeMl = Number(row.totalVolumeMl);
+  return {
+    checkoutReference: row.checkoutReference,
+    originalBusinessDate: row.originalBusinessDate,
+    settlementDate: row.settlementDate,
+    outcome: row.outcome,
+    netAmountKeptCentavos: Number(row.netAmountKeptCentavos),
+    cashReceivedCentavos: row.cashReceivedCentavos === null ? null : Number(row.cashReceivedCentavos),
+    changeCentavos: row.changeCentavos === null ? null : Number(row.changeCentavos),
+    totalContainers: Number(row.totalContainers),
+    totalVolumeMl,
+    totalVolumeLiters: mlToLiters(totalVolumeMl),
+    items: parseQuoteSnapshot(row.itemsSnapshot),
+    originalActor: row.originalActorUsername,
+    originalPaymentStartedAt: row.originalPaymentStartedAt
+      ? formatManilaIso(toDate(row.originalPaymentStartedAt))
+      : null,
+    originalPaymentRecordedAt: row.originalPaymentRecordedAt
+      ? formatManilaIso(toDate(row.originalPaymentRecordedAt))
+      : null,
+    paymentKeptConfirmed: true,
+    refillDeliveredConfirmed: true,
+    settledBy: row.settledByUsername,
+    settledAt: formatManilaIso(toDate(row.settledAt)),
+    note: row.note,
+  };
+}
+
 const DAY_SELECT = `
   SELECT d.id,
          to_char(d.business_date, 'YYYY-MM-DD') AS "businessDate",
@@ -238,6 +293,7 @@ const CHECKOUT_SELECT = `
          c.payment_started_at AS "paymentStartedAt",
          c.payment_recorded_at AS "paymentRecordedAt",
          c.resolution_reason AS "resolutionReason",
+         c.cancellation_origin AS "cancellationOrigin",
          c.created_at AS "createdAt",
          c.updated_at AS "updatedAt",
          d.closed_at AS "dayClosedAt"
@@ -264,6 +320,44 @@ const SALE_SELECT = `
     FROM pos_sales s
     JOIN pos_checkouts c ON c.id = s.checkout_id
     JOIN app_users creator ON creator.id = s.created_by_user_id`;
+
+const SETTLEMENT_SELECT = `
+  SELECT p.id,
+         p.checkout_id AS "checkoutId",
+         p.checkout_reference AS "checkoutReference",
+         p.original_business_day_id AS "originalBusinessDayId",
+         to_char(p.original_business_date, 'YYYY-MM-DD') AS "originalBusinessDate",
+         to_char(p.settlement_date, 'YYYY-MM-DD') AS "settlementDate",
+         p.outcome,
+         p.net_amount_kept_centavos AS "netAmountKeptCentavos",
+         p.cash_received_centavos AS "cashReceivedCentavos",
+         p.change_centavos AS "changeCentavos",
+         p.total_containers AS "totalContainers",
+         p.total_volume_ml AS "totalVolumeMl",
+         p.items_snapshot AS "itemsSnapshot",
+         orig.username AS "originalActorUsername",
+         p.original_payment_started_at AS "originalPaymentStartedAt",
+         p.original_payment_recorded_at AS "originalPaymentRecordedAt",
+         p.payment_kept_confirmed AS "paymentKeptConfirmed",
+         p.refill_delivered_confirmed AS "refillDeliveredConfirmed",
+         settler.username AS "settledByUsername",
+         p.settled_at AS "settledAt",
+         p.note
+    FROM pos_prior_day_settlements p
+    JOIN app_users orig ON orig.id = p.original_actor_user_id
+    JOIN app_users settler ON settler.id = p.settled_by_user_id`;
+
+async function loadPriorDaySettlements(
+  db: Queryable,
+  whereAndOrderSql: string,
+  params: unknown[],
+): Promise<PriorDaySettlementView[]> {
+  const { rows } = await db.query<PriorDaySettlementDbRow>(
+    `${SETTLEMENT_SELECT} ${whereAndOrderSql}`,
+    params,
+  );
+  return rows.map(toPriorDaySettlementView);
+}
 
 async function loadSaleViews(
   db: Queryable,
@@ -628,6 +722,21 @@ export const posRepository = {
     return this.listNonTerminalCheckoutsForDay(tx, dayId);
   },
 
+  async listClosedPriorDayReviewCheckouts(
+    db: Queryable,
+    todayDate: string,
+  ): Promise<CheckoutDbRow[]> {
+    const { rows } = await db.query<CheckoutDbRow>(
+      `${CHECKOUT_SELECT}
+        WHERE d.closed_at IS NOT NULL
+          AND c.business_date < $1::date
+          AND c.status IN ('PAYMENT_PENDING', 'REVIEW_REQUIRED')
+        ORDER BY c.business_date DESC, c.created_at ASC, c.reference ASC`,
+      [todayDate],
+    );
+    return rows;
+  },
+
   async insertCheckout(
     tx: Queryable,
     input: {
@@ -722,6 +831,7 @@ export const posRepository = {
       `UPDATE pos_checkouts
           SET status = 'CANCELLED_DRAFT',
               resolution_reason = $2,
+              cancellation_origin = 'EXPLICIT_OPERATOR',
               updated_at = $3
         WHERE id = $1`,
       [input.checkoutId, input.reason, input.now],
@@ -734,6 +844,7 @@ export const posRepository = {
       `UPDATE pos_checkouts
           SET status = 'CANCELLED_DRAFT',
               resolution_reason = 'CLEARED_ON_END_DAY',
+              cancellation_origin = 'AUTO_END_DAY',
               updated_at = $2
         WHERE business_day_id = $1 AND status = 'DRAFT'
         RETURNING reference`,
@@ -869,5 +980,138 @@ export const posRepository = {
       `WHERE ${conditions.join(" AND ")} ORDER BY s.created_at DESC, s.reference DESC`,
       params,
     );
+  },
+
+  async findPriorDaySettlementByCheckoutId(
+    db: Queryable,
+    checkoutId: string,
+  ): Promise<PriorDaySettlementView | undefined> {
+    const rows = await loadPriorDaySettlements(db, `WHERE p.checkout_id = $1`, [checkoutId]);
+    return rows[0];
+  },
+
+  async findPriorDaySettlementByReference(
+    db: Queryable,
+    reference: string,
+  ): Promise<PriorDaySettlementView | undefined> {
+    const rows = await loadPriorDaySettlements(db, `WHERE p.checkout_reference = $1`, [reference]);
+    return rows[0];
+  },
+
+  async listPriorDaySettlements(
+    db: Queryable,
+    filters: {
+      settlementDate?: string;
+      originalBusinessDate?: string;
+      referenceQuery: string;
+    },
+  ): Promise<PriorDaySettlementView[]> {
+    const conditions: string[] = [];
+    const params: unknown[] = [];
+
+    if (filters.settlementDate) {
+      params.push(filters.settlementDate);
+      conditions.push(`p.settlement_date = $${params.length}::date`);
+    }
+
+    if (filters.originalBusinessDate) {
+      params.push(filters.originalBusinessDate);
+      conditions.push(`p.original_business_date = $${params.length}::date`);
+    }
+
+    const q = filters.referenceQuery.trim();
+    if (q.length > 0) {
+      const escaped = q.replace(/[\\%_]/g, "\\$&");
+      params.push(`%${escaped}%`);
+      conditions.push(`p.checkout_reference ILIKE $${params.length} ESCAPE '\\'`);
+    }
+
+    const whereSql = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
+    return loadPriorDaySettlements(
+      db,
+      `${whereSql} ORDER BY p.settled_at DESC, p.checkout_reference DESC`,
+      params,
+    );
+  },
+
+  async insertPriorDaySettlementAtomic(
+    tx: Queryable,
+    input: {
+      checkoutId: string;
+      checkoutReference: string;
+      originalBusinessDayId: string;
+      originalBusinessDate: string;
+      settlementDate: string;
+      netAmountKeptCentavos: number;
+      cashReceivedCentavos: number | null;
+      changeCentavos: number | null;
+      totalContainers: number;
+      totalVolumeMl: number;
+      items: QuoteLineItem[];
+      originalActorUserId: string;
+      originalPaymentStartedAt: Date | null;
+      originalPaymentRecordedAt: Date | null;
+      settledByUserId: string;
+      settledAt: Date;
+      note: string | null;
+    },
+  ): Promise<{ settlement: PriorDaySettlementView; checkout: CheckoutView }> {
+    await tx.query(
+      `INSERT INTO pos_prior_day_settlements (
+         checkout_id, checkout_reference, original_business_day_id,
+         original_business_date, settlement_date, outcome,
+         net_amount_kept_centavos, cash_received_centavos, change_centavos,
+         total_containers, total_volume_ml, items_snapshot,
+         original_actor_user_id, original_payment_started_at, original_payment_recorded_at,
+         payment_kept_confirmed, refill_delivered_confirmed,
+         settled_by_user_id, settled_at, note
+       )
+       VALUES (
+         $1, $2, $3, $4::date, $5::date, 'PAID_AND_DELIVERED',
+         $6, $7, $8, $9, $10, $11::jsonb, $12, $13, $14, true, true, $15, $16, $17
+       )`,
+      [
+        input.checkoutId,
+        input.checkoutReference,
+        input.originalBusinessDayId,
+        input.originalBusinessDate,
+        input.settlementDate,
+        input.netAmountKeptCentavos,
+        input.cashReceivedCentavos,
+        input.changeCentavos,
+        input.totalContainers,
+        input.totalVolumeMl,
+        JSON.stringify(input.items),
+        input.originalActorUserId,
+        input.originalPaymentStartedAt,
+        input.originalPaymentRecordedAt,
+        input.settledByUserId,
+        input.settledAt,
+        input.note,
+      ],
+    );
+
+    await tx.query(
+      `UPDATE pos_checkouts
+          SET status = 'SETTLED_PRIOR_DAY',
+              cash_received_centavos = COALESCE(cash_received_centavos, $2),
+              change_centavos = COALESCE(change_centavos, $3),
+              resolution_reason = 'SETTLED_PRIOR_DAY_PAID_AND_DELIVERED',
+              updated_at = $4
+        WHERE id = $1`,
+      [
+        input.checkoutId,
+        input.cashReceivedCentavos,
+        input.changeCentavos,
+        input.settledAt,
+      ],
+    );
+
+    const [settlement, checkout] = await Promise.all([
+      this.findPriorDaySettlementByCheckoutId(tx, input.checkoutId),
+      this.findCheckoutByReference(tx, input.checkoutReference),
+    ]);
+
+    return { settlement: settlement!, checkout: toCheckoutView(checkout!) };
   },
 };

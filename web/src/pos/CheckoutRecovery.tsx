@@ -3,6 +3,7 @@ import {
   formatLiters,
   formatManilaTimestamp,
   type PendingCheckoutRecovery,
+  type PriorDaySettlementView,
   type RecoveryTone,
   resolveRecoveryPresentation,
   type SaleView,
@@ -12,6 +13,8 @@ export interface CheckoutRecoveryProps {
   record: PendingCheckoutRecovery;
   allRecoveries?: PendingCheckoutRecovery[];
   currentUsername: string;
+  currentUserRole?: "OWNER" | "CASHIER";
+  todayDate?: string;
   checking: boolean;
   retrying: boolean;
   errorMessage: string | null;
@@ -19,6 +22,8 @@ export interface CheckoutRecoveryProps {
   onCheckStatus(): void;
   onRetry(): void;
   onContinueSaved(reference: string, sale: SaleView): void;
+  onOpenPriorDaySettle?: (record: PendingCheckoutRecovery) => void;
+  onContinueSettled?: (reference: string, settlement: PriorDaySettlementView) => void;
 }
 
 function pillClassForTone(tone: RecoveryTone): string {
@@ -71,6 +76,8 @@ export function CheckoutRecovery({
   record,
   allRecoveries,
   currentUsername,
+  currentUserRole = "CASHIER",
+  todayDate,
   checking,
   retrying,
   errorMessage,
@@ -78,8 +85,15 @@ export function CheckoutRecovery({
   onCheckStatus,
   onRetry,
   onContinueSaved,
+  onOpenPriorDaySettle,
+  onContinueSettled,
 }: CheckoutRecoveryProps) {
-  const presentation = resolveRecoveryPresentation(record, currentUsername);
+  const presentation = resolveRecoveryPresentation(
+    record,
+    currentUsername,
+    currentUserRole,
+    todayDate,
+  );
 
   return (
     <div className="pos-layout">
@@ -140,9 +154,25 @@ export function CheckoutRecovery({
               <dd className="mono-ref">{record.reference}</dd>
             </div>
             <div className="detail-list__row">
+              <dt>Original payment date</dt>
+              <dd>{record.businessDate}</dd>
+            </div>
+            <div className="detail-list__row">
               <dt>Attempted at</dt>
               <dd>{formatManilaTimestamp(record.attemptedAt)}</dd>
             </div>
+            {presentation.settlement && (
+              <>
+                <div className="detail-list__row">
+                  <dt>Settlement date (Manila)</dt>
+                  <dd>{presentation.settlement.settlementDate}</dd>
+                </div>
+                <div className="detail-list__row">
+                  <dt>Settled by</dt>
+                  <dd>{presentation.settlement.settledBy}</dd>
+                </div>
+              </>
+            )}
             <div className="detail-list__row">
               <dt>Employee</dt>
               <dd>{record.initiatedBy}</dd>
@@ -219,6 +249,16 @@ export function CheckoutRecovery({
 
             {presentation.screen === "REVIEW_REQUIRED" && (
               <>
+                {presentation.canSettlePriorDay && onOpenPriorDaySettle && (
+                  <button
+                    type="button"
+                    className="button button--primary button--block"
+                    disabled={checking || retrying}
+                    onClick={() => onOpenPriorDaySettle(record)}
+                  >
+                    Review &amp; settle prior-day refill
+                  </button>
+                )}
                 <button
                   type="button"
                   className="button button--ghost button--block"
@@ -228,11 +268,24 @@ export function CheckoutRecovery({
                   {checking ? "Checking status…" : "Check transaction status"}
                 </button>
                 <p className="muted-sm">
-                  Keep this reference for Owner review. Automated refunds and backdated sales are not performed in this
-                  version.
+                  {currentUserRole === "CASHIER" && todayDate && record.businessDate < todayDate
+                    ? "Keep this reference for Owner review. Only the Owner can settle a confirmed paid-and-delivered prior-day refill; other outcomes remain pending."
+                    : "Keep this reference for Owner review. Automated refunds and backdated sales are not performed in this version."}
                 </p>
               </>
             )}
+
+            {presentation.screen === "SETTLED_PRIOR_DAY" &&
+              presentation.settlement &&
+              onContinueSettled && (
+                <button
+                  type="button"
+                  className="button button--primary button--block"
+                  onClick={() => onContinueSettled(record.reference, presentation.settlement!)}
+                >
+                  Continue with settled record
+                </button>
+              )}
           </div>
         </article>
 

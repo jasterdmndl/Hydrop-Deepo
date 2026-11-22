@@ -88,6 +88,15 @@ const cancelCheckoutBody = z
   })
   .strict();
 
+const settlePriorDayCheckoutBody = z
+  .object({
+    paymentKeptConfirmed: z.boolean(),
+    refillDeliveredConfirmed: z.boolean(),
+    cashReceivedCentavos: z.number().int().min(1).max(MAX_CASH_CENTAVOS).optional(),
+    note: z.string().trim().max(240).optional(),
+  })
+  .strict();
+
 function paramReference(raw: string | string[] | undefined): string {
   return typeof raw === "string" ? raw.trim().toUpperCase() : "";
 }
@@ -133,16 +142,17 @@ export function posRoutes(db: Database): Router {
 
   router.get("/day", async (req, res) => {
     const todayDate = formatManilaDate(req.now);
-    const [openRow, todayRow] = await Promise.all([
+    const [openRow, todayRow, closedPriorDayRows] = await Promise.all([
       repo.findOpenDay(db),
       repo.findDayByDate(db, todayDate),
+      repo.listClosedPriorDayReviewCheckouts(db, todayDate),
     ]);
 
     const openDayView = openRow
       ? toDayViewWithSummary(
-          openRow,
-          await repo.computeLiveDaySummary(db, openRow.id, openRow.businessDate),
-        )
+        openRow,
+        await repo.computeLiveDaySummary(db, openRow.id, openRow.businessDate),
+      )
       : null;
 
     const todayClosedView = todayRow && todayRow.closedAt !== null ? toClosedDayView(todayRow) : null;
@@ -174,6 +184,7 @@ export function posRoutes(db: Database): Router {
       ...status,
       unresolvedCheckouts,
       unpaidDrafts,
+      priorDayReviewCheckouts: closedPriorDayRows.map(toCheckoutView),
     });
   });
 
@@ -272,11 +283,13 @@ export function posRoutes(db: Database): Router {
     const dayView = toDayViewWithSummary(outcome.dayRow, outcome.summary);
     const status = deriveDayStatus(dayView, null, todayDate);
     const replayed = outcome.kind === "replayed";
+    const closedPriorDayRows = await repo.listClosedPriorDayReviewCheckouts(db, todayDate);
     res.status(replayed ? 200 : 201).json({
       ...status,
       replayed,
       unresolvedCheckouts: [],
       unpaidDrafts: [],
+      priorDayReviewCheckouts: closedPriorDayRows.map(toCheckoutView),
     });
   });
 
@@ -606,6 +619,9 @@ export function posRoutes(db: Database): Router {
       if (checkoutRow.status === "SAVED") {
         return { kind: "already-saved" as const };
       }
+      if (checkoutRow.status === "SETTLED_PRIOR_DAY") {
+        return { kind: "already-settled" as const };
+      }
       if (checkoutRow.status === "CANCELLED_DRAFT") {
         return { kind: "cancelled" as const };
       }
@@ -645,6 +661,15 @@ export function posRoutes(db: Database): Router {
     }
     if (outcome.kind === "already-saved") {
       sendError(res, 409, "CHECKOUT_ALREADY_SAVED", "This checkout is already saved.");
+      return;
+    }
+    if (outcome.kind === "already-settled") {
+      sendError(
+        res,
+        409,
+        "CHECKOUT_ALREADY_SETTLED",
+        "This prior-day checkout has already been settled.",
+      );
       return;
     }
     if (outcome.kind === "cancelled") {
@@ -694,16 +719,22 @@ export function posRoutes(db: Database): Router {
       return;
     }
 
-    const sale =
-      row.status === "SAVED" ? (await repo.findSaleByCheckoutId(db, row.id)) ?? null : null;
+    const [sale, settlement] = await Promise.all([
+      row.status === "SAVED" ? repo.findSaleByCheckoutId(db, row.id) : Promise.resolve(undefined),
+      row.status === "SETTLED_PRIOR_DAY"
+        ? repo.findPriorDaySettlementByCheckoutId(db, row.id)
+        : Promise.resolve(undefined),
+    ]);
 
     const lookup = deriveCheckoutLookup({
       checkout: toCheckoutView(row),
       checkoutOwnerUserId: row.createdByUserId,
       dayClosedAt: toIsoOrNull(row.dayClosedAt),
-      sale,
+      sale: sale ?? null,
+      settlement: settlement ?? null,
       todayDate: formatManilaDate(req.now),
       currentUserId: req.auth!.user.id,
+      currentUserRole: req.auth!.user.role,
       checkedAt: formatManilaIso(req.now),
       inFlightEntry: inFlight.get(reference),
     });
@@ -818,6 +849,15 @@ export function posRoutes(db: Database): Router {
           return { kind: "replayed" as const, sale: existingSale!, checkout: checkoutView };
         }
 
+        if (checkoutRow.status === "SETTLED_PRIOR_DAY") {
+          const existingSettlement = await repo.findPriorDaySettlementByCheckoutId(tx, checkoutRow.id);
+          return {
+            kind: "already-settled" as const,
+            checkout: checkoutView,
+            settlement: existingSettlement ?? null,
+          };
+        }
+
         if (checkoutRow.status === "REVIEW_REQUIRED") {
           if (
             checkoutRow.cashReceivedCentavos !== null &&
@@ -830,6 +870,14 @@ export function posRoutes(db: Database): Router {
 
         if (body.cashReceivedCentavos < checkoutView.totalCentavos) {
           return { kind: "insufficient-cash" as const };
+        }
+
+        const isAutoEndDayClear =
+          checkoutRow.cancellationOrigin === "AUTO_END_DAY" ||
+          (checkoutRow.cancellationOrigin === null &&
+            checkoutRow.resolutionReason === "CLEARED_ON_END_DAY");
+        if (checkoutRow.status === "CANCELLED_DRAFT" && !isAutoEndDayClear) {
+          return { kind: "cancelled" as const };
         }
 
         const changeCentavos = body.cashReceivedCentavos - checkoutView.totalCentavos;
@@ -916,6 +964,17 @@ export function posRoutes(db: Database): Router {
         "CHECKOUT_CANCELLED",
         "This checkout draft was already cancelled.",
       );
+      return;
+    }
+    if (outcome.kind === "already-settled") {
+      res.status(409).json({
+        error: {
+          code: "CHECKOUT_ALREADY_SETTLED",
+          message: "This prior-day checkout has already been settled and cannot be saved again.",
+        },
+        checkout: outcome.checkout,
+        settlement: outcome.settlement,
+      });
       return;
     }
     if (outcome.kind === "review-required") {
@@ -1066,6 +1125,221 @@ export function posRoutes(db: Database): Router {
     });
   });
 
+  router.post("/checkouts/:reference/settle", requireRole("OWNER"), async (req, res) => {
+    const reference = paramReference(req.params.reference);
+    if (!reference) {
+      sendError(res, 404, "NOT_FOUND", "Checkout reference not found.");
+      return;
+    }
+
+    const parsed = settlePriorDayCheckoutBody.safeParse(req.body ?? {});
+    if (!parsed.success) {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid prior-day settlement request.");
+      return;
+    }
+
+    const body = parsed.data;
+    if (!body.paymentKeptConfirmed || !body.refillDeliveredConfirmed) {
+      sendError(
+        res,
+        400,
+        "VALIDATION_FAILED",
+        "Confirm both that payment was kept and that the refill was delivered. Leave all other outcomes pending.",
+      );
+      return;
+    }
+
+    const preCheck = await repo.findCheckoutByReference(db, reference);
+    if (!preCheck) {
+      sendError(res, 404, "NOT_FOUND", "Checkout reference not found.");
+      return;
+    }
+
+    if (inFlight.has(reference)) {
+      sendError(
+        res,
+        409,
+        "CHECKOUT_NOT_SETTLABLE",
+        "Wait for the in-progress save attempt to finish before settling this checkout.",
+      );
+      return;
+    }
+
+    const todayDate = formatManilaDate(req.now);
+    const outcome = await db.transaction(async (tx) => {
+      const day = await repo.lockDayById(tx, preCheck.businessDayId);
+      const checkoutRow = await repo.lockCheckoutByReference(tx, reference);
+      if (!day || !checkoutRow) {
+        return { kind: "not-found" as const };
+      }
+
+      if (inFlight.has(reference)) {
+        return {
+          kind: "not-settlable" as const,
+          message: "Wait for the in-progress save attempt to finish before settling this checkout.",
+        };
+      }
+
+      const checkoutView = toCheckoutView(checkoutRow);
+
+      if (checkoutRow.status === "SAVED") {
+        const existingSale = await repo.findSaleByCheckoutId(tx, checkoutRow.id);
+        return {
+          kind: "already-saved" as const,
+          sale: existingSale ?? null,
+          checkout: checkoutView,
+        };
+      }
+
+      const existingSale = await repo.findSaleByCheckoutId(tx, checkoutRow.id);
+      if (existingSale) {
+        return {
+          kind: "already-saved" as const,
+          sale: existingSale,
+          checkout: checkoutView,
+        };
+      }
+
+      if (checkoutRow.status === "SETTLED_PRIOR_DAY") {
+        const existingSettlement = await repo.findPriorDaySettlementByCheckoutId(tx, checkoutRow.id);
+        if (
+          body.cashReceivedCentavos !== undefined &&
+          existingSettlement?.cashReceivedCentavos !== null &&
+          existingSettlement?.cashReceivedCentavos !== undefined &&
+          body.cashReceivedCentavos !== existingSettlement.cashReceivedCentavos
+        ) {
+          return { kind: "payload-mismatch" as const };
+        }
+        return {
+          kind: "replayed-settled" as const,
+          settlement: existingSettlement!,
+          checkout: checkoutView,
+        };
+      }
+
+      const existingSettlement = await repo.findPriorDaySettlementByCheckoutId(tx, checkoutRow.id);
+      if (existingSettlement) {
+        return {
+          kind: "replayed-settled" as const,
+          settlement: existingSettlement,
+          checkout: checkoutView,
+        };
+      }
+
+      if (checkoutRow.businessDate >= todayDate) {
+        return {
+          kind: "not-settlable" as const,
+          message: "Only prior-day checkouts can be recorded as a prior-day settlement.",
+        };
+      }
+
+      if (checkoutRow.status !== "REVIEW_REQUIRED" && checkoutRow.status !== "PAYMENT_PENDING") {
+        return {
+          kind: "not-settlable" as const,
+          message:
+            checkoutRow.status === "DRAFT"
+              ? "Unpaid draft checkouts without payment cannot be settled as paid and delivered."
+              : "Cancelled checkout drafts cannot be settled.",
+        };
+      }
+
+      const recordedCash =
+        checkoutRow.cashReceivedCentavos !== null ? Number(checkoutRow.cashReceivedCentavos) : null;
+      if (
+        recordedCash !== null &&
+        body.cashReceivedCentavos !== undefined &&
+        body.cashReceivedCentavos !== recordedCash
+      ) {
+        return { kind: "payload-mismatch" as const };
+      }
+
+      const effectiveCash = recordedCash ?? body.cashReceivedCentavos ?? null;
+      if (effectiveCash !== null && effectiveCash < checkoutView.totalCentavos) {
+        return { kind: "insufficient-cash" as const };
+      }
+      const effectiveChange =
+        effectiveCash !== null ? effectiveCash - checkoutView.totalCentavos : null;
+
+      const originalPaymentStartedAt = checkoutRow.paymentStartedAt
+        ? checkoutRow.paymentStartedAt instanceof Date
+          ? checkoutRow.paymentStartedAt
+          : new Date(checkoutRow.paymentStartedAt)
+        : null;
+      const originalPaymentRecordedAt = checkoutRow.paymentRecordedAt
+        ? checkoutRow.paymentRecordedAt instanceof Date
+          ? checkoutRow.paymentRecordedAt
+          : new Date(checkoutRow.paymentRecordedAt)
+        : null;
+
+      const settled = await repo.insertPriorDaySettlementAtomic(tx, {
+        checkoutId: checkoutRow.id,
+        checkoutReference: checkoutRow.reference,
+        originalBusinessDayId: checkoutRow.businessDayId,
+        originalBusinessDate: checkoutRow.businessDate,
+        settlementDate: todayDate,
+        netAmountKeptCentavos: checkoutView.totalCentavos,
+        cashReceivedCentavos: effectiveCash,
+        changeCentavos: effectiveChange,
+        totalContainers: checkoutView.totalContainers,
+        totalVolumeMl: checkoutView.totalVolumeMl,
+        items: checkoutView.items,
+        originalActorUserId: checkoutRow.createdByUserId,
+        originalPaymentStartedAt,
+        originalPaymentRecordedAt,
+        settledByUserId: req.auth!.user.id,
+        settledAt: req.now,
+        note: body.note?.trim() || null,
+      });
+
+      return {
+        kind: "settled" as const,
+        settlement: settled.settlement,
+        checkout: settled.checkout,
+      };
+    });
+
+    if (outcome.kind === "not-found") {
+      sendError(res, 404, "NOT_FOUND", "Checkout reference not found.");
+      return;
+    }
+    if (outcome.kind === "not-settlable") {
+      sendError(res, 409, "CHECKOUT_NOT_SETTLABLE", outcome.message);
+      return;
+    }
+    if (outcome.kind === "payload-mismatch") {
+      sendError(
+        res,
+        409,
+        "PAYLOAD_MISMATCH",
+        "Submitted cash amount does not match the recorded checkout payment.",
+      );
+      return;
+    }
+    if (outcome.kind === "insufficient-cash") {
+      sendError(res, 400, "INSUFFICIENT_CASH", "Cash received must cover the net amount kept.");
+      return;
+    }
+    if (outcome.kind === "already-saved") {
+      res.status(200).json({
+        outcome: "ALREADY_SAVED" as const,
+        replayed: true,
+        sale: outcome.sale,
+        settlement: null,
+        checkout: outcome.checkout,
+      });
+      return;
+    }
+
+    const replayed = outcome.kind === "replayed-settled";
+    res.status(replayed ? 200 : 201).json({
+      outcome: "SETTLED" as const,
+      replayed,
+      settlement: outcome.settlement,
+      sale: null,
+      checkout: outcome.checkout,
+    });
+  });
+
   router.get("/sales", async (req, res) => {
     const rawDate =
       typeof req.query.date === "string" && req.query.date.trim().length > 0
@@ -1094,17 +1368,24 @@ export function posRoutes(db: Database): Router {
           ? req.query.reference
           : "";
 
-    const sales = await repo.listSales(db, {
-      businessDate: rawDate,
-      status: rawStatus,
-      referenceQuery,
-    });
+    const [sales, priorDaySettlements] = await Promise.all([
+      repo.listSales(db, {
+        businessDate: rawDate,
+        status: rawStatus,
+        referenceQuery,
+      }),
+      repo.listPriorDaySettlements(db, {
+        settlementDate: rawDate,
+        referenceQuery,
+      }),
+    ]);
 
     res.json({
       businessDate: rawDate,
       status: rawStatus,
       query: referenceQuery.trim(),
       sales,
+      priorDaySettlements,
     });
   });
 
@@ -1122,6 +1403,62 @@ export function posRoutes(db: Database): Router {
     }
 
     res.json({ ...sale, sale });
+  });
+
+  router.get("/settlements", async (req, res) => {
+    const rawDate =
+      typeof req.query.date === "string" && req.query.date.trim().length > 0
+        ? req.query.date.trim()
+        : formatManilaDate(req.now);
+
+    if (!isValidCalendarDate(rawDate)) {
+      sendError(res, 400, "VALIDATION_FAILED", "Use YYYY-MM-DD for the settlement date filter.");
+      return;
+    }
+
+    let originalBusinessDate: string | undefined;
+    if (typeof req.query.originalDate === "string" && req.query.originalDate.trim().length > 0) {
+      originalBusinessDate = req.query.originalDate.trim();
+      if (!isValidCalendarDate(originalBusinessDate)) {
+        sendError(res, 400, "VALIDATION_FAILED", "Use YYYY-MM-DD for originalDate.");
+        return;
+      }
+    }
+
+    const referenceQuery =
+      typeof req.query.q === "string"
+        ? req.query.q
+        : typeof req.query.reference === "string"
+          ? req.query.reference
+          : "";
+
+    const settlements = await repo.listPriorDaySettlements(db, {
+      settlementDate: rawDate,
+      originalBusinessDate,
+      referenceQuery,
+    });
+
+    res.json({
+      settlementDate: rawDate,
+      query: referenceQuery.trim(),
+      settlements,
+    });
+  });
+
+  router.get("/settlements/:reference", async (req, res) => {
+    const reference = paramReference(req.params.reference);
+    if (!reference) {
+      sendError(res, 404, "NOT_FOUND", "Prior-day settlement not found.");
+      return;
+    }
+
+    const settlement = await repo.findPriorDaySettlementByReference(db, reference);
+    if (!settlement) {
+      sendError(res, 404, "NOT_FOUND", "Prior-day settlement not found.");
+      return;
+    }
+
+    res.json({ ...settlement, settlement });
   });
 
   return router;

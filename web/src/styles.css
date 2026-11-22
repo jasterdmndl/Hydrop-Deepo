@@ -3053,6 +3053,24 @@ textarea:focus-visible {
   gap: 10px;
 }
 
+.history-list-stack {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+  min-width: 0;
+}
+
+.pos-unresolved-row,
+.conflict-list__item {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+  margin-top: 6px;
+  min-width: 0;
+}
+
 /* Choose Module visual refresh (DEC-046 & DEC-047) */
 
 .shell--home .topbar {

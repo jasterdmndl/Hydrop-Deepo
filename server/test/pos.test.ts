@@ -1,10 +1,11 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/app.js";
-import type { Database, Queryable } from "../src/db/database.js";
+import { createPgliteDatabase, type Database, type Queryable } from "../src/db/database.js";
+import { MIGRATIONS_DIR, runMigrations } from "../src/db/migrate.js";
 import { ManualClock } from "../src/shared/clock.js";
 import {
   activatedAccount,
@@ -1593,6 +1594,703 @@ describe("POS station day and refill sales", () => {
       expect(endBlocked.status).toBe(409);
       expect(endBlocked.body.error.code).toBe("UNRESOLVED_CHECKOUTS");
       expect(endBlocked.body.blockingCheckouts.map((c: any) => c.reference)).toEqual([ref]);
+    });
+  });
+
+  describe("DEC-048 prior-day paid-and-delivered refill settlement", () => {
+    it("settles a PHP 50 paid-and-delivered prior-day refill once for Owner before today opens, denies Cashier, handles concurrent retries, blocks repeat confirm, and keeps history separate", async () => {
+      ctx.clock.set("2026-11-18T23:50:00+08:00");
+      owner = await reauth(ctx, "owner1", owner);
+      cashier = await reauth(ctx, "cashier1", cashier);
+      await startDay(ctx, cashier, { requestKey: "dec048-day-nov18" });
+
+      // Saved sale from yesterday (1 x 25L Alkaline = PHP 35) to verify closed summary stays unchanged.
+      const savedPrep = await prepareCheckout(ctx, cashier, {
+        prepareKey: "dec048-saved-nov18",
+        items: [{ kind: "STANDARD", waterType: "ALKALINE", quantity: 1 }],
+      });
+      const savedRef = savedPrep.body.checkout.reference as string;
+      const savedRes = await confirmCheckout(ctx.app, cashier, savedRef, {
+        cashReceivedCentavos: 5000,
+      });
+      expect(savedRes.status).toBe(201);
+
+      // PHP 50 refill (2 x 25L Purified) started payment before midnight, confirm arrives after midnight.
+      const priorPrep = await prepareCheckout(ctx, cashier, {
+        prepareKey: "dec048-prior-50",
+        items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 2 }],
+      });
+      const priorRef = priorPrep.body.checkout.reference as string;
+      const begun = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(priorRef)}/begin-payment`)
+        .set("Cookie", cashier.cookie)
+        .set("X-CSRF-Token", cashier.csrfToken)
+        .send({});
+      expect(begun.status).toBe(200);
+
+      // Cross Manila midnight to 2026-11-19
+      ctx.clock.set("2026-11-19T08:15:00+08:00");
+      owner = await reauth(ctx, "owner1", owner);
+      cashier = await reauth(ctx, "cashier1", cashier);
+
+      const lateConfirm = await confirmCheckout(ctx.app, cashier, priorRef, {
+        cashReceivedCentavos: 10000,
+      });
+      expect(lateConfirm.status).toBe(409);
+      expect(lateConfirm.body.error.code).toBe("CHECKOUT_REVIEW_REQUIRED");
+
+      // Day state is PREVIOUS_DAY_OPEN (today's business day 2026-11-19 has not started yet).
+      const dayBeforeSettle = await request(ctx.app).get("/api/pos/day").set("Cookie", owner.cookie);
+      expect(dayBeforeSettle.status).toBe(200);
+      expect(dayBeforeSettle.body.state).toBe("PREVIOUS_DAY_OPEN");
+
+      // Cashier lookup does NOT expose Owner settlement authority; Cashier POST /settle is forbidden.
+      const cashierLookup = await request(ctx.app)
+        .get(`/api/pos/checkouts/${priorRef}`)
+        .set("Cookie", cashier.cookie);
+      expect(cashierLookup.status).toBe(200);
+      expect(cashierLookup.body.canSettlePriorDay).toBe(false);
+
+      const cashierSettle = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(priorRef)}/settle`)
+        .set("Cookie", cashier.cookie)
+        .set("X-CSRF-Token", cashier.csrfToken)
+        .send({ paymentKeptConfirmed: true, refillDeliveredConfirmed: true });
+      expect(cashierSettle.status).toBe(403);
+      expect(cashierSettle.body.error.code).toBe("FORBIDDEN");
+
+      // Owner lookup shows prior-day settle eligibility.
+      const ownerLookupBefore = await request(ctx.app)
+        .get(`/api/pos/checkouts/${priorRef}`)
+        .set("Cookie", owner.cookie);
+      expect(ownerLookupBefore.status).toBe(200);
+      expect(ownerLookupBefore.body.canSettlePriorDay).toBe(true);
+
+      // Missing either confirmation keeps the checkout pending.
+      const missingDelivery = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(priorRef)}/settle`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ paymentKeptConfirmed: true, refillDeliveredConfirmed: false });
+      expect(missingDelivery.status).toBe(400);
+      expect(missingDelivery.body.error.code).toBe("VALIDATION_FAILED");
+
+      const stillBlocked = await endDay(ctx, owner, { requestKey: "dec048-still-blocked" });
+      expect(stillBlocked.status).toBe(409);
+      expect(stillBlocked.body.error.code).toBe("UNRESOLVED_CHECKOUTS");
+
+      // Owner confirms both payment kept and refill delivered before today's business day opens.
+      // Run two concurrent settle calls to verify atomic single-settlement recording.
+      const [s1, s2] = await Promise.all([
+        request(ctx.app)
+          .post(`/api/pos/checkouts/${encodeURIComponent(priorRef)}/settle`)
+          .set("Cookie", owner.cookie)
+          .set("X-CSRF-Token", owner.csrfToken)
+          .send({
+            paymentKeptConfirmed: true,
+            refillDeliveredConfirmed: true,
+            note: "Verified cash and handover",
+          }),
+        request(ctx.app)
+          .post(`/api/pos/checkouts/${encodeURIComponent(priorRef)}/settle`)
+          .set("Cookie", owner.cookie)
+          .set("X-CSRF-Token", owner.csrfToken)
+          .send({
+            paymentKeptConfirmed: true,
+            refillDeliveredConfirmed: true,
+            note: "Verified cash and handover",
+          }),
+      ]);
+
+      const statuses = [s1.status, s2.status].sort((a, b) => a - b);
+      expect(statuses).toEqual([200, 201]);
+      const createdRes = s1.status === 201 ? s1 : s2;
+      const replayedRes = s1.status === 200 ? s1 : s2;
+      expect(createdRes.body.replayed).toBe(false);
+      expect(replayedRes.body.replayed).toBe(true);
+      expect(createdRes.body.outcome).toBe("SETTLED");
+      expect(createdRes.body.settlement).toMatchObject({
+        checkoutReference: priorRef,
+        originalBusinessDate: "2026-11-18",
+        settlementDate: "2026-11-19",
+        outcome: "PAID_AND_DELIVERED",
+        netAmountKeptCentavos: 5000,
+        cashReceivedCentavos: 10000,
+        changeCentavos: 5000,
+        totalContainers: 2,
+        totalVolumeMl: 50000,
+        totalVolumeLiters: 50,
+        originalActor: "cashier1",
+        originalPaymentStartedAt: "2026-11-18T23:50:00+08:00",
+        originalPaymentRecordedAt: "2026-11-19T08:15:00+08:00",
+        paymentKeptConfirmed: true,
+        refillDeliveredConfirmed: true,
+        settledBy: "owner1",
+        settledAt: "2026-11-19T08:15:00+08:00",
+        note: "Verified cash and handover",
+      });
+      expect(replayedRes.body.settlement).toEqual(createdRes.body.settlement);
+
+      // Verify exactly one settlement row exists in PostgreSQL.
+      const { rows: dbCount } = await ctx.db.query<{ cnt: number | string }>(
+        `SELECT COUNT(*) AS cnt FROM pos_prior_day_settlements WHERE checkout_reference = $1`,
+        [priorRef],
+      );
+      expect(Number(dbCount[0]!.cnt)).toBe(1);
+
+      // Repeat confirmation or begin-payment cannot collect or save again.
+      const repeatConfirm = await confirmCheckout(ctx.app, cashier, priorRef, {
+        cashReceivedCentavos: 10000,
+      });
+      expect(repeatConfirm.status).toBe(409);
+      expect(repeatConfirm.body.error.code).toBe("CHECKOUT_ALREADY_SETTLED");
+
+      const repeatBegin = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(priorRef)}/begin-payment`)
+        .set("Cookie", cashier.cookie)
+        .set("X-CSRF-Token", cashier.csrfToken)
+        .send({});
+      expect(repeatBegin.status).toBe(409);
+      expect(repeatBegin.body.error.code).toBe("CHECKOUT_ALREADY_SETTLED");
+
+      // Lookup reflects SETTLED_PRIOR_DAY.
+      const lookupAfter = await request(ctx.app)
+        .get(`/api/pos/checkouts/${priorRef}`)
+        .set("Cookie", cashier.cookie);
+      expect(lookupAfter.status).toBe(200);
+      expect(lookupAfter.body).toMatchObject({
+        recoveryState: "SETTLED_PRIOR_DAY",
+        canRetry: false,
+        canSettlePriorDay: false,
+        sale: null,
+      });
+      expect(lookupAfter.body.settlement.checkoutReference).toBe(priorRef);
+
+      // Already-saved sale returns ALREADY_SAVED and creates zero settlements.
+      const settleSaved = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(savedRef)}/settle`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ paymentKeptConfirmed: true, refillDeliveredConfirmed: true });
+      expect(settleSaved.status).toBe(200);
+      expect(settleSaved.body).toMatchObject({
+        outcome: "ALREADY_SAVED",
+        replayed: true,
+        settlement: null,
+      });
+      expect(settleSaved.body.sale.reference).toBe(savedRef);
+
+      // Close yesterday: closed summary preserves ONLY the PHP 35 saved sale from 2026-11-18.
+      const closedYesterday = await endDay(ctx, owner, { requestKey: "dec048-close-nov18" });
+      expect(closedYesterday.status).toBe(200);
+      expect(closedYesterday.body.day.businessDate).toBe("2026-11-18");
+      expect(closedYesterday.body.summary).toMatchObject({
+        totalSalesCentavos: 3500,
+        validTransactionCount: 1,
+        purifiedQuantity: 0,
+        alkalineQuantity: 1,
+      });
+
+      // Start today (2026-11-19) and record a normal PHP 25 sale today.
+      const startedToday = await startDay(ctx, cashier, { requestKey: "dec048-start-nov19" });
+      expect(startedToday.status).toBe(201);
+      expect(startedToday.body.day.businessDate).toBe("2026-11-19");
+
+      const todayPrep = await prepareCheckout(ctx, cashier, {
+        prepareKey: "dec048-today-sale",
+        items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 1 }],
+      });
+      const todayRef = todayPrep.body.checkout.reference as string;
+      const todaySaved = await confirmCheckout(ctx.app, cashier, todayRef, {
+        cashReceivedCentavos: 5000,
+      });
+      expect(todaySaved.status).toBe(201);
+
+      // Today's sales history keeps today's refill sales (PHP 25) strictly separate from prior-day settlement (PHP 50).
+      const todayHistory = await request(ctx.app)
+        .get("/api/pos/sales?date=2026-11-19")
+        .set("Cookie", owner.cookie);
+      expect(todayHistory.status).toBe(200);
+      expect(todayHistory.body.sales.map((s: any) => s.reference)).toEqual([todayRef]);
+      expect(todayHistory.body.priorDaySettlements).toHaveLength(1);
+      expect(todayHistory.body.priorDaySettlements[0]).toMatchObject({
+        checkoutReference: priorRef,
+        originalBusinessDate: "2026-11-18",
+        settlementDate: "2026-11-19",
+        netAmountKeptCentavos: 5000,
+      });
+
+      // Yesterday's closed summary and sales history remain completely unchanged.
+      const nov18History = await request(ctx.app)
+        .get("/api/pos/sales?date=2026-11-18")
+        .set("Cookie", owner.cookie);
+      expect(nov18History.status).toBe(200);
+      expect(nov18History.body.sales.map((s: any) => s.reference)).toEqual([savedRef]);
+      expect(nov18History.body.priorDaySettlements).toEqual([]);
+
+      const settlementDetail = await request(ctx.app)
+        .get(`/api/pos/settlements/${encodeURIComponent(priorRef)}`)
+        .set("Cookie", cashier.cookie);
+      expect(settlementDetail.status).toBe(200);
+      expect(settlementDetail.body.checkoutReference).toBe(priorRef);
+
+      // Today's open day summary includes ONLY today's PHP 25 refill sale.
+      const todayDay = await request(ctx.app).get("/api/pos/day").set("Cookie", owner.cookie);
+      expect(todayDay.status).toBe(200);
+      expect(todayDay.body.day.summary).toMatchObject({
+        businessDate: "2026-11-19",
+        totalSalesCentavos: 2500,
+        validTransactionCount: 1,
+      });
+    });
+
+    it("resolves only the settled checkout's End Day block, preserves closed summaries, and rejects same-day or unpaid drafts", async () => {
+      ctx.clock.set("2026-11-18T23:50:00+08:00");
+      owner = await reauth(ctx, "owner1", owner);
+      cashier = await reauth(ctx, "cashier1", cashier);
+      await startDay(ctx, owner, { requestKey: "dec048-multi-day" });
+
+      // Prepare two prior-day PAYMENT_PENDING checkouts and one unpaid DRAFT.
+      const p1 = await prepareCheckout(ctx, cashier, {
+        prepareKey: "multi-1",
+        items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 2 }],
+      });
+      const ref1 = p1.body.checkout.reference as string;
+      await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(ref1)}/begin-payment`)
+        .set("Cookie", cashier.cookie)
+        .set("X-CSRF-Token", cashier.csrfToken)
+        .send({});
+
+      const p2 = await prepareCheckout(ctx, cashier, {
+        prepareKey: "multi-2",
+        items: [{ kind: "STANDARD", waterType: "ALKALINE", quantity: 1 }],
+      });
+      const ref2 = p2.body.checkout.reference as string;
+      await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(ref2)}/begin-payment`)
+        .set("Cookie", cashier.cookie)
+        .set("X-CSRF-Token", cashier.csrfToken)
+        .send({});
+
+      const pDraft = await prepareCheckout(ctx, cashier, {
+        prepareKey: "multi-draft",
+        items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 1 }],
+      });
+      const refDraft = pDraft.body.checkout.reference as string;
+
+      // Cross midnight to 2026-11-19
+      ctx.clock.set("2026-11-19T09:00:00+08:00");
+      owner = await reauth(ctx, "owner1", owner);
+      cashier = await reauth(ctx, "cashier1", cashier);
+
+      // Unpaid DRAFT cannot be settled as a paid-and-delivered prior-day refill.
+      const draftSettle = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(refDraft)}/settle`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ paymentKeptConfirmed: true, refillDeliveredConfirmed: true });
+      expect(draftSettle.status).toBe(409);
+      expect(draftSettle.body.error.code).toBe("CHECKOUT_NOT_SETTLABLE");
+
+      // Settle ONLY ref1 -> ref2 must still block End Day!
+      const settle1 = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(ref1)}/settle`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          paymentKeptConfirmed: true,
+          refillDeliveredConfirmed: true,
+          cashReceivedCentavos: 5000,
+        });
+      expect(settle1.status).toBe(201);
+
+      const endAfterOne = await endDay(ctx, owner, {
+        requestKey: "multi-end-after-1",
+        clearUnpaidDrafts: true,
+      });
+      expect(endAfterOne.status).toBe(409);
+      expect(endAfterOne.body.error.code).toBe("UNRESOLVED_CHECKOUTS");
+      expect(endAfterOne.body.blockingCheckouts.map((c: any) => c.reference)).toEqual([ref2]);
+
+      // Settle ref2 -> End Day now clears only refDraft and closes 2026-11-18 with zero sales.
+      const settle2 = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(ref2)}/settle`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ paymentKeptConfirmed: true, refillDeliveredConfirmed: true });
+      expect(settle2.status).toBe(201);
+      expect(settle2.body.settlement).toMatchObject({
+        checkoutReference: ref2,
+        cashReceivedCentavos: null,
+        originalPaymentStartedAt: "2026-11-18T23:50:00+08:00",
+        originalPaymentRecordedAt: null,
+        settledAt: "2026-11-19T09:00:00+08:00",
+      });
+
+      const endAfterTwo = await endDay(ctx, owner, {
+        requestKey: "multi-end-after-2",
+        clearUnpaidDrafts: true,
+      });
+      expect(endAfterTwo.status).toBe(200);
+      expect(endAfterTwo.body.clearedDraftReferences).toEqual([refDraft]);
+      expect(endAfterTwo.body.summary).toMatchObject({
+        businessDate: "2026-11-18",
+        totalSalesCentavos: 0,
+        validTransactionCount: 0,
+      });
+
+      // Start 2026-11-19 and confirm same-day PAYMENT_PENDING cannot be settled via prior-day settle.
+      const startedNov19 = await startDay(ctx, owner, { requestKey: "multi-start-nov19" });
+      expect(startedNov19.status).toBe(201);
+
+      const sameDayPrep = await prepareCheckout(ctx, cashier, {
+        prepareKey: "same-day-pp",
+        items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 1 }],
+      });
+      const sameDayRef = sameDayPrep.body.checkout.reference as string;
+      await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(sameDayRef)}/begin-payment`)
+        .set("Cookie", cashier.cookie)
+        .set("X-CSRF-Token", cashier.csrfToken)
+        .send({});
+
+      const sameDaySettle = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(sameDayRef)}/settle`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ paymentKeptConfirmed: true, refillDeliveredConfirmed: true });
+      expect(sameDaySettle.status).toBe(409);
+      expect(sameDaySettle.body.error.code).toBe("CHECKOUT_NOT_SETTLABLE");
+    });
+
+    it("leaves a previously closed day summary untouched when settling a prior-day DAY_CLOSED review-required checkout", async () => {
+      ctx.clock.set("2026-11-18T10:00:00+08:00");
+      owner = await reauth(ctx, "owner1", owner);
+      cashier = await reauth(ctx, "cashier1", cashier);
+      await startDay(ctx, owner, { requestKey: "closed-day-start" });
+
+      // Completed sale on Nov 18 (PHP 25)
+      const pSaved = await prepareCheckout(ctx, cashier, {
+        prepareKey: "closed-saved",
+        items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 1 }],
+      });
+      await confirmCheckout(ctx.app, cashier, pSaved.body.checkout.reference, {
+        cashReceivedCentavos: 2500,
+      });
+
+      // Another checkout prepared on Nov 18; Owner closes Nov 18 clearing unpaid drafts,
+      // then confirm arrives late and marks it REVIEW_REQUIRED (DAY_CLOSED).
+      const pLate = await prepareCheckout(ctx, cashier, {
+        prepareKey: "closed-late",
+        items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 2 }],
+      });
+      const lateRef = pLate.body.checkout.reference as string;
+      const closedNov18 = await endDay(ctx, owner, {
+        requestKey: "closed-day-end",
+        clearUnpaidDrafts: true,
+      });
+      expect(closedNov18.status).toBe(200);
+      expect(closedNov18.body.summary.totalSalesCentavos).toBe(2500);
+
+      const lateConfirm = await confirmCheckout(ctx.app, cashier, lateRef, {
+        cashReceivedCentavos: 5000,
+      });
+      expect(lateConfirm.status).toBe(409);
+      expect(lateConfirm.body.error.code).toBe("CHECKOUT_REVIEW_REQUIRED");
+
+      // Advance to Nov 19 (NOT_STARTED) before today opens: GET /day surfaces closed prior-day reference outside unresolvedCheckouts.
+      ctx.clock.set("2026-11-19T09:30:00+08:00");
+      owner = await reauth(ctx, "owner1", owner);
+      const dayBeforeSettle = await request(ctx.app).get("/api/pos/day").set("Cookie", owner.cookie);
+      expect(dayBeforeSettle.status).toBe(200);
+      expect(dayBeforeSettle.body.state).toBe("NOT_STARTED");
+      expect(dayBeforeSettle.body.unresolvedCheckouts).toEqual([]);
+      expect(dayBeforeSettle.body.priorDayReviewCheckouts.map((c: any) => c.reference)).toEqual([
+        lateRef,
+      ]);
+
+      const settled = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(lateRef)}/settle`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ paymentKeptConfirmed: true, refillDeliveredConfirmed: true });
+      expect(settled.status).toBe(201);
+
+      const dayAfterSettle = await request(ctx.app).get("/api/pos/day").set("Cookie", owner.cookie);
+      expect(dayAfterSettle.status).toBe(200);
+      expect(dayAfterSettle.body.priorDayReviewCheckouts).toEqual([]);
+
+      // Verify Nov 18's stored closed summary columns in pos_business_days were NOT modified.
+      const { rows: dayRows } = await ctx.db.query<{
+        closedTotalSalesCentavos: number | string;
+        closedValidTxCount: number | string;
+      }>(
+        `SELECT closed_total_sales_centavos AS "closedTotalSalesCentavos",
+                closed_valid_tx_count AS "closedValidTxCount"
+           FROM pos_business_days
+          WHERE business_date = '2026-11-18'`,
+      );
+      expect(Number(dayRows[0]!.closedTotalSalesCentavos)).toBe(2500);
+      expect(Number(dayRows[0]!.closedValidTxCount)).toBe(1);
+    });
+
+    it("preserves explicit unpaid cancellations across date rollover and day closure without becoming settlable", async () => {
+      ctx.clock.set("2026-11-18T23:50:00+08:00");
+      owner = await reauth(ctx, "owner1", owner);
+      cashier = await reauth(ctx, "cashier1", cashier);
+      await startDay(ctx, cashier, { requestKey: "cancel-preserve-day" });
+
+      // Checkout A: explicit no-cash cancellation of PAYMENT_PENDING using reason colliding with internal label
+      const prepExplicit = await prepareCheckout(ctx, cashier, {
+        prepareKey: "explicit-cancel-pp",
+        items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 2 }],
+      });
+      const explicitRef = prepExplicit.body.checkout.reference as string;
+      await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(explicitRef)}/begin-payment`)
+        .set("Cookie", cashier.cookie)
+        .set("X-CSRF-Token", cashier.csrfToken)
+        .send({});
+      const explicitCancel = await cancelCheckout(ctx, cashier, explicitRef, {
+        confirmNoCashTaken: true,
+        reason: "CLEARED_ON_END_DAY",
+      });
+      expect(explicitCancel.status).toBe(200);
+
+      // Checkout B: unpaid DRAFT that will be automatically cleared on End Day
+      const prepAutoCleared = await prepareCheckout(ctx, cashier, {
+        prepareKey: "auto-clear-draft",
+        items: [{ kind: "STANDARD", waterType: "ALKALINE", quantity: 1 }],
+      });
+      const autoClearedRef = prepAutoCleared.body.checkout.reference as string;
+
+      // Cross midnight to 2026-11-19
+      ctx.clock.set("2026-11-19T00:10:00+08:00");
+      owner = await reauth(ctx, "owner1", owner);
+      cashier = await reauth(ctx, "cashier1", cashier);
+
+      // Delayed confirm after rollover MUST reject with CHECKOUT_CANCELLED and preserve reason (despite reason string collision)
+      const confirmAfterMidnight = await confirmCheckout(ctx.app, cashier, explicitRef, {
+        cashReceivedCentavos: 10000,
+      });
+      expect(confirmAfterMidnight.status).toBe(409);
+      expect(confirmAfterMidnight.body.error.code).toBe("CHECKOUT_CANCELLED");
+
+      const lookupAfterMidnight = await request(ctx.app)
+        .get(`/api/pos/checkouts/${explicitRef}`)
+        .set("Cookie", owner.cookie);
+      expect(lookupAfterMidnight.status).toBe(200);
+      expect(lookupAfterMidnight.body.checkout).toMatchObject({
+        status: "CANCELLED_DRAFT",
+        resolutionReason: "CLEARED_ON_END_DAY",
+      });
+      expect(lookupAfterMidnight.body.canSettlePriorDay).toBe(false);
+
+      const settleAfterMidnight = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(explicitRef)}/settle`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ paymentKeptConfirmed: true, refillDeliveredConfirmed: true });
+      expect(settleAfterMidnight.status).toBe(409);
+      expect(settleAfterMidnight.body.error.code).toBe("CHECKOUT_NOT_SETTLABLE");
+
+      // Close Nov 18 (auto-clearing only the unpaid DRAFT B)
+      const closedDay = await endDay(ctx, owner, {
+        requestKey: "cancel-preserve-end",
+        clearUnpaidDrafts: true,
+      });
+      expect(closedDay.status).toBe(200);
+      expect(closedDay.body.clearedDraftReferences).toEqual([autoClearedRef]);
+
+      // Delayed confirm on explicitRef AFTER day close STILL preserves CANCELLED_DRAFT & its reason
+      const confirmAfterClose = await confirmCheckout(ctx.app, cashier, explicitRef, {
+        cashReceivedCentavos: 10000,
+      });
+      expect(confirmAfterClose.status).toBe(409);
+      expect(confirmAfterClose.body.error.code).toBe("CHECKOUT_CANCELLED");
+
+      const lookupAfterClose = await request(ctx.app)
+        .get(`/api/pos/checkouts/${explicitRef}`)
+        .set("Cookie", owner.cookie);
+      expect(lookupAfterClose.body.checkout).toMatchObject({
+        status: "CANCELLED_DRAFT",
+        resolutionReason: "CLEARED_ON_END_DAY",
+      });
+
+      // Contrast: delayed confirm on auto-cleared draft after End Day still flags DAY_CLOSED for Owner review
+      const delayedAutoConfirm = await confirmCheckout(ctx.app, cashier, autoClearedRef, {
+        cashReceivedCentavos: 5000,
+      });
+      expect(delayedAutoConfirm.status).toBe(409);
+      expect(delayedAutoConfirm.body.error.code).toBe("CHECKOUT_REVIEW_REQUIRED");
+      expect(delayedAutoConfirm.body.checkout).toMatchObject({
+        status: "REVIEW_REQUIRED",
+        resolutionReason: "DAY_CLOSED",
+      });
+    });
+
+    it("upgrades a database already on first-revision 0005 with existing settlement rows via 0006 without losing history", async () => {
+      const upgradeDb = await createPgliteDatabase();
+      try {
+        await upgradeDb.exec(`
+          CREATE TABLE IF NOT EXISTS schema_migrations (
+            name text PRIMARY KEY,
+            applied_at timestamptz NOT NULL DEFAULT now()
+          );
+        `);
+        const pre0006Files = (await readdir(MIGRATIONS_DIR))
+          .filter((f) => /^\d{4}_.+\.sql$/.test(f) && !f.startsWith("0006_"))
+          .sort();
+        for (const file of pre0006Files) {
+          const sql = await readFile(path.join(MIGRATIONS_DIR, file), "utf8");
+          await upgradeDb.exec(sql);
+          await upgradeDb.query("INSERT INTO schema_migrations (name) VALUES ($1)", [file]);
+        }
+
+        // Insert pre-upgrade user accounts, day, checkouts, and settled row via SQL (as left by pre-0006 server)
+        const clock = new ManualClock("2026-11-17T10:00:00+08:00");
+        const preUpgradeApp = createApp({ db: upgradeDb, clock });
+        const preUpgradeCtx: TestContext = {
+          db: upgradeDb,
+          clock,
+          app: preUpgradeApp,
+          close: () => upgradeDb.close(),
+        };
+        const upOwner = await activatedAccount(preUpgradeCtx, "upowner", "OWNER");
+        const upCashier = await activatedAccount(preUpgradeCtx, "upcashier", "CASHIER");
+
+        const { rows: uRows } = await upgradeDb.query<{ id: string; username: string }>(
+          `SELECT id, username FROM app_users WHERE username IN ('upowner', 'upcashier')`,
+        );
+        const ownerId = uRows.find((r) => r.username === "upowner")!.id;
+        const cashierId = uRows.find((r) => r.username === "upcashier")!.id;
+
+        const { rows: dayInserted } = await upgradeDb.query<{ id: string }>(
+          `INSERT INTO pos_business_days (business_date, started_by_user_id, started_at, next_reference_seq)
+           VALUES ('2026-11-17', $1, '2026-11-17T09:00:00+08:00', 2)
+           RETURNING id`,
+          [ownerId],
+        );
+        const dayId = dayInserted[0]!.id;
+
+        const oldRef = "HD-1117-001";
+        const newRef = "HD-1117-002";
+        const oldItems = [
+          {
+            lineIndex: 0,
+            kind: "STANDARD",
+            catalogCode: "PURIFIED_25L",
+            waterType: "PURIFIED",
+            displayLabel: "Purified refill · 25 L",
+            unitVolumeMl: 25000,
+            unitVolumeLiters: 25,
+            unitPriceCentavos: 2500,
+            quantity: 2,
+            lineTotalCentavos: 5000,
+            lineVolumeMl: 50000,
+            lineVolumeLiters: 50,
+          },
+        ];
+        const newItems = [
+          {
+            lineIndex: 0,
+            kind: "STANDARD",
+            catalogCode: "ALKALINE_25L",
+            waterType: "ALKALINE",
+            displayLabel: "Alkaline refill · 25 L",
+            unitVolumeMl: 25000,
+            unitVolumeLiters: 25,
+            unitPriceCentavos: 3500,
+            quantity: 1,
+            lineTotalCentavos: 3500,
+            lineVolumeMl: 25000,
+            lineVolumeLiters: 25,
+          },
+        ];
+
+        const { rows: cOldInserted } = await upgradeDb.query<{ id: string }>(
+          `INSERT INTO pos_checkouts (
+             reference, business_day_id, business_date, created_by_user_id,
+             status, quote_snapshot, quote_hash, total_centavos, total_containers, total_volume_ml,
+             cash_received_centavos, change_centavos, payment_started_at, payment_recorded_at,
+             resolution_reason, created_at, updated_at
+           )
+           VALUES (
+             $1, $2, '2026-11-17', $3,
+             'SETTLED_PRIOR_DAY', $4::jsonb, 'hash-old', 5000, 2, 50000,
+             10000, 5000, '2026-11-17T23:50:00+08:00', '2026-11-17T23:55:00+08:00',
+             'SETTLED_PRIOR_DAY_PAID_AND_DELIVERED', '2026-11-17T23:49:00+08:00', '2026-11-18T08:00:00+08:00'
+           )
+           RETURNING id`,
+          [oldRef, dayId, cashierId, JSON.stringify(oldItems)],
+        );
+
+        await upgradeDb.query(
+          `INSERT INTO pos_checkouts (
+             reference, business_day_id, business_date, created_by_user_id,
+             status, quote_snapshot, quote_hash, total_centavos, total_containers, total_volume_ml,
+             payment_started_at, created_at, updated_at
+           )
+           VALUES (
+             $1, $2, '2026-11-17', $3,
+             'PAYMENT_PENDING', $4::jsonb, 'hash-new', 3500, 1, 25000,
+             '2026-11-17T10:00:00+08:00', '2026-11-17T09:59:00+08:00', '2026-11-17T10:00:00+08:00'
+           )`,
+          [newRef, dayId, cashierId, JSON.stringify(newItems)],
+        );
+
+        await upgradeDb.query(
+          `INSERT INTO pos_prior_day_settlements (
+             checkout_id, checkout_reference, original_business_day_id,
+             original_business_date, settlement_date, outcome,
+             net_amount_kept_centavos, cash_received_centavos, change_centavos,
+             total_containers, total_volume_ml, items_snapshot,
+             original_actor_user_id, original_payment_recorded_at,
+             payment_kept_confirmed, refill_delivered_confirmed,
+             settled_by_user_id, settled_at, note
+           )
+           VALUES (
+             $1, $2, $3, '2026-11-17', '2026-11-18', 'PAID_AND_DELIVERED',
+             5000, 10000, 5000, 2, 50000, $4::jsonb,
+             $5, '2026-11-17T23:55:00+08:00', true, true, $6, '2026-11-18T08:00:00+08:00', 'Pre-0006 row'
+           )`,
+          [cOldInserted[0]!.id, oldRef, dayId, JSON.stringify(oldItems), cashierId, ownerId],
+        );
+
+        // Now run the migration runner to upgrade existing DB -> must apply 0006!
+        const newlyApplied = await runMigrations(upgradeDb);
+        expect(newlyApplied).toEqual(["0006_pos_settlement_audit_and_cancel_origin.sql"]);
+
+        // Advance to 2026-11-18 and read pre-0006 settlement history + record a new settlement
+        clock.set("2026-11-18T09:00:00+08:00");
+        const ownerAfter = await signIn(preUpgradeApp, "upowner", upOwner.password);
+
+        const salesAfterUpgrade = await request(preUpgradeApp)
+          .get("/api/pos/sales?date=2026-11-18")
+          .set("Cookie", ownerAfter.cookie);
+        expect(salesAfterUpgrade.status).toBe(200);
+        expect(salesAfterUpgrade.body.priorDaySettlements).toHaveLength(1);
+        expect(salesAfterUpgrade.body.priorDaySettlements[0]).toMatchObject({
+          checkoutReference: oldRef,
+          originalPaymentStartedAt: null,
+          note: "Pre-0006 row",
+        });
+
+        const newSettle = await request(preUpgradeApp)
+          .post(`/api/pos/checkouts/${encodeURIComponent(newRef)}/settle`)
+          .set("Cookie", ownerAfter.cookie)
+          .set("X-CSRF-Token", ownerAfter.csrfToken)
+          .send({ paymentKeptConfirmed: true, refillDeliveredConfirmed: true });
+        expect(newSettle.status).toBe(201);
+        expect(newSettle.body.settlement).toMatchObject({
+          checkoutReference: newRef,
+          originalPaymentStartedAt: "2026-11-17T10:00:00+08:00",
+          originalPaymentRecordedAt: null,
+        });
+      } finally {
+        await upgradeDb.close();
+      }
     });
   });
 });
