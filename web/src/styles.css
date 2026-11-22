@@ -2993,8 +2993,98 @@ textarea:focus-visible {
   color: var(--text-muted);
 }
 
+/* Inventory Round and Slim opening stock (DEC-065) */
+
+.inventory-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 20px;
+  align-items: start;
+}
+
+.inventory-card {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.inventory-card__header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.inventory-card__header h2 {
+  font-size: 1.1875rem;
+  color: var(--navy-900);
+}
+
+.inventory-balance {
+  padding: 16px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: #f8fafc;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.inventory-balance--unset {
+  background: var(--amber-bg);
+  border-color: #fed7aa;
+}
+
+.inventory-balance__label {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.inventory-balance__row {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+
+.inventory-balance__value {
+  font-size: 2rem;
+  font-weight: 700;
+  line-height: 1.15;
+  color: var(--navy-900);
+  font-variant-numeric: tabular-nums;
+}
+
+.inventory-balance__value--unset {
+  font-size: 1.5rem;
+  color: var(--amber-text);
+}
+
+.inventory-balance__unit {
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text-muted);
+}
+
+.inventory-form {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.inventory-readonly-note {
+  padding: 12px 14px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: #f8fafc;
+  font-size: 0.875rem;
+  color: var(--text-muted);
+}
+
 @media (orientation: portrait) and (max-width: 900px) {
-  .pos-layout {
+  .pos-layout,
+  .inventory-grid {
     grid-template-columns: minmax(0, 1fr);
   }
 }
@@ -3002,7 +3092,8 @@ textarea:focus-visible {
 @container workspace (max-width: 739px) {
 
   .pos-layout,
-  .pos-history-filters__grid {
+  .pos-history-filters__grid,
+  .inventory-grid {
     grid-template-columns: minmax(0, 1fr);
   }
 }

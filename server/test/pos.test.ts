@@ -444,12 +444,18 @@ describe("POS station day and refill sales", () => {
         },
       ]);
 
-      // Verify zero inventory/stock tables exist in this refill-only slice
-      const { rows: stockTables } = await ctx.db.query<{ table_name: string }>(
-        `SELECT table_name FROM information_schema.tables
-          WHERE table_schema = 'public' AND (table_name LIKE '%stock%' OR table_name LIKE '%inventory%')`,
+      // Completing a customer-owned refill leaves container opening counts unset and untouched.
+      const { rows: openingRows } = await ctx.db.query<{ id: string }>(
+        `SELECT id FROM inventory_opening_counts`,
       );
-      expect(stockTables).toEqual([]);
+      expect(openingRows).toEqual([]);
+      const { rows: itemRows } = await ctx.db.query<{ code: string; current_quantity: number | null }>(
+        `SELECT code, current_quantity FROM inventory_items ORDER BY code ASC`,
+      );
+      expect(itemRows).toEqual([
+        { code: "ROUND", current_quantity: null },
+        { code: "SLIM", current_quantity: null },
+      ]);
     });
 
     it("supports mixed standard and custom per-container pricing, keeps distinct custom lines, checks PHP 500 minus PHP 325 = PHP 175, and rejects forged inputs", async () => {
