@@ -39,13 +39,23 @@ import {
   toCartItemInputs,
   type WaterType,
 } from "./posRecovery";
+import {
+  getVisibleQuantityError,
+  hasInvalidQuantityEdits,
+  isQuantityEditInvalid,
+  MAX_LINE_QTY,
+  QUANTITY_ERROR_MESSAGE,
+  type QuantityEditState,
+  revealInvalidQuantityEdit,
+  revealInvalidQuantityEdits,
+} from "./quantityInput";
+import { QuantityStepper } from "./QuantityStepper";
 import { SaleHistory } from "./SaleHistory";
 
 type PosTab = "sale" | "history";
 type SaleStep = "select" | "review";
 
 const MAX_LINES = 50;
-const MAX_LINE_QTY = 500;
 
 function generateKey(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -132,7 +142,10 @@ export function PosPage() {
   const [customLitersInput, setCustomLitersInput] = useState("");
   const [customPriceInput, setCustomPriceInput] = useState("");
   const [customQty, setCustomQty] = useState(1);
+  const [customQtyEdit, setCustomQtyEdit] = useState<QuantityEditState | null>(null);
   const [customError, setCustomError] = useState<string | null>(null);
+
+  const [qtyEdits, setQtyEdits] = useState<Record<string, QuantityEditState>>({});
 
   const [endDayOpen, setEndDayOpen] = useState(false);
   const [endDayClearDrafts, setEndDayClearDrafts] = useState(false);
@@ -145,6 +158,8 @@ export function PosPage() {
   const preparedCheckoutRef = useRef<CheckoutView | null>(null);
   preparedCheckoutRef.current = preparedCheckout;
   const activeConfirmingRef = useRef<PendingCheckoutRecovery | null>(null);
+  const qtyInputRefs = useRef(new Map<string, HTMLInputElement | null>());
+  const customQtyInputRef = useRef<HTMLInputElement | null>(null);
 
   const activeRecovery = useMemo(
     () =>
@@ -159,33 +174,51 @@ export function PosPage() {
   const showRecoveryScreen =
     activeRecovery !== null && activeConfirming === null && !inActiveCashStep;
 
-  const applyServerDayStatus = useCallback((dayRes: PosDayResponse) => {
-    setDayStatus(dayRes);
-    if (activeConfirmingRef.current !== null) return;
-    const currentPrepared = preparedCheckoutRef.current;
-    if (!currentPrepared) return;
-
-    const matched =
-      dayRes.state === "OPEN" && currentPrepared.businessDate === dayRes.todayDate
-        ? (dayRes.unresolvedCheckouts.find(
-            (c) => c.reference === currentPrepared.reference && c.status === "PAYMENT_PENDING",
-          ) ?? dayRes.unpaidDrafts.find((d) => d.reference === currentPrepared.reference))
-        : undefined;
-
-    if (!matched) {
-      setPreparedCheckout(null);
-      setPrepareKey(null);
-      setPrepareSignature(null);
-      setStep("select");
-      setCashInput("");
-      setConfirmNoCashChecked(false);
-    } else if (
-      matched.status !== currentPrepared.status ||
-      matched.updatedAt !== currentPrepared.updatedAt
-    ) {
-      setPreparedCheckout(matched);
-    }
+  const clearAllQtyEdits = useCallback(() => {
+    setQtyEdits({});
   }, []);
+
+  const closeCustomizeModal = useCallback(() => {
+    setCustomizeOpen(false);
+    setCustomQty(1);
+    setCustomQtyEdit(null);
+    setCustomError(null);
+  }, []);
+
+  const applyServerDayStatus = useCallback(
+    (dayRes: PosDayResponse) => {
+      setDayStatus(dayRes);
+      if (!dayRes.canSell) {
+        clearAllQtyEdits();
+        closeCustomizeModal();
+      }
+      if (activeConfirmingRef.current !== null) return;
+      const currentPrepared = preparedCheckoutRef.current;
+      if (!currentPrepared) return;
+
+      const matched =
+        dayRes.state === "OPEN" && currentPrepared.businessDate === dayRes.todayDate
+          ? (dayRes.unresolvedCheckouts.find(
+              (c) => c.reference === currentPrepared.reference && c.status === "PAYMENT_PENDING",
+            ) ?? dayRes.unpaidDrafts.find((d) => d.reference === currentPrepared.reference))
+          : undefined;
+
+      if (!matched) {
+        setPreparedCheckout(null);
+        setPrepareKey(null);
+        setPrepareSignature(null);
+        setStep("select");
+        setCashInput("");
+        setConfirmNoCashChecked(false);
+      } else if (
+        matched.status !== currentPrepared.status ||
+        matched.updatedAt !== currentPrepared.updatedAt
+      ) {
+        setPreparedCheckout(matched);
+      }
+    },
+    [clearAllQtyEdits, closeCustomizeModal],
+  );
 
   const loadPosState = useCallback(async () => {
     const requestId = loadTrackerRef.current.next();
@@ -234,9 +267,11 @@ export function PosPage() {
       }
     }
     setConfirmNoCashChecked(false);
+    clearAllQtyEdits();
+    setCustomQtyEdit(null);
     hydratedRef.current = true;
     void loadPosState();
-  }, [user.username, loadPosState]);
+  }, [user.username, loadPosState, clearAllQtyEdits]);
 
   // Synchronize per-reference recovery records across browser tabs in real time.
   useEffect(() => {
@@ -278,17 +313,17 @@ export function PosPage() {
     showRecoveryScreen,
   ]);
 
-  // Close Customize or End Day modals cleanly on Escape.
+  // Close Customize or End Day modals cleanly on Escape unless a child input handled it.
   useEffect(() => {
     if (!customizeOpen && !endDayOpen) return;
     const onKeyDown = (event: KeyboardEvent) => {
-      if (event.key !== "Escape") return;
-      if (customizeOpen) setCustomizeOpen(false);
+      if (event.defaultPrevented || event.key !== "Escape") return;
+      if (customizeOpen) closeCustomizeModal();
       if (endDayOpen && !endingDay) setEndDayOpen(false);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [customizeOpen, endDayOpen, endingDay]);
+  }, [customizeOpen, endDayOpen, endingDay, closeCustomizeModal]);
 
   const stationStatus = dayStatus ? stationStatusFromDay(dayStatus) : null;
 
@@ -320,6 +355,14 @@ export function PosPage() {
 
   const customLines = useMemo(() => lines.filter((line) => line.kind === "CUSTOM"), [lines]);
 
+  const customLabelCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const line of customLines) {
+      counts.set(line.displayName, (counts.get(line.displayName) ?? 0) + 1);
+    }
+    return counts;
+  }, [customLines]);
+
   const endDayGuard = useMemo(
     () =>
       evaluateEndDayGuard({
@@ -345,21 +388,51 @@ export function PosPage() {
     [dayStatus?.unresolvedCheckouts, localRecoveryRefSet],
   );
 
-  function setStandardQuantity(item: CatalogRefill, nextQty: number) {
+  function setFieldQtyEdit(fieldId: string, nextEdit: QuantityEditState | null) {
+    if (!nextEdit?.showError) {
+      setSaleError(null);
+    }
+    setQtyEdits((prev) => {
+      if (nextEdit === null) {
+        if (!(fieldId in prev)) return prev;
+        const copy = { ...prev };
+        delete copy[fieldId];
+        return copy;
+      }
+      return { ...prev, [fieldId]: nextEdit };
+    });
+  }
+
+  function clearFieldQtyEdit(fieldId: string) {
+    setQtyEdits((prev) => {
+      if (!(fieldId in prev)) return prev;
+      const copy = { ...prev };
+      delete copy[fieldId];
+      return copy;
+    });
+  }
+
+  function setStandardQuantity(item: CatalogRefill, nextQty: number): boolean {
     const clamped = Math.max(0, Math.min(MAX_LINE_QTY, Math.trunc(nextQty)));
+    const id = defaultLineId(item.waterType);
+    const existingIdx = lines.findIndex((l) => l.id === id);
+
+    if (clamped > 0 && existingIdx === -1 && lines.length >= MAX_LINES) {
+      setSaleError(`Maximum ${MAX_LINES} lines per sale.`);
+      return false;
+    }
+
     setSaleError(null);
     setLastSavedSale(null);
     setLines((prev) => {
-      const id = defaultLineId(item.waterType);
-      const existingIdx = prev.findIndex((l) => l.id === id);
+      const idx = prev.findIndex((l) => l.id === id);
       if (clamped === 0) {
-        return existingIdx === -1 ? prev : prev.filter((l) => l.id !== id);
+        return idx === -1 ? prev : prev.filter((l) => l.id !== id);
       }
-      if (existingIdx !== -1) {
+      if (idx !== -1) {
         return prev.map((l) => (l.id === id ? { ...l, quantity: clamped } : l));
       }
       if (prev.length >= MAX_LINES) {
-        setSaleError(`Maximum ${MAX_LINES} lines per sale.`);
         return prev;
       }
       return [
@@ -376,10 +449,22 @@ export function PosPage() {
         },
       ];
     });
+    return true;
+  }
+
+  function setCustomLineQuantity(id: string, nextQty: number) {
+    const clamped = Math.max(1, Math.min(MAX_LINE_QTY, Math.trunc(nextQty)));
+    setSaleError(null);
+    setLastSavedSale(null);
+    setLines((prev) =>
+      prev.map((line) => (line.id === id ? { ...line, quantity: clamped } : line)),
+    );
   }
 
   function adjustCustomLineQuantity(id: string, delta: number) {
+    clearFieldQtyEdit(id);
     setSaleError(null);
+    setLastSavedSale(null);
     setLines((prev) =>
       prev
         .map((line) =>
@@ -392,25 +477,42 @@ export function PosPage() {
   }
 
   function removeLine(id: string) {
+    clearFieldQtyEdit(id);
     setSaleError(null);
     setLines((prev) => prev.filter((line) => line.id !== id));
   }
 
   function openCustomizeModal() {
+    setQtyEdits((prev) => revealInvalidQuantityEdits(prev).nextEdits);
+    if (
+      document.activeElement instanceof HTMLInputElement &&
+      document.activeElement.classList.contains("qty-stepper__value")
+    ) {
+      document.activeElement.blur();
+    }
     setCustomWaterType("PURIFIED");
     setCustomLitersInput("");
     setCustomPriceInput("");
     setCustomQty(1);
+    setCustomQtyEdit(null);
     setCustomError(null);
     setCustomizeOpen(true);
   }
 
   const parsedCustomLiters = parseLitersInput(customLitersInput);
   const parsedCustomPriceCentavos = parsePesoInputToCentavos(customPriceInput);
+  const visibleCustomQtyError = getVisibleQuantityError(customQtyEdit);
+  const hasInvalidLineEdits = hasInvalidQuantityEdits(qtyEdits);
 
   function handleAddCustomLine(event: FormEvent) {
     event.preventDefault();
     setCustomError(null);
+    if (isQuantityEditInvalid(customQtyEdit)) {
+      setCustomQtyEdit(revealInvalidQuantityEdit(customQtyEdit));
+      setCustomError(QUANTITY_ERROR_MESSAGE);
+      customQtyInputRef.current?.focus();
+      return;
+    }
     if (parsedCustomLiters === null) {
       setCustomError("Enter liters per container between 0.01 and 1000 (up to 2 decimal places).");
       return;
@@ -424,10 +526,21 @@ export function PosPage() {
       return;
     }
 
+    const existingMatch = lines.find(
+      (l) =>
+        l.kind === "CUSTOM" &&
+        l.waterType === customWaterType &&
+        l.unitVolumeLiters === parsedCustomLiters &&
+        l.unitPriceCentavos === parsedCustomPriceCentavos,
+    );
+    if (!existingMatch && lines.length >= MAX_LINES) {
+      setCustomError(`Maximum ${MAX_LINES} lines per sale.`);
+      return;
+    }
+
     const typeLabel = customWaterType === "PURIFIED" ? "Purified" : "Alkaline";
     const displayName = `Custom ${typeLabel} refill · ${formatLiters(parsedCustomLiters)}`;
 
-    let limitHit = false;
     setLines((prev) => {
       const match = prev.find(
         (l) =>
@@ -444,7 +557,6 @@ export function PosPage() {
         );
       }
       if (prev.length >= MAX_LINES) {
-        limitHit = true;
         return prev;
       }
       return [
@@ -461,13 +573,12 @@ export function PosPage() {
       ];
     });
 
-    if (limitHit) {
-      setCustomError(`Maximum ${MAX_LINES} lines per sale.`);
-      return;
+    if (existingMatch) {
+      clearFieldQtyEdit(existingMatch.id);
     }
     setLastSavedSale(null);
     setSaleError(null);
-    setCustomizeOpen(false);
+    closeCustomizeModal();
   }
 
   async function handleStartDay() {
@@ -537,6 +648,7 @@ export function PosPage() {
         setPreparedCheckout(null);
         setPrepareKey(null);
         setPrepareSignature(null);
+        clearAllQtyEdits();
         setStep("select");
       }
       setLastClosedSummary(closed.summary);
@@ -553,7 +665,15 @@ export function PosPage() {
   }
 
   async function handleProceedToCash() {
-    if (lines.length === 0 || !dayStatus?.canSell) return;
+    if (preparingCheckout || lines.length === 0 || !dayStatus?.canSell) return;
+    const { nextEdits, invalidIds } = revealInvalidQuantityEdits(qtyEdits);
+    if (invalidIds.length > 0) {
+      qtyInputRefs.current.get(invalidIds[0]!)?.focus();
+      setQtyEdits(nextEdits);
+      setSaleError("Fix invalid refill quantities before reviewing checkout.");
+      return;
+    }
+
     setPreparingCheckout(true);
     setSaleError(null);
     setLastSavedSale(null);
@@ -595,6 +715,7 @@ export function PosPage() {
       setPreparedCheckout(res.checkout);
       setCashInput("");
       setConfirmNoCashChecked(false);
+      clearAllQtyEdits();
       setStep("review");
     } catch (err) {
       setSaleError(err instanceof ApiError ? err.message : "Could not prepare checkout.");
@@ -648,6 +769,7 @@ export function PosPage() {
   function handleResumeServerPending(checkout: CheckoutView) {
     const hydrated = quoteItemsToDraftLines(checkout.items);
     setLines(hydrated);
+    clearAllQtyEdits();
     setPreparedCheckout(checkout);
     setPrepareKey(null);
     setPrepareSignature(cartLinesSignature(hydrated));
@@ -804,6 +926,7 @@ export function PosPage() {
           : (remaining[0]?.reference ?? null),
       );
       setLines([]);
+      clearAllQtyEdits();
       setPreparedCheckout(null);
       setPrepareKey(null);
       setPrepareSignature(null);
@@ -831,6 +954,7 @@ export function PosPage() {
         setRecoveryError(err.message);
         setPreparedCheckout(null);
         setLines([]);
+        clearAllQtyEdits();
         setPrepareKey(null);
         setPrepareSignature(null);
         setCashInput("");
@@ -850,6 +974,7 @@ export function PosPage() {
       setRecoveryError(errorMsg);
       setPreparedCheckout(null);
       setLines([]);
+      clearAllQtyEdits();
       setPrepareKey(null);
       setPrepareSignature(null);
       setCashInput("");
@@ -918,6 +1043,7 @@ export function PosPage() {
       setPendingRecoveries(remaining);
       setSelectedRecoveryRef(remaining[0]?.reference ?? null);
       setLines([]);
+      clearAllQtyEdits();
       setPreparedCheckout(null);
       setPrepareKey(null);
       setPrepareSignature(null);
@@ -958,6 +1084,7 @@ export function PosPage() {
     setSelectedRecoveryRef(remaining[0]?.reference ?? null);
     setRecoveryError(null);
     setLines([]);
+    clearAllQtyEdits();
     setPreparedCheckout(null);
     setPrepareKey(null);
     setPrepareSignature(null);
@@ -1252,11 +1379,15 @@ export function PosPage() {
 
                       <div className="refill-grid">
                         {catalog.map((item) => {
+                          const fieldId = defaultLineId(item.waterType);
                           const qty = standardQtyByType.get(item.waterType) ?? 0;
                           const isSelected = qty > 0;
                           const labelBase = item.waterType === "PURIFIED" ? "Purified Refill" : "Alkaline Refill";
                           const desc =
                             item.waterType === "PURIFIED" ? "Purified drinking water" : "Alkaline drinking water";
+                          const edit = qtyEdits[fieldId];
+                          const visibleError = getVisibleQuantityError(edit);
+                          const errorId = `qty-error-${fieldId}`;
                           return (
                             <div
                               key={item.code}
@@ -1266,34 +1397,41 @@ export function PosPage() {
                                 <h3>{labelBase}</h3>
                                 <p className="muted-sm">{desc}</p>
                               </div>
-                              <div className="refill-card__bottom">
-                                <span className="refill-card__price">
-                                  <strong>{formatCentavos(item.unitPriceCentavos)}</strong>
-                                  <span className="muted-sm">/{formatLiters(item.unitVolumeLiters).replace(" ", "")}</span>
-                                </span>
-                                <div className="qty-stepper" aria-label={`${labelBase} quantity`}>
-                                  <button
-                                    type="button"
-                                    className="qty-stepper__btn"
-                                    aria-label={`Decrease ${labelBase}`}
-                                    disabled={!dayStatus?.canSell || qty === 0}
-                                    onClick={() => setStandardQuantity(item, qty - 1)}
-                                  >
-                                    −
-                                  </button>
-                                  <span className="qty-stepper__value" aria-live="polite">
-                                    {qty}
+                              <div className="refill-card__footer">
+                                <div className="refill-card__bottom">
+                                  <span className="refill-card__price">
+                                    <strong>{formatCentavos(item.unitPriceCentavos)}</strong>
+                                    <span className="muted-sm">/{formatLiters(item.unitVolumeLiters).replace(" ", "")}</span>
                                   </span>
-                                  <button
-                                    type="button"
-                                    className="qty-stepper__btn"
-                                    aria-label={`Increase ${labelBase}`}
-                                    disabled={!dayStatus?.canSell || qty >= MAX_LINE_QTY}
-                                    onClick={() => setStandardQuantity(item, qty + 1)}
-                                  >
-                                    +
-                                  </button>
+                                  <QuantityStepper
+                                    value={qty}
+                                    edit={edit}
+                                    onEditChange={(nextEdit) => setFieldQtyEdit(fieldId, nextEdit)}
+                                    onCommitValidValue={(nextQty) => setStandardQuantity(item, nextQty)}
+                                    onStep={(delta) => {
+                                      clearFieldQtyEdit(fieldId);
+                                      setStandardQuantity(item, qty + delta);
+                                    }}
+                                    groupLabel={`${labelBase} quantity controls`}
+                                    inputLabel={`${labelBase} quantity`}
+                                    decreaseLabel={`Decrease ${labelBase}`}
+                                    increaseLabel={`Increase ${labelBase}`}
+                                    disabled={!dayStatus?.canSell || preparingCheckout}
+                                    decreaseDisabled={!dayStatus?.canSell || preparingCheckout || qty === 0}
+                                    increaseDisabled={!dayStatus?.canSell || preparingCheckout || qty >= MAX_LINE_QTY}
+                                    allowRestingZero
+                                    errorId={errorId}
+                                    inputRef={(el) => {
+                                      if (el) qtyInputRefs.current.set(fieldId, el);
+                                      else qtyInputRefs.current.delete(fieldId);
+                                    }}
+                                  />
                                 </div>
+                                {visibleError && (
+                                  <p id={errorId} className="qty-stepper__error" role="alert">
+                                    {visibleError}
+                                  </p>
+                                )}
                               </div>
                             </div>
                           );
@@ -1304,7 +1442,10 @@ export function PosPage() {
                         <button
                           type="button"
                           className="button button--primary"
-                          disabled={!dayStatus?.canSell}
+                          disabled={!dayStatus?.canSell || preparingCheckout}
+                          onMouseDown={(event) => {
+                            if (hasInvalidLineEdits) event.preventDefault();
+                          }}
                           onClick={openCustomizeModal}
                         >
                           Customize
@@ -1317,47 +1458,69 @@ export function PosPage() {
                       {customLines.length > 0 && (
                         <div className="custom-line-list" aria-label="Custom refill items">
                           <h3>Custom refills</h3>
-                          {customLines.map((line) => (
-                            <div key={line.id} className="custom-line-row">
-                              <div className="custom-line-row__info">
-                                <strong>{line.displayName}</strong>
-                                <span className="muted-sm">
-                                  {formatCentavos(line.unitPriceCentavos)} per container · Line total{" "}
-                                  {formatCentavos(line.unitPriceCentavos * line.quantity)}
-                                </span>
-                              </div>
-                              <div className="custom-line-row__controls">
-                                <div className="qty-stepper" aria-label={`${line.displayName} quantity`}>
+                          {customLines.map((line) => {
+                            const baseQtyLabel =
+                              (customLabelCounts.get(line.displayName) ?? 0) > 1
+                                ? `${line.displayName} (${formatCentavos(line.unitPriceCentavos)})`
+                                : line.displayName;
+                            const edit = qtyEdits[line.id];
+                            const visibleError = getVisibleQuantityError(edit);
+                            const errorId = `qty-error-${line.id}`;
+                            return (
+                              <div key={line.id} className="custom-line-row">
+                                <div className="custom-line-row__info">
+                                  <strong>{line.displayName}</strong>
+                                  <span className="muted-sm">
+                                    {formatCentavos(line.unitPriceCentavos)} per container · Line total{" "}
+                                    {formatCentavos(line.unitPriceCentavos * line.quantity)}
+                                  </span>
+                                </div>
+                                <div className="custom-line-row__controls">
+                                  <QuantityStepper
+                                    value={line.quantity}
+                                    edit={edit}
+                                    onEditChange={(nextEdit) => setFieldQtyEdit(line.id, nextEdit)}
+                                    onCommitValidValue={(nextQty) => setCustomLineQuantity(line.id, nextQty)}
+                                    onStep={(delta) => adjustCustomLineQuantity(line.id, delta)}
+                                    groupLabel={`${baseQtyLabel} quantity controls`}
+                                    inputLabel={`${baseQtyLabel} quantity`}
+                                    decreaseLabel={`Decrease ${baseQtyLabel}`}
+                                    increaseLabel={`Increase ${baseQtyLabel}`}
+                                    disabled={!dayStatus?.canSell || preparingCheckout}
+                                    decreaseDisabled={!dayStatus?.canSell || preparingCheckout}
+                                    increaseDisabled={
+                                      !dayStatus?.canSell || preparingCheckout || line.quantity >= MAX_LINE_QTY
+                                    }
+                                    errorId={errorId}
+                                    inputRef={(el) => {
+                                      if (el) qtyInputRefs.current.set(line.id, el);
+                                      else qtyInputRefs.current.delete(line.id);
+                                    }}
+                                  />
                                   <button
                                     type="button"
-                                    className="qty-stepper__btn"
-                                    aria-label={`Decrease ${line.displayName}`}
-                                    disabled={!dayStatus?.canSell}
-                                    onClick={() => adjustCustomLineQuantity(line.id, -1)}
+                                    className="button button--ghost button--sm"
+                                    disabled={!dayStatus?.canSell || preparingCheckout}
+                                    onMouseDown={(event) => {
+                                      if (hasInvalidLineEdits) event.preventDefault();
+                                    }}
+                                    onClick={() => removeLine(line.id)}
                                   >
-                                    −
-                                  </button>
-                                  <span className="qty-stepper__value">{line.quantity}</span>
-                                  <button
-                                    type="button"
-                                    className="qty-stepper__btn"
-                                    aria-label={`Increase ${line.displayName}`}
-                                    disabled={!dayStatus?.canSell || line.quantity >= MAX_LINE_QTY}
-                                    onClick={() => adjustCustomLineQuantity(line.id, 1)}
-                                  >
-                                    +
+                                    Remove
                                   </button>
                                 </div>
-                                <button
-                                  type="button"
-                                  className="button button--ghost button--sm"
-                                  onClick={() => removeLine(line.id)}
-                                >
-                                  Remove
-                                </button>
+                                {visibleError && (
+                                  <p
+                                    id={errorId}
+                                    className="qty-stepper__error qty-stepper__error--row"
+                                    role="alert"
+                                  >
+                                    {visibleError}
+                                  </p>
+                                )}
                               </div>
-                            </div>
-                          ))}
+                            );
+                          })}
                         </div>
                       )}
                     </article>
@@ -1378,6 +1541,9 @@ export function PosPage() {
                           <button
                             type="button"
                             className="button button--ghost button--sm"
+                            onMouseDown={(event) => {
+                              if (hasInvalidLineEdits) event.preventDefault();
+                            }}
                             onClick={() => {
                               setHistoryFocusRef(lastSavedSale.reference);
                               setTab("history");
@@ -1438,6 +1604,9 @@ export function PosPage() {
                           type="button"
                           className="button button--primary button--block"
                           disabled={!dayStatus?.canSell || lines.length === 0 || preparingCheckout}
+                          onMouseDown={(event) => {
+                            if (hasInvalidLineEdits) event.preventDefault();
+                          }}
                           onClick={() => void handleProceedToCash()}
                         >
                           {preparingCheckout ? "Preparing checkout…" : "Review checkout"}
@@ -1447,9 +1616,21 @@ export function PosPage() {
                             type="button"
                             className="button button--ghost button--block"
                             disabled={preparingCheckout}
+                            onMouseDown={(event) => {
+                              if (hasInvalidLineEdits) event.preventDefault();
+                            }}
                             onClick={() => {
                               setLines([]);
+                              clearAllQtyEdits();
                               setSaleError(null);
+                              setTimeout(() => {
+                                if (
+                                  document.activeElement instanceof HTMLInputElement &&
+                                  document.activeElement.classList.contains("qty-stepper__value")
+                                ) {
+                                  document.activeElement.blur();
+                                }
+                              }, 0);
                             }}
                           >
                             Clear sale
@@ -1731,7 +1912,7 @@ export function PosPage() {
         <div
           className="modal-backdrop"
           role="presentation"
-          onClick={() => setCustomizeOpen(false)}
+          onClick={closeCustomizeModal}
         >
           <div
             className="modal modal--wide"
@@ -1801,29 +1982,45 @@ export function PosPage() {
                 </label>
               </div>
 
-              <div className="customize-qty-row">
-                <span className="customize-qty-row__label">Quantity (containers)</span>
-                <div className="qty-stepper" aria-label="Custom refill quantity">
-                  <button
-                    type="button"
-                    className="qty-stepper__btn"
-                    aria-label="Decrease custom quantity"
-                    disabled={customQty <= 1}
-                    onClick={() => setCustomQty((q) => Math.max(1, q - 1))}
-                  >
-                    −
-                  </button>
-                  <span className="qty-stepper__value">{customQty}</span>
-                  <button
-                    type="button"
-                    className="qty-stepper__btn"
-                    aria-label="Increase custom quantity"
-                    disabled={customQty >= MAX_LINE_QTY}
-                    onClick={() => setCustomQty((q) => Math.min(MAX_LINE_QTY, q + 1))}
-                  >
-                    +
-                  </button>
+              <div className="customize-qty-group">
+                <div className="customize-qty-row">
+                  <span className="customize-qty-row__label">Quantity (containers)</span>
+                  <QuantityStepper
+                    value={customQty}
+                    edit={customQtyEdit}
+                    onEditChange={(nextEdit) => {
+                      setCustomQtyEdit(nextEdit);
+                      if (!nextEdit?.showError) {
+                        setCustomError(null);
+                      }
+                    }}
+                    onCommitValidValue={(nextQty) => {
+                      setCustomQty(nextQty);
+                      setCustomError(null);
+                    }}
+                    onStep={(delta) => {
+                      setCustomQtyEdit(null);
+                      setCustomError(null);
+                      setCustomQty((q) => Math.max(1, Math.min(MAX_LINE_QTY, q + delta)));
+                    }}
+                    groupLabel="Custom refill quantity controls"
+                    inputLabel="Custom refill quantity"
+                    decreaseLabel="Decrease custom quantity"
+                    increaseLabel="Increase custom quantity"
+                    disabled={!dayStatus?.canSell || preparingCheckout}
+                    decreaseDisabled={customQty <= 1}
+                    increaseDisabled={customQty >= MAX_LINE_QTY}
+                    errorId="qty-error-customize"
+                    inputRef={(el) => {
+                      customQtyInputRef.current = el;
+                    }}
+                  />
                 </div>
+                {visibleCustomQtyError && (
+                  <p id="qty-error-customize" className="qty-stepper__error" role="alert">
+                    {visibleCustomQtyError}
+                  </p>
+                )}
               </div>
 
               <div className="callout callout--info">
@@ -1845,10 +2042,23 @@ export function PosPage() {
               )}
 
               <div className="modal__actions">
-                <button type="button" className="button button--ghost" onClick={() => setCustomizeOpen(false)}>
+                <button
+                  type="button"
+                  className="button button--ghost"
+                  onMouseDown={(event) => {
+                    if (isQuantityEditInvalid(customQtyEdit)) event.preventDefault();
+                  }}
+                  onClick={closeCustomizeModal}
+                >
                   Discard
                 </button>
-                <button type="submit" className="button button--primary">
+                <button
+                  type="submit"
+                  className="button button--primary"
+                  onMouseDown={(event) => {
+                    if (isQuantityEditInvalid(customQtyEdit)) event.preventDefault();
+                  }}
+                >
                   Add To Cart
                 </button>
               </div>

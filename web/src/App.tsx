@@ -5,7 +5,7 @@ import { IdleWarning } from "./auth/IdleWarning";
 import { postAuthRedirectPath } from "./auth/idle";
 import { LoginPage } from "./auth/LoginPage";
 import { CalendarPage } from "./calendar/CalendarPage";
-import { ChooseModule } from "./ChooseModule";
+import { ChooseModule, WorkspaceSidebarProvider } from "./ChooseModule";
 import { PosPage } from "./pos/PosPage";
 
 function AppRoutes() {
@@ -47,12 +47,14 @@ function AppRoutes() {
   }
 
   return (
-    <Routes>
-      <Route path="/" element={<ChooseModule />} />
-      <Route path="/pos" element={<PosPage />} />
-      <Route path="/calendar" element={<CalendarPage />} />
-      <Route path="*" element={<Navigate to="/" replace />} />
-    </Routes>
+    <WorkspaceSidebarProvider key={state.user.username}>
+      <Routes>
+        <Route path="/" element={<ChooseModule />} />
+        <Route path="/pos" element={<PosPage />} />
+        <Route path="/calendar" element={<CalendarPage />} />
+        <Route path="*" element={<Navigate to="/" replace />} />
+      </Routes>
+    </WorkspaceSidebarProvider>
   );
 }
 

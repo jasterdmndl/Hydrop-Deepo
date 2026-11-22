@@ -1,4 +1,4 @@
-import { type MouseEvent, type ReactNode, useCallback, useEffect, useRef, useState } from "react";
+import { createContext, type MouseEvent, type ReactNode, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { Link, useLocation } from "react-router-dom";
 import { api, ApiError } from "./api";
 import { LogoutErrorBanner, useAuth, useSignedInUser } from "./auth/AuthContext";
@@ -11,6 +11,7 @@ import {
   formatManilaFullDate,
   manilaGreeting,
   orderSidebarModules,
+  resolveSidebarState,
   selectHomeCardModules,
 } from "./chooseModuleView";
 import {
@@ -235,6 +236,25 @@ export interface AppShellProps {
 const DRAWER_MEDIA_QUERY = "(max-width: 799px), (orientation: portrait) and (max-width: 900px)";
 const FOCUSABLE_SELECTOR = 'a[href], button:not(:disabled), [tabindex]:not([tabindex="-1"])';
 
+interface WorkspaceSidebarContextValue {
+  wideSidebarOpen: boolean;
+  toggleWideSidebar: () => void;
+}
+
+const WorkspaceSidebarContext = createContext<WorkspaceSidebarContextValue | null>(null);
+
+export function WorkspaceSidebarProvider({ children }: { children: ReactNode }) {
+  const [wideSidebarOpen, setWideSidebarOpen] = useState(true);
+  const toggleWideSidebar = useCallback(() => {
+    setWideSidebarOpen((open) => !open);
+  }, []);
+  const value = useMemo(
+    () => ({ wideSidebarOpen, toggleWideSidebar }),
+    [wideSidebarOpen, toggleWideSidebar],
+  );
+  return <WorkspaceSidebarContext.Provider value={value}>{children}</WorkspaceSidebarContext.Provider>;
+}
+
 export function AppShell({
   activeKey,
   sectionName,
@@ -246,6 +266,16 @@ export function AppShell({
   const user = useSignedInUser();
   const { state, clockOffset, logout, loggingOut, logoutError } = useAuth();
   const location = useLocation();
+  const sharedSidebar = useContext(WorkspaceSidebarContext);
+  const [localWideSidebarOpen, setLocalWideSidebarOpen] = useState(true);
+  const wideSidebarOpen = sharedSidebar ? sharedSidebar.wideSidebarOpen : localWideSidebarOpen;
+  const toggleWideSidebar = useCallback(() => {
+    if (sharedSidebar) {
+      sharedSidebar.toggleWideSidebar();
+    } else {
+      setLocalWideSidebarOpen((open) => !open);
+    }
+  }, [sharedSidebar]);
   const [fetchedModules, setFetchedModules] = useState<ModulesResponse | null>(null);
   const [fetchedStationStatus, setFetchedStationStatus] = useState<StationStatus | null>(null);
   const [isDrawerMode, setIsDrawerMode] = useState(() =>
@@ -255,11 +285,19 @@ export function AppShell({
   );
   const [drawerOpen, setDrawerOpen] = useState(false);
 
+  const { drawerActive, sidebarCollapsed, sidebarHidden, sidebarExpanded, toggleLabel } = resolveSidebarState(
+    isDrawerMode,
+    drawerOpen,
+    wideSidebarOpen,
+  );
+
   const menuButtonRef = useRef<HTMLButtonElement | null>(null);
   const drawerRef = useRef<HTMLElement | null>(null);
   const closeButtonRef = useRef<HTMLButtonElement | null>(null);
   const workspaceRef = useRef<HTMLDivElement | null>(null);
   const restoreFocusOnCloseRef = useRef(false);
+  const drawerOpenRef = useRef(false);
+  drawerOpenRef.current = drawerOpen;
   const stationTrackerRef = useRef(createRequestTracker());
 
   const closeDrawer = useCallback((restoreFocus: boolean) => {
@@ -273,7 +311,8 @@ export function AppShell({
     const update = () => {
       setIsDrawerMode(media.matches);
       if (!media.matches) {
-        restoreFocusOnCloseRef.current = false;
+        restoreFocusOnCloseRef.current =
+          drawerOpenRef.current && !document.querySelector('[role="alertdialog"]');
         setDrawerOpen(false);
       }
     };
@@ -293,17 +332,21 @@ export function AppShell({
   useEffect(() => {
     const workspace = workspaceRef.current as (HTMLDivElement & { inert: boolean }) | null;
     if (workspace) {
-      workspace.inert = isDrawerMode && drawerOpen;
+      workspace.inert = drawerActive;
     }
     const drawer = drawerRef.current as (HTMLElement & { inert: boolean }) | null;
     if (drawer) {
-      drawer.inert = isDrawerMode && !drawerOpen;
+      drawer.inert = sidebarHidden;
     }
-    if (isDrawerMode && !drawerOpen && restoreFocusOnCloseRef.current) {
+    if (!drawerActive && restoreFocusOnCloseRef.current) {
       restoreFocusOnCloseRef.current = false;
-      menuButtonRef.current?.focus();
+      const activeInVisibleSidebar =
+        !sidebarHidden && Boolean(drawer && document.activeElement && drawer.contains(document.activeElement));
+      if (!activeInVisibleSidebar && !document.querySelector('[role="alertdialog"]')) {
+        menuButtonRef.current?.focus();
+      }
     }
-  }, [isDrawerMode, drawerOpen]);
+  }, [isDrawerMode, drawerOpen, drawerActive, sidebarHidden]);
 
   useEffect(() => {
     if (!isDrawerMode || !drawerOpen) return;
@@ -409,7 +452,9 @@ export function AppShell({
   const stationStatus =
     stationStatusOverride !== undefined ? stationStatusOverride : (effectiveModuleStation ?? fetchedStationStatus);
   const todayManila = formatManilaFullDate();
-  const drawerActive = isDrawerMode && drawerOpen;
+  const shellClassName = ["shell", isHome ? "shell--home" : "", sidebarCollapsed ? "shell--sidebar-collapsed" : ""]
+    .filter(Boolean)
+    .join(" ");
 
   const normalizePath = (path: string) => (path.length > 1 && path.endsWith("/") ? path.slice(0, -1) : path);
 
@@ -424,18 +469,19 @@ export function AppShell({
   };
 
   return (
-    <div className={isHome ? "shell shell--home" : "shell"}>
+    <div className={shellClassName}>
       {drawerActive && (
         <div className="drawer-backdrop" aria-hidden="true" onClick={() => closeDrawer(true)} />
       )}
       <aside
         id="workspace-sidebar"
         ref={drawerRef}
+        hidden={sidebarCollapsed}
         className={drawerActive ? "sidebar sidebar--open" : "sidebar"}
         role={drawerActive ? "dialog" : undefined}
         aria-modal={drawerActive ? true : undefined}
         aria-label="Workspace navigation"
-        aria-hidden={isDrawerMode && !drawerOpen ? true : undefined}
+        aria-hidden={sidebarHidden ? true : undefined}
       >
         <div className="sidebar__top">
           <div className="sidebar__brand-row">
@@ -540,17 +586,27 @@ export function AppShell({
               ref={menuButtonRef}
               type="button"
               className="menu-button"
-              aria-label="Open navigation menu"
-              aria-expanded={drawerActive}
+              aria-label={toggleLabel}
+              title={isDrawerMode ? undefined : toggleLabel}
+              aria-expanded={sidebarExpanded}
               aria-controls="workspace-sidebar"
-              onClick={() => setDrawerOpen(true)}
+              onClick={() => (isDrawerMode ? setDrawerOpen(true) : toggleWideSidebar())}
             >
-              <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
-                <line x1="4" y1="6" x2="20" y2="6" />
-                <line x1="4" y1="12" x2="20" y2="12" />
-                <line x1="4" y1="18" x2="20" y2="18" />
-              </svg>
-              <span>Menu</span>
+              {isDrawerMode ? (
+                <>
+                  <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+                    <line x1="4" y1="6" x2="20" y2="6" />
+                    <line x1="4" y1="12" x2="20" y2="12" />
+                    <line x1="4" y1="18" x2="20" y2="18" />
+                  </svg>
+                  <span>Menu</span>
+                </>
+              ) : (
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <rect x="3" y="4" width="18" height="16" rx="2" />
+                  <line x1="9" y1="4" x2="9" y2="20" />
+                </svg>
+              )}
             </button>
             <nav className="breadcrumb" aria-label="Breadcrumb">
               {sectionName ? (

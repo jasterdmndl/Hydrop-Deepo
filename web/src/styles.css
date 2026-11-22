@@ -468,7 +468,7 @@ textarea:focus-visible {
   color: #a82825;
 }
 
-.login-field > span {
+.login-field>span {
   font-size: 0.8125rem;
   font-weight: 600;
   color: #142c48;
@@ -667,7 +667,30 @@ textarea:focus-visible {
   gap: 12px;
 }
 
-.menu-button,
+.menu-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  min-height: 44px;
+  min-width: 44px;
+  padding: 0 10px;
+  border-radius: var(--radius-md);
+  border: 1px solid var(--border);
+  background: #ffffff;
+  color: var(--navy-900);
+  font: inherit;
+  font-size: 0.875rem;
+  font-weight: 600;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.menu-button:hover,
+.menu-button:active {
+  background: #f8fafc;
+}
+
 .drawer-close,
 .drawer-backdrop {
   display: none;
@@ -968,7 +991,7 @@ textarea:focus-visible {
   gap: 12px;
 }
 
-.page-header > div {
+.page-header>div {
   min-width: 0;
 }
 
@@ -1189,8 +1212,8 @@ textarea:focus-visible {
   align-items: start;
 }
 
-.calendar-layout > *,
-.two-col-layout > * {
+.calendar-layout>*,
+.two-col-layout>* {
   min-width: 0;
 }
 
@@ -1995,7 +2018,8 @@ textarea:focus-visible {
   }
 }
 
-@media (min-width: 800px) and (max-width: 960px), (min-width: 800px) and (max-height: 680px) {
+@media (min-width: 800px) and (max-width: 960px),
+(min-width: 800px) and (max-height: 680px) {
   .login-page {
     grid-template-columns: minmax(280px, 40%) 1fr;
   }
@@ -2048,7 +2072,8 @@ textarea:focus-visible {
   }
 }
 
-@media (min-width: 800px) and (max-width: 900px), (min-width: 800px) and (max-height: 680px) {
+@media (min-width: 800px) and (max-width: 900px),
+(min-width: 800px) and (max-height: 680px) {
   .shell {
     grid-template-columns: 196px minmax(0, 1fr);
   }
@@ -2083,9 +2108,19 @@ textarea:focus-visible {
   }
 }
 
+.shell.shell--sidebar-collapsed {
+  grid-template-columns: minmax(0, 1fr);
+}
+
+.shell.shell--sidebar-collapsed > .sidebar,
+.sidebar[hidden] {
+  display: none;
+}
+
 /* Portrait and narrow layouts (drawer navigation + stacked sign-in) */
 
-@media (max-width: 799px), (orientation: portrait) and (max-width: 900px) {
+@media (max-width: 799px),
+(orientation: portrait) and (max-width: 900px) {
   .login-page {
     grid-template-columns: 1fr;
     align-content: start;
@@ -2124,26 +2159,7 @@ textarea:focus-visible {
   }
 
   .menu-button {
-    display: inline-flex;
-    align-items: center;
-    gap: 8px;
-    min-height: 44px;
-    min-width: 44px;
     padding: 0 12px;
-    border-radius: var(--radius-md);
-    border: 1px solid var(--border);
-    background: #ffffff;
-    color: var(--navy-900);
-    font: inherit;
-    font-size: 0.875rem;
-    font-weight: 600;
-    cursor: pointer;
-    flex-shrink: 0;
-  }
-
-  .menu-button:hover,
-  .menu-button:active {
-    background: #f8fafc;
   }
 
   .drawer-backdrop {
@@ -2208,6 +2224,7 @@ textarea:focus-visible {
 }
 
 @media (orientation: portrait) and (max-width: 900px) {
+
   .calendar-layout,
   .two-col-layout {
     grid-template-columns: minmax(0, 1fr);
@@ -2245,6 +2262,7 @@ textarea:focus-visible {
 /* Workspace container adaptation */
 
 @container workspace (max-width: 739px) {
+
   .calendar-layout,
   .two-col-layout {
     grid-template-columns: minmax(0, 1fr);
@@ -2452,7 +2470,7 @@ textarea:focus-visible {
   align-items: start;
 }
 
-.pos-layout > *,
+.pos-layout>*,
 .pos-main,
 .recovery-main {
   min-width: 0;
@@ -2537,10 +2555,29 @@ textarea:focus-visible {
   border: 1px solid #cbd5e1;
   border-radius: var(--radius-md);
   background: #ffffff;
-  overflow: hidden;
+  transition: border-color 120ms ease, box-shadow 120ms ease;
+}
+
+.qty-stepper:focus-within {
+  border-color: var(--blue-600);
+  box-shadow: 0 0 0 3px rgba(29, 99, 220, 0.22);
+}
+
+.qty-stepper--invalid {
+  border-color: #dc2626;
+}
+
+.qty-stepper--invalid:focus-within {
+  border-color: #dc2626;
+  box-shadow: 0 0 0 3px rgba(220, 38, 38, 0.2);
+}
+
+.qty-stepper--disabled {
+  background: #f8fafc;
 }
 
 .qty-stepper__btn {
+  flex: 0 0 44px;
   min-width: 44px;
   min-height: 44px;
   border: none;
@@ -2552,8 +2589,23 @@ textarea:focus-visible {
   cursor: pointer;
 }
 
+.qty-stepper__btn:first-child {
+  border-top-left-radius: calc(var(--radius-md) - 1px);
+  border-bottom-left-radius: calc(var(--radius-md) - 1px);
+}
+
+.qty-stepper__btn:last-child {
+  border-top-right-radius: calc(var(--radius-md) - 1px);
+  border-bottom-right-radius: calc(var(--radius-md) - 1px);
+}
+
 .qty-stepper__btn:hover:not(:disabled) {
   background: #f1f5f9;
+}
+
+.qty-stepper__btn:focus-visible {
+  outline: 2px solid var(--blue-600);
+  outline-offset: -2px;
 }
 
 .qty-stepper__btn:disabled {
@@ -2562,12 +2614,70 @@ textarea:focus-visible {
 }
 
 .qty-stepper__value {
-  min-width: 34px;
-  padding: 0 4px;
+  flex: 0 0 auto;
+  width: 54px;
+  min-width: 50px;
+  min-height: 44px;
+  margin: 0;
+  padding: 0 6px;
+  border: none;
+  border-left: 1px solid #e2e8f0;
+  border-right: 1px solid #e2e8f0;
+  border-radius: 0;
+  background: transparent;
   text-align: center;
+  font: inherit;
+  font-size: 1rem;
   font-weight: 700;
   font-variant-numeric: tabular-nums;
   color: var(--navy-900);
+}
+
+.qty-stepper__value:hover:not(:disabled) {
+  background: #f8fafc;
+}
+
+.qty-stepper__value:focus,
+.qty-stepper__value:focus-visible {
+  outline: 2px solid var(--blue-600);
+  outline-offset: -2px;
+  background: var(--blue-50);
+}
+
+.qty-stepper--invalid .qty-stepper__value {
+  background: var(--red-bg);
+  color: var(--red-text);
+}
+
+.qty-stepper--invalid .qty-stepper__value:focus,
+.qty-stepper--invalid .qty-stepper__value:focus-visible {
+  outline: 2px solid #dc2626;
+  outline-offset: -2px;
+  background: var(--red-bg);
+}
+
+.qty-stepper__value:disabled {
+  color: var(--text-muted);
+  cursor: not-allowed;
+}
+
+.refill-card__footer,
+.customize-qty-group {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.qty-stepper__error {
+  margin: 0;
+  font-size: 0.8125rem;
+  font-weight: 500;
+  line-height: 1.35;
+  color: var(--red-text);
+}
+
+.qty-stepper__error--row {
+  flex: 1 0 100%;
 }
 
 .pos-customize-row {
@@ -2890,6 +3000,7 @@ textarea:focus-visible {
 }
 
 @container workspace (max-width: 739px) {
+
   .pos-layout,
   .pos-history-filters__grid {
     grid-template-columns: minmax(0, 1fr);
@@ -2897,6 +3008,7 @@ textarea:focus-visible {
 }
 
 @container workspace (max-width: 519px) {
+
   .refill-grid,
   .customize-water-grid {
     grid-template-columns: minmax(0, 1fr);
@@ -3295,6 +3407,7 @@ textarea:focus-visible {
 }
 
 @media (min-width: 800px) and (max-width: 1100px) {
+
   .shell--home .topbar,
   .shell--home .content {
     padding-left: 20px;
@@ -3302,7 +3415,9 @@ textarea:focus-visible {
   }
 }
 
-@media (min-width: 800px) and (max-width: 900px), (min-width: 800px) and (max-height: 680px) {
+@media (min-width: 800px) and (max-width: 900px),
+(min-width: 800px) and (max-height: 680px) {
+
   .shell--home .topbar,
   .shell--home .content {
     padding-left: 16px;
@@ -3310,7 +3425,8 @@ textarea:focus-visible {
   }
 }
 
-@media (max-width: 799px), (orientation: portrait) and (max-width: 900px) {
+@media (max-width: 799px),
+(orientation: portrait) and (max-width: 900px) {
   .shell--home .topbar {
     padding: max(10px, env(safe-area-inset-top)) 16px 10px;
   }
@@ -3359,6 +3475,7 @@ textarea:focus-visible {
 /* Wide workspace scaling (e.g. 1600px-1920px+ desktop monitors) */
 
 @container workspace (min-width: 1280px) {
+
   .calendar-layout,
   .two-col-layout {
     grid-template-columns: minmax(0, 1fr) clamp(380px, 32cqi, 440px);
@@ -3372,25 +3489,25 @@ textarea:focus-visible {
     max-width: 1120px;
   }
 
-  .form-card > .form-card__title-row,
-  .form-card > .alert,
-  .form-card > .callout,
-  .form-card > .field,
-  .form-card > .field-row,
-  .form-card > .checkbox-field,
-  .form-card > .form-card__footer,
-  .pos-cash-card > .detail-card__header,
-  .pos-cash-card > .callout,
-  .pos-cash-card > .alert,
-  .pos-cash-card > .field,
-  .pos-cash-card > .quick-tender-row,
-  .pos-cash-card > .change-box,
-  .pos-cash-card > .pos-summary-actions,
-  .recovery-card > .recovery-card__header,
-  .recovery-card > .callout,
-  .recovery-card > .detail-list,
-  .recovery-card > .alert,
-  .recovery-card > .recovery-actions {
+  .form-card>.form-card__title-row,
+  .form-card>.alert,
+  .form-card>.callout,
+  .form-card>.field,
+  .form-card>.field-row,
+  .form-card>.checkbox-field,
+  .form-card>.form-card__footer,
+  .pos-cash-card>.detail-card__header,
+  .pos-cash-card>.callout,
+  .pos-cash-card>.alert,
+  .pos-cash-card>.field,
+  .pos-cash-card>.quick-tender-row,
+  .pos-cash-card>.change-box,
+  .pos-cash-card>.pos-summary-actions,
+  .recovery-card>.recovery-card__header,
+  .recovery-card>.callout,
+  .recovery-card>.detail-list,
+  .recovery-card>.alert,
+  .recovery-card>.recovery-actions {
     width: 100%;
     max-width: 780px;
   }

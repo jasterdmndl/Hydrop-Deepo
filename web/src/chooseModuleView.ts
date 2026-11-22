@@ -181,3 +181,28 @@ export function collectPendingPaymentReferences(
 
   return refs;
 }
+
+export interface SidebarPresentationState {
+  drawerActive: boolean;
+  sidebarCollapsed: boolean;
+  sidebarHidden: boolean;
+  sidebarExpanded: boolean;
+  toggleLabel: string;
+}
+
+export function resolveSidebarState(
+  isDrawerMode: boolean,
+  drawerOpen: boolean,
+  wideSidebarOpen: boolean,
+): SidebarPresentationState {
+  const drawerActive = isDrawerMode && drawerOpen;
+  const sidebarCollapsed = !isDrawerMode && !wideSidebarOpen;
+  const sidebarHidden = isDrawerMode ? !drawerOpen : !wideSidebarOpen;
+  const sidebarExpanded = isDrawerMode ? drawerActive : wideSidebarOpen;
+  const toggleLabel = isDrawerMode
+    ? "Open navigation menu"
+    : wideSidebarOpen
+      ? "Hide navigation sidebar"
+      : "Show navigation sidebar";
+  return { drawerActive, sidebarCollapsed, sidebarHidden, sidebarExpanded, toggleLabel };
+}

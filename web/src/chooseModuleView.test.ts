@@ -8,6 +8,7 @@ import {
   formatManilaFullDate,
   manilaGreeting,
   orderSidebarModules,
+  resolveSidebarState,
   selectHomeCardModules,
 } from "./chooseModuleView";
 import type { PendingCheckoutRecovery, PosDayResponse } from "./pos/posRecovery";
@@ -211,5 +212,39 @@ describe("chooseModuleView helpers", () => {
       "HD-1120-002",
     ]);
     expect(collectPendingPaymentReferences([], null)).toEqual([]);
+  });
+
+  it("resolves sidebar presentation independently for wide and drawer modes", () => {
+    expect(resolveSidebarState(false, false, true)).toEqual({
+      drawerActive: false,
+      sidebarCollapsed: false,
+      sidebarHidden: false,
+      sidebarExpanded: true,
+      toggleLabel: "Hide navigation sidebar",
+    });
+
+    expect(resolveSidebarState(false, true, false)).toEqual({
+      drawerActive: false,
+      sidebarCollapsed: true,
+      sidebarHidden: true,
+      sidebarExpanded: false,
+      toggleLabel: "Show navigation sidebar",
+    });
+
+    expect(resolveSidebarState(true, false, false)).toEqual({
+      drawerActive: false,
+      sidebarCollapsed: false,
+      sidebarHidden: true,
+      sidebarExpanded: false,
+      toggleLabel: "Open navigation menu",
+    });
+
+    expect(resolveSidebarState(true, true, false)).toEqual({
+      drawerActive: true,
+      sidebarCollapsed: false,
+      sidebarHidden: false,
+      sidebarExpanded: true,
+      toggleLabel: "Open navigation menu",
+    });
   });
 });
