@@ -1672,7 +1672,7 @@ describe("POS station day and refill sales", () => {
       expect(ownerLookupBefore.status).toBe(200);
       expect(ownerLookupBefore.body.canSettlePriorDay).toBe(true);
 
-      // Missing either confirmation keeps the checkout pending.
+      // Missing or wrong confirmation keeps the checkout pending.
       const missingDelivery = await request(ctx.app)
         .post(`/api/pos/checkouts/${encodeURIComponent(priorRef)}/settle`)
         .set("Cookie", owner.cookie)
@@ -1680,6 +1680,14 @@ describe("POS station day and refill sales", () => {
         .send({ paymentKeptConfirmed: true, refillDeliveredConfirmed: false });
       expect(missingDelivery.status).toBe(400);
       expect(missingDelivery.body.error.code).toBe("VALIDATION_FAILED");
+
+      const wrongFlagDelivery = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(priorRef)}/settle`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ paymentKeptConfirmed: true, itemsHandedOverConfirmed: true });
+      expect(wrongFlagDelivery.status).toBe(400);
+      expect(wrongFlagDelivery.body.error.code).toBe("VALIDATION_FAILED");
 
       const stillBlocked = await endDay(ctx, owner, { requestKey: "dec048-still-blocked" });
       expect(stillBlocked.status).toBe(409);
@@ -2297,6 +2305,2215 @@ describe("POS station day and refill sales", () => {
       } finally {
         await upgradeDb.close();
       }
+    });
+  });
+
+  describe("Inventory merchandise in POS (DEC-068 through DEC-070)", () => {
+    async function createProduct(
+      payload: Record<string, unknown>,
+      actor: SignedIn = owner,
+    ) {
+      return request(ctx.app)
+        .post("/api/inventory/products")
+        .set("Cookie", actor.cookie)
+        .set("X-CSRF-Token", actor.csrfToken)
+        .send(payload);
+    }
+
+    async function setOpeningStock(itemKey: string, quantity: number, actor: SignedIn = owner) {
+      return request(ctx.app)
+        .post(`/api/inventory/items/${encodeURIComponent(itemKey)}/opening-stock`)
+        .set("Cookie", actor.cookie)
+        .set("X-CSRF-Token", actor.csrfToken)
+        .send({ quantity });
+    }
+
+    it("exposes visible merchandise in catalog, hides unchecked items, sells standalone and mixed orders, and leaves customer refills decoupled", async () => {
+      const faucetRes = await createProduct({
+        name: "Push-Type Faucet",
+        description: "Press to dispense water",
+        unit: "pcs",
+        unitConfirmed: true,
+        unitPriceCentavos: 4000,
+        showInPos: true,
+        posSection: "CHANGE_OF_GRIPO",
+      });
+      expect(faucetRes.status).toBe(201);
+      const faucetId = faucetRes.body.item.id as string;
+
+      const dividerRes = await createProduct({
+        name: "Divider",
+        description: "A white transparent cover",
+        unit: "pcs",
+        unitConfirmed: true,
+        unitPriceCentavos: 1500,
+        showInPos: false,
+        posSection: "TAKIP_ACCESSORIES",
+      });
+      expect(dividerRes.status).toBe(201);
+      const dividerId = dividerRes.body.item.id as string;
+
+      // Catalog shows visible faucet (NOT_SET initially) and omits hidden divider.
+      const cat1 = await request(ctx.app).get("/api/pos/catalog").set("Cookie", cashier.cookie);
+      expect(cat1.status).toBe(200);
+      expect(cat1.body.merchandise).toEqual([
+        {
+          id: faucetId,
+          code: faucetRes.body.item.code,
+          name: "Push-Type Faucet",
+          description: "Press to dispense water",
+          unit: "pcs",
+          unitPriceCentavos: 4000,
+          posSection: "CHANGE_OF_GRIPO",
+          stockStatus: "NOT_SET",
+          currentQuantity: null,
+          availableQuantity: null,
+        },
+      ]);
+
+      await startDay(ctx, owner, { requestKey: "merch-day-1" });
+
+      // Submitting Not Set merchandise fails for both Cashier and Owner.
+      for (const actor of [cashier, owner]) {
+        const unsetPrep = await prepareCheckout(ctx, actor, {
+          items: [{ kind: "MERCHANDISE", productId: faucetId, quantity: 1 }],
+        });
+        expect(unsetPrep.status).toBe(409);
+        expect(unsetPrep.body.error.code).toBe("INSUFFICIENT_STOCK");
+      }
+
+      // Submitting hidden product directly fails.
+      const hiddenPrep = await prepareCheckout(ctx, cashier, {
+        items: [{ kind: "MERCHANDISE", productId: dividerId, quantity: 1 }],
+      });
+      expect(hiddenPrep.status).toBe(400);
+      expect(hiddenPrep.body.error.code).toBe("PRODUCT_UNAVAILABLE");
+
+      // Forged price rejected on schema validation.
+      const forgedPrep = await prepareCheckout(ctx, cashier, {
+        items: [{ kind: "MERCHANDISE", productId: faucetId, quantity: 1, unitPriceCentavos: 100 }],
+      });
+      expect(forgedPrep.status).toBe(400);
+      expect(forgedPrep.body.error.code).toBe("VALIDATION_FAILED");
+
+      // Record opening stock: 5 pcs for Push-Type Faucet.
+      const opening = await setOpeningStock(faucetId, 5);
+      expect(opening.status).toBe(201);
+
+      // Summed demand across duplicate lines in one cart exceeding 5 is blocked.
+      const summedOver = await prepareCheckout(ctx, cashier, {
+        items: [
+          { kind: "MERCHANDISE", productId: faucetId, quantity: 3 },
+          { kind: "MERCHANDISE", productId: faucetId, quantity: 3 },
+        ],
+      });
+      expect(summedOver.status).toBe(409);
+      expect(summedOver.body.error.code).toBe("INSUFFICIENT_STOCK");
+
+      // Two-faucet sale: ₱80 total, ₱100 tender, ₱20 change, 0 containers, 0 L water volume.
+      const twoFaucetsPrep = await prepareCheckout(ctx, cashier, {
+        prepareKey: "merch-two-faucets",
+        items: [{ kind: "MERCHANDISE", productId: faucetId, quantity: 2 }],
+      });
+      expect(twoFaucetsPrep.status).toBe(201);
+      const ref1 = twoFaucetsPrep.body.checkout.reference as string;
+      expect(twoFaucetsPrep.body.checkout).toMatchObject({
+        totalCentavos: 8000,
+        totalContainers: 0,
+        totalVolumeMl: 0,
+        totalVolumeLiters: 0,
+      });
+
+      const begin1 = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(ref1)}/begin-payment`)
+        .set("Cookie", cashier.cookie)
+        .set("X-CSRF-Token", cashier.csrfToken)
+        .send({});
+      expect(begin1.status).toBe(200);
+
+      const confirm1 = await confirmCheckout(ctx.app, cashier, ref1, { cashReceivedCentavos: 10000 });
+      expect(confirm1.status).toBe(201);
+      expect(confirm1.body.sale).toMatchObject({
+        reference: ref1,
+        totalCentavos: 8000,
+        cashReceivedCentavos: 10000,
+        changeCentavos: 2000,
+        totalContainers: 0,
+        totalVolumeMl: 0,
+        totalVolumeLiters: 0,
+      });
+      expect(confirm1.body.sale.items).toEqual([
+        {
+          lineIndex: 0,
+          kind: "MERCHANDISE",
+          catalogCode: null,
+          waterType: null,
+          productId: faucetId,
+          stockUnit: "pcs",
+          posSection: "CHANGE_OF_GRIPO",
+          displayLabel: "Push-Type Faucet",
+          unitVolumeMl: 0,
+          unitVolumeLiters: 0,
+          unitPriceCentavos: 4000,
+          quantity: 2,
+          lineTotalCentavos: 8000,
+          lineVolumeMl: 0,
+          lineVolumeLiters: 0,
+        },
+      ]);
+
+      // Lost-response retry on /confirm does NOT deduct stock again!
+      const retry1 = await confirmCheckout(ctx.app, cashier, ref1, { cashReceivedCentavos: 10000 });
+      expect(retry1.status).toBe(200);
+      expect(retry1.body.replayed).toBe(true);
+
+      const { rows: invAfter1 } = await ctx.db.query<{ current_quantity: number }>(
+        `SELECT current_quantity FROM inventory_items WHERE id = $1`,
+        [faucetId],
+      );
+      expect(Number(invAfter1[0]!.current_quantity)).toBe(3);
+
+      const { rows: moveRows1 } = await ctx.db.query<{
+        quantity_delta: number;
+        balance_before: number;
+        balance_after: number;
+        pos_reference: string;
+      }>(
+        `SELECT quantity_delta, balance_before, balance_after, pos_reference
+           FROM inventory_stock_movements
+          WHERE item_id = $1`,
+        [faucetId],
+      );
+      expect(moveRows1).toEqual([
+        {
+          quantity_delta: -2,
+          balance_before: 5,
+          balance_after: 3,
+          pos_reference: ref1,
+        },
+      ]);
+
+      // Mixed sale: 1 Purified 25 L refill (₱25) + 1 Push-Type Faucet (₱40) = ₱65
+      const mixedPrep = await prepareCheckout(ctx, owner, {
+        prepareKey: "merch-mixed-sale",
+        items: [
+          { kind: "STANDARD", waterType: "PURIFIED", quantity: 1 },
+          { kind: "MERCHANDISE", productId: faucetId, quantity: 1 },
+        ],
+      });
+      expect(mixedPrep.status).toBe(201);
+      const ref2 = mixedPrep.body.checkout.reference as string;
+      const mixedConfirm = await confirmCheckout(ctx.app, owner, ref2, { cashReceivedCentavos: 10000 });
+      expect(mixedConfirm.status).toBe(201);
+      expect(mixedConfirm.body.sale).toMatchObject({
+        totalCentavos: 6500,
+        cashReceivedCentavos: 10000,
+        changeCentavos: 3500,
+        totalContainers: 1,
+        totalVolumeMl: 25000,
+        totalVolumeLiters: 25,
+      });
+
+      // Customer-owned refill alone does not alter merchandise stock (stays at 2).
+      const refillOnlyPrep = await prepareCheckout(ctx, cashier, {
+        items: [{ kind: "CUSTOM", waterType: "ALKALINE", unitVolumeLiters: 10, unitPriceCentavos: 3000, quantity: 1 }],
+      });
+      expect(refillOnlyPrep.status).toBe(201);
+      const refillOnlyConfirm = await confirmCheckout(ctx.app, cashier, refillOnlyPrep.body.checkout.reference, {
+        cashReceivedCentavos: 3000,
+      });
+      expect(refillOnlyConfirm.status).toBe(201);
+
+      const { rows: invAfter3 } = await ctx.db.query<{ current_quantity: number }>(
+        `SELECT current_quantity FROM inventory_items WHERE id = $1`,
+        [faucetId],
+      );
+      expect(Number(invAfter3[0]!.current_quantity)).toBe(2);
+
+      // Day summary tracks refill volume + combined sales revenue accurately.
+      const dayRes = await request(ctx.app).get("/api/pos/day").set("Cookie", owner.cookie);
+      expect(dayRes.body.day.summary).toMatchObject({
+        totalSalesCentavos: 8000 + 6500 + 3000,
+        validTransactionCount: 3,
+        purifiedQuantity: 1,
+        alkalineQuantity: 1,
+        totalVolumeMl: 35000,
+        totalVolumeLiters: 35,
+      });
+    });
+
+    it("prevents competing checkouts from committing the same last unit, releases on cancel, preserves snapshots on product edits, and blocks closed-day and prior-day settlement", async () => {
+      const faucetRes = await createProduct({
+        name: "Push-Type Faucet",
+        unit: "pcs",
+        unitConfirmed: true,
+        unitPriceCentavos: 4000,
+        showInPos: true,
+        posSection: "CHANGE_OF_GRIPO",
+      });
+      const faucetId = faucetRes.body.item.id as string;
+      await setOpeningStock(faucetId, 1);
+
+      await startDay(ctx, owner, { requestKey: "compete-day" });
+
+      // Prepare two separate drafts for the last 1 faucet.
+      const prepA = await prepareCheckout(ctx, cashier, {
+        prepareKey: "compete-a",
+        items: [{ kind: "MERCHANDISE", productId: faucetId, quantity: 1 }],
+      });
+      const prepB = await prepareCheckout(ctx, owner, {
+        prepareKey: "compete-b",
+        items: [{ kind: "MERCHANDISE", productId: faucetId, quantity: 1 }],
+      });
+      expect(prepA.status).toBe(201);
+      expect(prepB.status).toBe(201);
+      const refA = prepA.body.checkout.reference as string;
+      const refB = prepB.body.checkout.reference as string;
+
+      // Concurrent begin-payment: exactly one succeeds (200) and the other is blocked (409 INSUFFICIENT_STOCK).
+      const [beginA, beginB] = await Promise.all([
+        request(ctx.app)
+          .post(`/api/pos/checkouts/${encodeURIComponent(refA)}/begin-payment`)
+          .set("Cookie", cashier.cookie)
+          .set("X-CSRF-Token", cashier.csrfToken)
+          .send({}),
+        request(ctx.app)
+          .post(`/api/pos/checkouts/${encodeURIComponent(refB)}/begin-payment`)
+          .set("Cookie", owner.cookie)
+          .set("X-CSRF-Token", owner.csrfToken)
+          .send({}),
+      ]);
+      const beginStatuses = [beginA.status, beginB.status].sort((a, b) => a - b);
+      expect(beginStatuses).toEqual([200, 409]);
+
+      const winnerRef = beginA.status === 200 ? refA : refB;
+      const winnerActor = beginA.status === 200 ? cashier : owner;
+      const loserRef = beginA.status === 409 ? refA : refB;
+      const loserActor = beginA.status === 409 ? cashier : owner;
+
+      // Catalog shows 0 available while winner holds active commitment.
+      const catHeld = await request(ctx.app).get("/api/pos/catalog").set("Cookie", cashier.cookie);
+      expect(catHeld.body.merchandise[0]).toMatchObject({
+        stockStatus: "OUT_OF_STOCK",
+        currentQuantity: 1,
+        availableQuantity: 0,
+      });
+
+      // Cancelling winner with confirmNoCashTaken releases the commitment so loser can begin payment.
+      const cancelWinner = await cancelCheckout(ctx, winnerActor, winnerRef, {
+        confirmNoCashTaken: true,
+        reason: "Customer changed mind",
+      });
+      expect(cancelWinner.status).toBe(200);
+
+      const beginLoser = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(loserRef)}/begin-payment`)
+        .set("Cookie", loserActor.cookie)
+        .set("X-CSRF-Token", loserActor.csrfToken)
+        .send({});
+      expect(beginLoser.status).toBe(200);
+
+      // Owner updates product price and hides it AFTER loser's checkout was quoted.
+      const patchRes = await request(ctx.app)
+        .patch(`/api/inventory/products/${encodeURIComponent(faucetId)}`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ name: "Updated Faucet", unitPriceCentavos: 5500, showInPos: false });
+      expect(patchRes.status).toBe(200);
+
+      // Quoted recovery / confirm still uses the ₱40 snapshot and saves cleanly!
+      const lookupLoser = await request(ctx.app)
+        .get(`/api/pos/checkouts/${encodeURIComponent(loserRef)}`)
+        .set("Cookie", loserActor.cookie);
+      expect(lookupLoser.status).toBe(200);
+      expect(lookupLoser.body.checkout.totalCentavos).toBe(4000);
+      expect(lookupLoser.body.checkout.items[0].displayLabel).toBe("Push-Type Faucet");
+
+      const confirmLoser = await confirmCheckout(ctx.app, loserActor, loserRef, {
+        cashReceivedCentavos: 5000,
+      });
+      expect(confirmLoser.status).toBe(201);
+      expect(confirmLoser.body.sale.totalCentavos).toBe(4000);
+      expect(confirmLoser.body.sale.items[0].displayLabel).toBe("Push-Type Faucet");
+
+      // Re-publish updated faucet with 2 pcs, close today, and verify closed-day attempt is rejected.
+      await request(ctx.app)
+        .patch(`/api/inventory/products/${encodeURIComponent(faucetId)}`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ showInPos: true });
+      await ctx.db.query(`UPDATE inventory_items SET current_quantity = 2 WHERE id = $1`, [faucetId]);
+
+      const endToday = await endDay(ctx, owner, { requestKey: "end-today-merch" });
+      expect(endToday.status).toBe(200);
+
+      const closedPrep = await prepareCheckout(ctx, cashier, {
+        items: [{ kind: "MERCHANDISE", productId: faucetId, quantity: 1 }],
+      });
+      expect(closedPrep.status).toBe(409);
+      expect(closedPrep.body.error.code).toBe("DAY_ALREADY_CLOSED");
+
+      // Next business day: mixed refill + merchandise checkout crossing midnight remains pending (DEC-075 covers merchandise-only only).
+      ctx.clock.advance(24 * 60 * 60_000);
+      owner = await reauth(ctx, "owner1", owner);
+      cashier = await reauth(ctx, "cashier1", cashier);
+
+      const startNext = await startDay(ctx, owner, { requestKey: "start-next-merch" });
+      expect(startNext.status).toBe(201);
+
+      const priorPrep = await prepareCheckout(ctx, cashier, {
+        items: [
+          { kind: "STANDARD", waterType: "PURIFIED", quantity: 1 },
+          { kind: "MERCHANDISE", productId: faucetId, quantity: 1 },
+        ],
+      });
+      expect(priorPrep.status).toBe(201);
+      const priorRef = priorPrep.body.checkout.reference as string;
+      const priorBegin = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(priorRef)}/begin-payment`)
+        .set("Cookie", cashier.cookie)
+        .set("X-CSRF-Token", cashier.csrfToken)
+        .send({});
+      expect(priorBegin.status).toBe(200);
+
+      ctx.clock.advance(24 * 60 * 60_000);
+      owner = await reauth(ctx, "owner1", owner);
+
+      const priorLookup = await request(ctx.app)
+        .get(`/api/pos/checkouts/${encodeURIComponent(priorRef)}`)
+        .set("Cookie", owner.cookie);
+      expect(priorLookup.status).toBe(200);
+      expect(priorLookup.body.recoveryState).toBe("REVIEW_REQUIRED");
+      expect(priorLookup.body.canSettlePriorDay).toBe(false);
+
+      const settleMixed = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(priorRef)}/settle`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ paymentKeptConfirmed: true, itemsHandedOverConfirmed: true });
+      expect(settleMixed.status).toBe(409);
+      expect(settleMixed.body.error.code).toBe("CHECKOUT_NOT_SETTLABLE");
+    });
+
+    it("publishes Round/Slim container packages sharing one shape balance, enforces shared stock gates, exposes custom sections, and keeps started checkout recovery safe after archive (DEC-073, DEC-074)", async () => {
+      // Publish Round container (Slim remains hidden initially)
+      const pubRound = await request(ctx.app)
+        .patch("/api/inventory/containers/ROUND")
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ showInPos: true });
+      expect(pubRound.status).toBe(200);
+
+      const catBeforeStock = await request(ctx.app).get("/api/pos/catalog").set("Cookie", cashier.cookie);
+      expect(catBeforeStock.status).toBe(200);
+      expect(catBeforeStock.body.containerPackages.map((p: any) => p.packageCode)).toEqual([
+        "ROUND_EMPTY",
+        "ROUND_PURIFIED",
+        "ROUND_ALKALINE",
+      ]);
+      expect(catBeforeStock.body.containerPackages[0]).toMatchObject({
+        packageCode: "ROUND_EMPTY",
+        unitPriceCentavos: 17500,
+        unitVolumeLiters: 0,
+        stockStatus: "NOT_SET",
+      });
+
+      await startDay(ctx, owner, { requestKey: "containers-pos-day" });
+
+      // Not Set Round and hidden Slim are both blocked
+      const roundUnsetPrep = await prepareCheckout(ctx, cashier, {
+        items: [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_EMPTY",
+            includedGripo: "PUSH_TYPE",
+            quantity: 1,
+          },
+        ],
+      });
+      expect(roundUnsetPrep.status).toBe(409);
+      expect(roundUnsetPrep.body.error.code).toBe("INSUFFICIENT_STOCK");
+
+      const slimHiddenPrep = await prepareCheckout(ctx, cashier, {
+        items: [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "SLIM_EMPTY",
+            includedGripo: "TWIST_TYPE",
+            quantity: 1,
+          },
+        ],
+      });
+      expect(slimHiddenPrep.status).toBe(400);
+      expect(slimHiddenPrep.body.error.code).toBe("PRODUCT_UNAVAILABLE");
+
+      // Record opening stock: Round = 5, Slim = 4; publish Slim (explicit check of ₱200 empty Slim)
+      expect((await setOpeningStock("ROUND", 5)).status).toBe(201);
+      expect((await setOpeningStock("SLIM", 4)).status).toBe(201);
+      expect(
+        (
+          await request(ctx.app)
+            .patch("/api/inventory/containers/SLIM")
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({ showInPos: true })
+        ).status,
+      ).toBe(200);
+
+      const catPublished = await request(ctx.app).get("/api/pos/catalog").set("Cookie", cashier.cookie);
+      expect(catPublished.body.containerPackages).toHaveLength(6);
+      expect(
+        catPublished.body.containerPackages.find((p: any) => p.packageCode === "SLIM_EMPTY"),
+      ).toMatchObject({
+        unitPriceCentavos: 20000,
+        unitVolumeMl: 0,
+        availableQuantity: 4,
+      });
+
+      // Mixed options exceeding Round's 5 balance (3 Empty + 3 Purified = 6) are blocked for both roles
+      for (const actor of [cashier, owner]) {
+        const overMixed = await prepareCheckout(ctx, actor, {
+          items: [
+            {
+              kind: "CONTAINER_PACKAGE",
+              packageCode: "ROUND_EMPTY",
+              includedGripo: "PUSH_TYPE",
+              quantity: 3,
+            },
+            {
+              kind: "CONTAINER_PACKAGE",
+              packageCode: "ROUND_PURIFIED",
+              includedGripo: "TWIST_TYPE",
+              quantity: 3,
+            },
+          ],
+        });
+        expect(overMixed.status).toBe(409);
+        expect(overMixed.body.error.code).toBe("INSUFFICIENT_STOCK");
+      }
+
+      // Valid mixed Round sale: 1 Empty Round (₱175) + 1 Purified Round (₱200, 25 L) = ₱375, 25 L, deducts 2 Round (5 -> 3), Slim stays 4
+      const mixedRoundPrep = await prepareCheckout(ctx, cashier, {
+        prepareKey: "mixed-round-1",
+        items: [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_EMPTY",
+            includedGripo: "PUSH_TYPE",
+            quantity: 1,
+          },
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_PURIFIED",
+            includedGripo: "TWIST_TYPE",
+            quantity: 1,
+          },
+        ],
+      });
+      expect(mixedRoundPrep.status).toBe(201);
+      const mixedRef = mixedRoundPrep.body.checkout.reference as string;
+      const mixedConfirm = await confirmCheckout(ctx.app, cashier, mixedRef, {
+        cashReceivedCentavos: 50000,
+      });
+      expect(mixedConfirm.status).toBe(201);
+      expect(mixedConfirm.body.sale).toMatchObject({
+        totalCentavos: 37500,
+        changeCentavos: 12500,
+        totalContainers: 0,
+        totalVolumeMl: 25000,
+        totalVolumeLiters: 25,
+      });
+
+      const invAfterRound = await request(ctx.app).get("/api/inventory/items").set("Cookie", owner.cookie);
+      const roundRow = invAfterRound.body.items.find((i: any) => i.shape === "ROUND");
+      const slimRow = invAfterRound.body.items.find((i: any) => i.shape === "SLIM");
+      expect(roundRow.currentQuantity).toBe(3);
+      expect(slimRow.currentQuantity).toBe(4);
+
+      // Customer-owned refill leaves Round and Slim balances unchanged
+      const refillPrep = await prepareCheckout(ctx, cashier, {
+        items: [{ kind: "STANDARD", waterType: "ALKALINE", quantity: 2 }],
+      });
+      expect(
+        (
+          await confirmCheckout(ctx.app, cashier, refillPrep.body.checkout.reference, {
+            cashReceivedCentavos: 10000,
+          })
+        ).status,
+      ).toBe(201);
+
+      const invAfterRefill = await request(ctx.app).get("/api/inventory/items").set("Cookie", owner.cookie);
+      expect(invAfterRefill.body.items.find((i: any) => i.shape === "ROUND").currentQuantity).toBe(3);
+      expect(invAfterRefill.body.items.find((i: any) => i.shape === "SLIM").currentQuantity).toBe(4);
+
+      // Custom section + edit + archive with in-progress checkout recovery
+      const secRes = await request(ctx.app)
+        .post("/api/inventory/pos-sections")
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ name: "Cleaning Supplies" });
+      expect(secRes.status).toBe(201);
+      const customCode = secRes.body.section.code as string;
+
+      const brushRes = await createProduct({
+        name: "Gallon Brush",
+        unit: "pcs",
+        unitConfirmed: true,
+        unitPriceCentavos: 6500,
+        showInPos: true,
+        posSection: customCode,
+      });
+      const brushId = brushRes.body.item.id as string;
+      await setOpeningStock(brushId, 6);
+
+      const catCustom = await request(ctx.app).get("/api/pos/catalog").set("Cookie", cashier.cookie);
+      expect(catCustom.body.posSections.some((s: any) => s.code === customCode && s.name === "Cleaning Supplies")).toBe(true);
+      expect(catCustom.body.merchandise.find((m: any) => m.id === brushId)).toMatchObject({
+        posSection: customCode,
+        unitPriceCentavos: 6500,
+      });
+
+      // Start payment on Gallon Brush, then Owner archives Gallon Brush before confirmation
+      const brushPrep = await prepareCheckout(ctx, cashier, {
+        prepareKey: "brush-pending-archive",
+        items: [{ kind: "MERCHANDISE", productId: brushId, quantity: 2 }],
+      });
+      expect(brushPrep.status).toBe(201);
+      const brushRef = brushPrep.body.checkout.reference as string;
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/checkouts/${encodeURIComponent(brushRef)}/begin-payment`)
+            .set("Cookie", cashier.cookie)
+            .set("X-CSRF-Token", cashier.csrfToken)
+            .send({})
+        ).status,
+      ).toBe(200);
+
+      const archiveBrush = await request(ctx.app)
+        .post(`/api/inventory/products/${encodeURIComponent(brushId)}/archive`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({});
+      expect(archiveBrush.status).toBe(200);
+
+      // New checkout for archived product is rejected, while the already-started PAYMENT_PENDING checkout completes safely
+      const newArchivedPrep = await prepareCheckout(ctx, cashier, {
+        items: [{ kind: "MERCHANDISE", productId: brushId, quantity: 1 }],
+      });
+      expect(newArchivedPrep.status).toBe(400);
+      expect(newArchivedPrep.body.error.code).toBe("PRODUCT_UNAVAILABLE");
+
+      const confirmArchivedPending = await confirmCheckout(ctx.app, cashier, brushRef, {
+        cashReceivedCentavos: 20000,
+      });
+      expect(confirmArchivedPending.status).toBe(201);
+      expect(confirmArchivedPending.body.sale.items[0].displayLabel).toBe("Gallon Brush");
+
+      // Preserved balance reflects 6 - 2 = 4 in includeArchived query
+      const archivedLookup = await request(ctx.app)
+        .get("/api/inventory/items?includeArchived=true")
+        .set("Cookie", owner.cookie);
+      expect(archivedLookup.body.items.find((i: any) => i.id === brushId).currentQuantity).toBe(4);
+    });
+
+    it("protects active PAYMENT_PENDING reservations from conflicting stock corrections in both orderings (Finding 2)", async () => {
+      const faucetRes = await createProduct({
+        name: "Protected Faucet",
+        unit: "pcs",
+        unitConfirmed: true,
+        unitPriceCentavos: 4000,
+        showInPos: true,
+        posSection: "CHANGE_OF_GRIPO",
+      });
+      const faucetId = faucetRes.body.item.id as string;
+      const open1 = await setOpeningStock(faucetId, 1);
+      expect(open1.status).toBe(201);
+      const rev1 = open1.body.item.stockRevision as number;
+
+      await startDay(ctx, owner, { requestKey: "finding2-day" });
+
+      // Ordering A: Cashier reserves the 1 unit in begin-payment -> Owner reconciliation 1 -> 0 is blocked
+      const prepA = await prepareCheckout(ctx, cashier, {
+        prepareKey: "f2-order-a",
+        items: [{ kind: "MERCHANDISE", productId: faucetId, quantity: 1 }],
+      });
+      const refA = prepA.body.checkout.reference as string;
+      const beginA = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(refA)}/begin-payment`)
+        .set("Cookie", cashier.cookie)
+        .set("X-CSRF-Token", cashier.csrfToken)
+        .send({});
+      expect(beginA.status).toBe(200);
+
+      const blockedRec = await request(ctx.app)
+        .post(`/api/inventory/items/${encodeURIComponent(faucetId)}/reconciliations`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          physicalCount: 0,
+          reason: "Conflicting count",
+          expectedRevision: rev1,
+          expectedCurrentQuantity: 1,
+        });
+      expect(blockedRec.status).toBe(409);
+      expect(blockedRec.body.error.code).toBe("ACTIVE_PAYMENT_COMMITMENT");
+
+      // Cashier can still confirm the ₱40 sale and deduct 1 -> 0 cleanly
+      const confirmA = await confirmCheckout(ctx.app, cashier, refA, {
+        cashReceivedCentavos: 5000,
+      });
+      expect(confirmA.status).toBe(201);
+
+      // Re-stock to 5 pcs and verify non-conflicting reconciliation (5 -> 2 with 1 reserved succeeds)
+      const invMid = await request(ctx.app).get("/api/inventory/items").set("Cookie", owner.cookie);
+      const itemMid = invMid.body.items.find((i: any) => i.id === faucetId);
+      const recUp = await request(ctx.app)
+        .post(`/api/inventory/items/${encodeURIComponent(faucetId)}/reconciliations`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          physicalCount: 5,
+          reason: "Verified restock shelf count",
+          expectedRevision: itemMid.stockRevision,
+          expectedCurrentQuantity: 0,
+        });
+      expect(recUp.status).toBe(201);
+
+      const prepB = await prepareCheckout(ctx, cashier, {
+        prepareKey: "f2-order-b",
+        items: [{ kind: "MERCHANDISE", productId: faucetId, quantity: 1 }],
+      });
+      const refB = prepB.body.checkout.reference as string;
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/checkouts/${encodeURIComponent(refB)}/begin-payment`)
+            .set("Cookie", cashier.cookie)
+            .set("X-CSRF-Token", cashier.csrfToken)
+            .send({})
+        ).status,
+      ).toBe(200);
+
+      // With 1 unit reserved, reconciling 5 -> 2 leaves enough for the active reservation (2 >= 1)
+      const recNonConflicting = await request(ctx.app)
+        .post(`/api/inventory/items/${encodeURIComponent(faucetId)}/reconciliations`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          physicalCount: 2,
+          reason: "Shelf count still covers active payment",
+          expectedRevision: recUp.body.item.stockRevision,
+          expectedCurrentQuantity: 5,
+        });
+      expect(recNonConflicting.status).toBe(201);
+
+      const confirmB = await confirmCheckout(ctx.app, cashier, refB, {
+        cashReceivedCentavos: 5000,
+      });
+      expect(confirmB.status).toBe(201);
+
+      // Ordering B: Draft prepared when 1 unit available -> Owner reconciles 1 -> 0 BEFORE begin-payment -> begin-payment blocked before cash is taken
+      const draftBeforeRec = await prepareCheckout(ctx, cashier, {
+        prepareKey: "f2-order-c",
+        items: [{ kind: "MERCHANDISE", productId: faucetId, quantity: 1 }],
+      });
+      const refC = draftBeforeRec.body.checkout.reference as string;
+
+      const invBeforeC = await request(ctx.app).get("/api/inventory/items").set("Cookie", owner.cookie);
+      const itemBeforeC = invBeforeC.body.items.find((i: any) => i.id === faucetId);
+      expect(itemBeforeC.currentQuantity).toBe(1);
+
+      const recToZero = await request(ctx.app)
+        .post(`/api/inventory/items/${encodeURIComponent(faucetId)}/reconciliations`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          physicalCount: 0,
+          reason: "Removed damaged last unit before payment",
+          expectedRevision: itemBeforeC.stockRevision,
+          expectedCurrentQuantity: 1,
+        });
+      expect(recToZero.status).toBe(201);
+
+      const beginCAfterRec = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(refC)}/begin-payment`)
+        .set("Cookie", cashier.cookie)
+        .set("X-CSRF-Token", cashier.csrfToken)
+        .send({});
+      expect(beginCAfterRec.status).toBe(409);
+      expect(beginCAfterRec.body.error.code).toBe("INSUFFICIENT_STOCK");
+    });
+
+    it("blocks unpaid drafts from entering payment or confirming after archival while keeping started payments completable (Finding 3)", async () => {
+      const faucetRes = await createProduct({
+        name: "Archive Guard Faucet",
+        unit: "pcs",
+        unitConfirmed: true,
+        unitPriceCentavos: 4000,
+        showInPos: true,
+        posSection: "CHANGE_OF_GRIPO",
+      });
+      const faucetId = faucetRes.body.item.id as string;
+      await setOpeningStock(faucetId, 5);
+
+      await startDay(ctx, owner, { requestKey: "finding3-day" });
+
+      // Draft 1 & Draft 2 stay in DRAFT; Checkout 3 enters PAYMENT_PENDING before archive
+      const draftForBegin = await prepareCheckout(ctx, cashier, {
+        prepareKey: "f3-draft-begin",
+        items: [{ kind: "MERCHANDISE", productId: faucetId, quantity: 1 }],
+      });
+      const refDraftBegin = draftForBegin.body.checkout.reference as string;
+
+      const draftDirectConfirm = await prepareCheckout(ctx, cashier, {
+        prepareKey: "f3-draft-direct",
+        items: [{ kind: "MERCHANDISE", productId: faucetId, quantity: 1 }],
+      });
+      const refDraftDirect = draftDirectConfirm.body.checkout.reference as string;
+
+      const startedBeforeArchive = await prepareCheckout(ctx, cashier, {
+        prepareKey: "f3-started",
+        items: [{ kind: "MERCHANDISE", productId: faucetId, quantity: 1 }],
+      });
+      const refStarted = startedBeforeArchive.body.checkout.reference as string;
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/checkouts/${encodeURIComponent(refStarted)}/begin-payment`)
+            .set("Cookie", cashier.cookie)
+            .set("X-CSRF-Token", cashier.csrfToken)
+            .send({})
+        ).status,
+      ).toBe(200);
+
+      // Owner archives the product
+      const arch = await request(ctx.app)
+        .post(`/api/inventory/products/${encodeURIComponent(faucetId)}/archive`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({});
+      expect(arch.status).toBe(200);
+
+      // Both unpaid drafts are blocked at begin-payment and direct confirm
+      const beginBlocked = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(refDraftBegin)}/begin-payment`)
+        .set("Cookie", cashier.cookie)
+        .set("X-CSRF-Token", cashier.csrfToken)
+        .send({});
+      expect(beginBlocked.status).toBe(409);
+      expect(beginBlocked.body.error.code).toBe("PRODUCT_UNAVAILABLE");
+
+      const directBlocked = await confirmCheckout(ctx.app, cashier, refDraftDirect, {
+        cashReceivedCentavos: 5000,
+      });
+      expect(directBlocked.status).toBe(409);
+      expect(directBlocked.body.error.code).toBe("PRODUCT_UNAVAILABLE");
+
+      // Already-started PAYMENT_PENDING checkout completes safely
+      const startedConfirm = await confirmCheckout(ctx.app, cashier, refStarted, {
+        cashReceivedCentavos: 5000,
+      });
+      expect(startedConfirm.status).toBe(201);
+      expect(startedConfirm.body.sale.totalCentavos).toBe(4000);
+    });
+
+    it("requires and saves customer Push-Type or Twist-Type gripo choices per container line at the same package price (Finding 4, POS-012)", async () => {
+      await request(ctx.app)
+        .patch("/api/inventory/containers/ROUND")
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ showInPos: true });
+      await setOpeningStock("ROUND", 5);
+
+      await startDay(ctx, owner, { requestKey: "finding4-day" });
+
+      // Missing includedGripo is rejected
+      const missingGripo = await prepareCheckout(ctx, cashier, {
+        items: [{ kind: "CONTAINER_PACKAGE", packageCode: "ROUND_EMPTY", quantity: 1 }],
+      });
+      expect(missingGripo.status).toBe(400);
+      expect(missingGripo.body.error.code).toBe("VALIDATION_FAILED");
+
+      // Mixed choices on the same package save as separate lines at ₱175 each with no extra charge
+      const mixedGripoPrep = await prepareCheckout(ctx, cashier, {
+        prepareKey: "f4-mixed-gripo",
+        items: [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_EMPTY",
+            includedGripo: "PUSH_TYPE",
+            quantity: 1,
+          },
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_EMPTY",
+            includedGripo: "TWIST_TYPE",
+            quantity: 1,
+          },
+        ],
+      });
+      expect(mixedGripoPrep.status).toBe(201);
+      expect(mixedGripoPrep.body.checkout.totalCentavos).toBe(35000);
+
+      const ref = mixedGripoPrep.body.checkout.reference as string;
+      const confirmed = await confirmCheckout(ctx.app, cashier, ref, {
+        cashReceivedCentavos: 40000,
+      });
+      expect(confirmed.status).toBe(201);
+      expect(confirmed.body.sale.items).toEqual([
+        expect.objectContaining({
+          kind: "CONTAINER_PACKAGE",
+          catalogCode: "ROUND_EMPTY",
+          includedGripo: "PUSH_TYPE",
+          displayLabel: "Empty Round Container · Push-Type gripo",
+          unitPriceCentavos: 17500,
+          quantity: 1,
+          lineTotalCentavos: 17500,
+        }),
+        expect.objectContaining({
+          kind: "CONTAINER_PACKAGE",
+          catalogCode: "ROUND_EMPTY",
+          includedGripo: "TWIST_TYPE",
+          displayLabel: "Empty Round Container · Twist-Type gripo",
+          unitPriceCentavos: 17500,
+          quantity: 1,
+          lineTotalCentavos: 17500,
+        }),
+      ]);
+
+      const fetched = await request(ctx.app)
+        .get(`/api/pos/sales/${encodeURIComponent(ref)}`)
+        .set("Cookie", cashier.cookie);
+      expect(fetched.status).toBe(200);
+      expect(fetched.body.sale.items.map((i: any) => i.includedGripo)).toEqual([
+        "PUSH_TYPE",
+        "TWIST_TYPE",
+      ]);
+
+      const invAfter = await request(ctx.app).get("/api/inventory/items").set("Cookie", owner.cookie);
+      expect(invAfter.body.items.find((i: any) => i.shape === "ROUND").currentQuantity).toBe(3);
+    });
+
+    it("upgrades databases from either revision of 0009 via migration 0010 without guessing historical faucet choices (Finding 5)", async () => {
+      // Path A: Database that already applied the original 0009 (before included_gripo existed)
+      const upgradeDb = await createPgliteDatabase();
+      try {
+        await upgradeDb.exec(`
+          CREATE TABLE IF NOT EXISTS schema_migrations (
+            name text PRIMARY KEY,
+            applied_at timestamptz NOT NULL DEFAULT now()
+          );
+        `);
+        const pre0009Files = (await readdir(MIGRATIONS_DIR))
+          .filter((f) => /^000[1-8]_.+\.sql$/.test(f))
+          .sort();
+        for (const file of pre0009Files) {
+          const sql = await readFile(path.join(MIGRATIONS_DIR, file), "utf8");
+          await upgradeDb.exec(sql);
+          await upgradeDb.query("INSERT INTO schema_migrations (name) VALUES ($1)", [file]);
+        }
+
+        // Apply exact original 0009 schema (without included_gripo column on pos_sale_items)
+        const current0009 = await readFile(
+          path.join(MIGRATIONS_DIR, "0009_inventory_management_and_containers.sql"),
+          "utf8",
+        );
+        const original0009 = current0009
+          .replace(
+            /ALTER TABLE pos_sale_items\s+ADD COLUMN included_gripo text[\s\S]*?TWIST_TYPE'\)\);/m,
+            "",
+          )
+          .replace(/\s+AND included_gripo IS NULL/g, "")
+          .replace(/\s+AND included_gripo IN \('PUSH_TYPE', 'TWIST_TYPE'\)/g, "");
+        expect(original0009).not.toContain("included_gripo");
+        await upgradeDb.exec(original0009);
+        await upgradeDb.query("INSERT INTO schema_migrations (name) VALUES ($1)", [
+          "0009_inventory_management_and_containers.sql",
+        ]);
+
+        const clock = new ManualClock("2026-11-22T10:00:00+08:00");
+        const upgradeApp = createApp({ db: upgradeDb, clock });
+        const upCtx: TestContext = {
+          db: upgradeDb,
+          clock,
+          app: upgradeApp,
+          close: () => upgradeDb.close(),
+        };
+        const upOwner = await activatedAccount(upCtx, "upowner", "OWNER");
+        const upCashier = await activatedAccount(upCtx, "upcashier", "CASHIER");
+
+        const { rows: userRows } = await upgradeDb.query<{ id: string; username: string }>(
+          `SELECT id, username FROM app_users WHERE username IN ('upowner', 'upcashier')`,
+        );
+        const ownerId = userRows.find((r) => r.username === "upowner")!.id;
+        const cashierId = userRows.find((r) => r.username === "upcashier")!.id;
+
+        const { rows: roundRows } = await upgradeDb.query<{ id: string }>(
+          `UPDATE inventory_items
+              SET show_in_pos = true,
+                  pos_section = 'CONTAINERS',
+                  current_quantity = 5,
+                  stock_revision = 1
+            WHERE category = 'CONTAINER' AND container_shape = 'ROUND'
+            RETURNING id`,
+        );
+        const roundId = roundRows[0]!.id;
+        await upgradeDb.query(
+          `INSERT INTO inventory_opening_counts (item_id, quantity, unit, recorded_by_user_id, recorded_at)
+           VALUES ($1, 5, 'containers', $2, '2026-11-22T09:00:00+08:00')`,
+          [roundId, ownerId],
+        );
+
+        const { rows: dayRows } = await upgradeDb.query<{ id: string }>(
+          `INSERT INTO pos_business_days (business_date, started_by_user_id, started_at, next_reference_seq)
+           VALUES ('2026-11-22', $1, '2026-11-22T09:00:00+08:00', 2)
+           RETURNING id`,
+          [ownerId],
+        );
+        const dayId = dayRows[0]!.id;
+
+        // Seed pre-0010 historical standard refill + historical container sale (no included_gripo column yet)
+        const stdRef = "HD-1122-001";
+        const pkgRef = "HD-1122-002";
+        const { rows: c1 } = await upgradeDb.query<{ id: string }>(
+          `INSERT INTO pos_checkouts (
+             reference, business_day_id, business_date, created_by_user_id,
+             status, quote_snapshot, quote_hash, total_centavos, total_containers, total_volume_ml,
+             cash_received_centavos, change_centavos, payment_recorded_at, created_at, updated_at
+           )
+           VALUES (
+             $1, $2, '2026-11-22', $3, 'SAVED', '[]'::jsonb, 'h1', 2500, 1, 25000,
+             5000, 2500, '2026-11-22T09:10:00+08:00', '2026-11-22T09:09:00+08:00', '2026-11-22T09:10:00+08:00'
+           )
+           RETURNING id`,
+          [stdRef, dayId, cashierId],
+        );
+        const { rows: s1 } = await upgradeDb.query<{ id: string }>(
+          `INSERT INTO pos_sales (
+             reference, checkout_id, business_day_id, business_date, status,
+             total_centavos, cash_received_centavos, change_centavos,
+             total_containers, total_volume_ml, created_by_user_id, created_at
+           )
+           VALUES ($1, $2, $3, '2026-11-22', 'ACTIVE', 2500, 5000, 2500, 1, 25000, $4, '2026-11-22T09:10:00+08:00')
+           RETURNING id`,
+          [stdRef, c1[0]!.id, dayId, cashierId],
+        );
+        await upgradeDb.query(
+          `INSERT INTO pos_sale_items (
+             sale_id, line_index, item_kind, catalog_code, water_type,
+             inventory_item_id, stock_unit, pos_section, display_label,
+             unit_volume_ml, unit_price_centavos, quantity, line_total_centavos, line_volume_ml
+           )
+           VALUES ($1, 0, 'STANDARD', 'PURIFIED_25L', 'PURIFIED', NULL, NULL, NULL, 'Purified refill · 25 L', 25000, 2500, 1, 2500, 25000)`,
+          [s1[0]!.id],
+        );
+
+        const { rows: c2 } = await upgradeDb.query<{ id: string }>(
+          `INSERT INTO pos_checkouts (
+             reference, business_day_id, business_date, created_by_user_id,
+             status, quote_snapshot, quote_hash, total_centavos, total_containers, total_volume_ml,
+             cash_received_centavos, change_centavos, payment_recorded_at, created_at, updated_at
+           )
+           VALUES (
+             $1, $2, '2026-11-22', $3, 'SAVED', '[]'::jsonb, 'h2', 17500, 0, 0,
+             20000, 2500, '2026-11-22T09:20:00+08:00', '2026-11-22T09:19:00+08:00', '2026-11-22T09:20:00+08:00'
+           )
+           RETURNING id`,
+          [pkgRef, dayId, cashierId],
+        );
+        const { rows: s2 } = await upgradeDb.query<{ id: string }>(
+          `INSERT INTO pos_sales (
+             reference, checkout_id, business_day_id, business_date, status,
+             total_centavos, cash_received_centavos, change_centavos,
+             total_containers, total_volume_ml, created_by_user_id, created_at
+           )
+           VALUES ($1, $2, $3, '2026-11-22', 'ACTIVE', 17500, 20000, 2500, 0, 0, $4, '2026-11-22T09:20:00+08:00')
+           RETURNING id`,
+          [pkgRef, c2[0]!.id, dayId, cashierId],
+        );
+        await upgradeDb.query(
+          `INSERT INTO pos_sale_items (
+             sale_id, line_index, item_kind, catalog_code, water_type,
+             inventory_item_id, stock_unit, pos_section, display_label,
+             unit_volume_ml, unit_price_centavos, quantity, line_total_centavos, line_volume_ml
+           )
+           VALUES ($1, 0, 'CONTAINER_PACKAGE', 'ROUND_EMPTY', NULL, $2, 'containers', 'CONTAINERS', 'Empty Round Container', 0, 17500, 1, 17500, 0)`,
+          [s2[0]!.id, roundId],
+        );
+
+        // Run forward migrations 0010 and 0011 on the upgraded DB
+        const newlyApplied = await runMigrations(upgradeDb);
+        expect(newlyApplied).toEqual([
+          "0010_pos_container_included_gripo.sql",
+          "0011_pos_legacy_pending_container_gripo.sql",
+          "0012_pos_prior_day_merchandise_settlement.sql",
+        ]);
+
+        const cashierAfter = await signIn(upgradeApp, "upcashier", upCashier.password);
+        expect(upOwner.password.length).toBeGreaterThan(0);
+
+        // Historical container sale stays readable with includedGripo = null (no guessed faucet choice)
+        const historyRes = await request(upgradeApp)
+          .get("/api/pos/sales?date=2026-11-22")
+          .set("Cookie", cashierAfter.cookie);
+        expect(historyRes.status).toBe(200);
+        const oldPkgSale = historyRes.body.sales.find((s: any) => s.reference === pkgRef);
+        expect(oldPkgSale.items[0]).toMatchObject({
+          kind: "CONTAINER_PACKAGE",
+          catalogCode: "ROUND_EMPTY",
+          displayLabel: "Empty Round Container",
+          includedGripo: null,
+        });
+
+        // Standard Purified refill prepares and confirms cleanly after upgrade
+        const refillPrep = await request(upgradeApp)
+          .post("/api/pos/checkouts")
+          .set("Cookie", cashierAfter.cookie)
+          .set("X-CSRF-Token", cashierAfter.csrfToken)
+          .send({
+            prepareKey: "up-refill-1",
+            items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 1 }],
+          });
+        expect(refillPrep.status).toBe(201);
+        const refillRef = refillPrep.body.checkout.reference as string;
+        const refillBegin = await request(upgradeApp)
+          .post(`/api/pos/checkouts/${encodeURIComponent(refillRef)}/begin-payment`)
+          .set("Cookie", cashierAfter.cookie)
+          .set("X-CSRF-Token", cashierAfter.csrfToken)
+          .send({});
+        expect(refillBegin.status).toBe(200);
+        const refillConfirm = await confirmCheckout(upgradeApp, cashierAfter, refillRef, {
+          cashReceivedCentavos: 5000,
+        });
+        expect(refillConfirm.status).toBe(201);
+
+        // New container sale saves includedGripo = TWIST_TYPE and returns it in history
+        const newPkgPrep = await request(upgradeApp)
+          .post("/api/pos/checkouts")
+          .set("Cookie", cashierAfter.cookie)
+          .set("X-CSRF-Token", cashierAfter.csrfToken)
+          .send({
+            prepareKey: "up-pkg-1",
+            items: [
+              {
+                kind: "CONTAINER_PACKAGE",
+                packageCode: "ROUND_EMPTY",
+                includedGripo: "TWIST_TYPE",
+                quantity: 1,
+              },
+            ],
+          });
+        expect(newPkgPrep.status).toBe(201);
+        const newPkgRef = newPkgPrep.body.checkout.reference as string;
+        const newPkgConfirm = await confirmCheckout(upgradeApp, cashierAfter, newPkgRef, {
+          cashReceivedCentavos: 20000,
+        });
+        expect(newPkgConfirm.status).toBe(201);
+        expect(newPkgConfirm.body.sale.items[0]).toMatchObject({
+          kind: "CONTAINER_PACKAGE",
+          catalogCode: "ROUND_EMPTY",
+          includedGripo: "TWIST_TYPE",
+          displayLabel: "Empty Round Container · Twist-Type gripo",
+        });
+
+        // New container package checkout without includedGripo is rejected by Express validation
+        const missingGripoPrepare = await request(upgradeApp)
+          .post("/api/pos/checkouts")
+          .set("Cookie", cashierAfter.cookie)
+          .set("X-CSRF-Token", cashierAfter.csrfToken)
+          .send({
+            items: [{ kind: "CONTAINER_PACKAGE", packageCode: "ROUND_EMPTY", quantity: 1 }],
+          });
+        expect(missingGripoPrepare.status).toBe(400);
+        expect(missingGripoPrepare.body.error.code).toBe("VALIDATION_FAILED");
+      } finally {
+        await upgradeDb.close();
+      }
+
+      // Path B: Database that already applied the revised 0009 upgrades cleanly through 0010 and 0011 too
+      const revisedDb = await createPgliteDatabase();
+      try {
+        await revisedDb.exec(`
+          CREATE TABLE IF NOT EXISTS schema_migrations (
+            name text PRIMARY KEY,
+            applied_at timestamptz NOT NULL DEFAULT now()
+          );
+        `);
+        const pre0010Files = (await readdir(MIGRATIONS_DIR))
+          .filter((f) => /^000[1-9]_.+\.sql$/.test(f))
+          .sort();
+        for (const file of pre0010Files) {
+          const sql = await readFile(path.join(MIGRATIONS_DIR, file), "utf8");
+          await revisedDb.exec(sql);
+          await revisedDb.query("INSERT INTO schema_migrations (name) VALUES ($1)", [file]);
+        }
+        const applied = await runMigrations(revisedDb);
+        expect(applied).toEqual([
+          "0010_pos_container_included_gripo.sql",
+          "0011_pos_legacy_pending_container_gripo.sql",
+          "0012_pos_prior_day_merchandise_settlement.sql",
+        ]);
+      } finally {
+        await revisedDb.close();
+      }
+    });
+
+    it("Finding 6: pre-0010 same-day PAYMENT_PENDING container checkout finishes after 0010/0011 without guessing gripo and unblocks End Day", async () => {
+      const upgradeDb = await createPgliteDatabase();
+      try {
+        await upgradeDb.exec(`
+          CREATE TABLE IF NOT EXISTS schema_migrations (
+            name text PRIMARY KEY,
+            applied_at timestamptz NOT NULL DEFAULT now()
+          );
+        `);
+        const pre0009Files = (await readdir(MIGRATIONS_DIR))
+          .filter((f) => /^000[1-8]_.+\.sql$/.test(f))
+          .sort();
+        for (const file of pre0009Files) {
+          const sql = await readFile(path.join(MIGRATIONS_DIR, file), "utf8");
+          await upgradeDb.exec(sql);
+          await upgradeDb.query("INSERT INTO schema_migrations (name) VALUES ($1)", [file]);
+        }
+
+        const current0009 = await readFile(
+          path.join(MIGRATIONS_DIR, "0009_inventory_management_and_containers.sql"),
+          "utf8",
+        );
+        const original0009 = current0009
+          .replace(
+            /ALTER TABLE pos_sale_items\s+ADD COLUMN included_gripo text[\s\S]*?TWIST_TYPE'\)\);/m,
+            "",
+          )
+          .replace(/\s+AND included_gripo IS NULL/g, "")
+          .replace(/\s+AND included_gripo IN \('PUSH_TYPE', 'TWIST_TYPE'\)/g, "");
+        await upgradeDb.exec(original0009);
+        await upgradeDb.query("INSERT INTO schema_migrations (name) VALUES ($1)", [
+          "0009_inventory_management_and_containers.sql",
+        ]);
+
+        const clock = new ManualClock("2026-11-22T11:00:00+08:00");
+        const upgradeApp = createApp({ db: upgradeDb, clock });
+        const upCtx: TestContext = {
+          db: upgradeDb,
+          clock,
+          app: upgradeApp,
+          close: () => upgradeDb.close(),
+        };
+        const upOwner = await activatedAccount(upCtx, "f6owner", "OWNER");
+        const upCashier = await activatedAccount(upCtx, "f6cashier", "CASHIER");
+
+        const { rows: userRows } = await upgradeDb.query<{ id: string; username: string }>(
+          `SELECT id, username FROM app_users WHERE username IN ('f6owner', 'f6cashier')`,
+        );
+        const ownerId = userRows.find((r) => r.username === "f6owner")!.id;
+        const cashierId = userRows.find((r) => r.username === "f6cashier")!.id;
+
+        const { rows: roundRows } = await upgradeDb.query<{ id: string }>(
+          `UPDATE inventory_items
+              SET show_in_pos = true,
+                  pos_section = 'CONTAINERS',
+                  current_quantity = 5,
+                  stock_revision = 1
+            WHERE category = 'CONTAINER' AND container_shape = 'ROUND'
+            RETURNING id`,
+        );
+        const roundId = roundRows[0]!.id;
+        await upgradeDb.query(
+          `INSERT INTO inventory_opening_counts (item_id, quantity, unit, recorded_by_user_id, recorded_at)
+           VALUES ($1, 5, 'containers', $2, '2026-11-22T09:00:00+08:00')`,
+          [roundId, ownerId],
+        );
+
+        const { rows: dayRows } = await upgradeDb.query<{ id: string }>(
+          `INSERT INTO pos_business_days (business_date, started_by_user_id, started_at, next_reference_seq)
+           VALUES ('2026-11-22', $1, '2026-11-22T09:00:00+08:00', 1)
+           RETURNING id`,
+          [ownerId],
+        );
+        const dayId = dayRows[0]!.id;
+
+        // Seed an already-started same-day PAYMENT_PENDING container checkout from pre-0010 (no includedGripo in quote_snapshot)
+        const pendingRef = "HD-1122-001";
+        const legacyQuoteSnapshot = [
+          {
+            lineIndex: 0,
+            kind: "CONTAINER_PACKAGE",
+            catalogCode: "ROUND_EMPTY",
+            waterType: null,
+            productId: roundId,
+            stockUnit: "containers",
+            posSection: "CONTAINERS",
+            displayLabel: "Empty Round Container",
+            unitVolumeMl: 0,
+            unitVolumeLiters: 0,
+            unitPriceCentavos: 17500,
+            quantity: 1,
+            lineTotalCentavos: 17500,
+            lineVolumeMl: 0,
+            lineVolumeLiters: 0,
+          },
+        ];
+        const { rows: pendingRows } = await upgradeDb.query<{ id: string }>(
+          `INSERT INTO pos_checkouts (
+             reference, business_day_id, business_date, created_by_user_id,
+             status, quote_hash, quote_snapshot, total_centavos, total_containers, total_volume_ml,
+             payment_started_at, created_at, updated_at
+           )
+           VALUES ($1, $2, '2026-11-22', $3, 'PAYMENT_PENDING', 'legacy-pre-0010-hash', $4::jsonb, 17500, 0, 0,
+                   '2026-11-22T10:55:00+08:00', '2026-11-22T10:54:00+08:00', '2026-11-22T10:55:00+08:00')
+           RETURNING id`,
+          [pendingRef, dayId, cashierId, JSON.stringify(legacyQuoteSnapshot)],
+        );
+        await upgradeDb.query(
+          `INSERT INTO pos_checkout_stock_commitments (checkout_id, item_id, quantity, status, created_at)
+           VALUES ($1, $2, 1, 'ACTIVE', '2026-11-22T10:55:00+08:00')`,
+          [pendingRows[0]!.id, roundId],
+        );
+
+        // Upgrade via 0010 + 0011
+        const applied = await runMigrations(upgradeDb);
+        expect(applied).toEqual([
+          "0010_pos_container_included_gripo.sql",
+          "0011_pos_legacy_pending_container_gripo.sql",
+          "0012_pos_prior_day_merchandise_settlement.sql",
+        ]);
+
+        const cashier = await signIn(upgradeApp, "f6cashier", upCashier.password);
+        const owner = await signIn(upgradeApp, "f6owner", upOwner.password);
+
+        // Confirm the legacy PAYMENT_PENDING checkout (sending legacy payload without includedGripo)
+        const confirmRes = await request(upgradeApp)
+          .post(`/api/pos/checkouts/${pendingRef}/confirm`)
+          .set("Cookie", cashier.cookie)
+          .set("X-CSRF-Token", cashier.csrfToken)
+          .send({
+            cashReceivedCentavos: 20000,
+            items: [{ kind: "CONTAINER_PACKAGE", packageCode: "ROUND_EMPTY", quantity: 1 }],
+            expectedTotalCentavos: 17500,
+          });
+        expect(confirmRes.status).toBe(201);
+        expect(confirmRes.body.sale.items[0]).toMatchObject({
+          kind: "CONTAINER_PACKAGE",
+          catalogCode: "ROUND_EMPTY",
+          includedGripo: null,
+          displayLabel: "Empty Round Container",
+        });
+
+        // Duplicate confirm replays idempotently without double-deducting stock
+        const replayRes = await request(upgradeApp)
+          .post(`/api/pos/checkouts/${pendingRef}/confirm`)
+          .set("Cookie", cashier.cookie)
+          .set("X-CSRF-Token", cashier.csrfToken)
+          .send({
+            cashReceivedCentavos: 20000,
+            items: [{ kind: "CONTAINER_PACKAGE", packageCode: "ROUND_EMPTY", quantity: 1 }],
+            expectedTotalCentavos: 17500,
+          });
+        expect(replayRes.status).toBe(200);
+        expect(replayRes.body.replayed).toBe(true);
+
+        // Stock was deducted exactly once (5 -> 4) and commitment was consumed
+        const { rows: stockRows } = await upgradeDb.query<{ current_quantity: number }>(
+          `SELECT current_quantity FROM inventory_items WHERE id = $1`,
+          [roundId],
+        );
+        expect(Number(stockRows[0]!.current_quantity)).toBe(4);
+        const { rows: commitRows } = await upgradeDb.query<{ status: string }>(
+          `SELECT status FROM pos_checkout_stock_commitments WHERE checkout_id = $1`,
+          [pendingRows[0]!.id],
+        );
+        expect(commitRows[0]!.status).toBe("CONSUMED");
+
+        // New container sale still requires includedGripo and saves it when provided
+        const newMissingRes = await request(upgradeApp)
+          .post("/api/pos/checkouts")
+          .set("Cookie", cashier.cookie)
+          .set("X-CSRF-Token", cashier.csrfToken)
+          .send({
+            items: [{ kind: "CONTAINER_PACKAGE", packageCode: "ROUND_EMPTY", quantity: 1 }],
+          });
+        expect(newMissingRes.status).toBe(400);
+        expect(newMissingRes.body.error.code).toBe("VALIDATION_FAILED");
+
+        const newValidRes = await request(upgradeApp)
+          .post("/api/pos/checkouts")
+          .set("Cookie", cashier.cookie)
+          .set("X-CSRF-Token", cashier.csrfToken)
+          .send({
+            items: [
+              {
+                kind: "CONTAINER_PACKAGE",
+                packageCode: "ROUND_EMPTY",
+                includedGripo: "PUSH_TYPE",
+                quantity: 1,
+              },
+            ],
+          });
+        expect(newValidRes.status).toBe(201);
+        const newConfirmRes = await request(upgradeApp)
+          .post(`/api/pos/checkouts/${newValidRes.body.checkout.reference}/confirm`)
+          .set("Cookie", cashier.cookie)
+          .set("X-CSRF-Token", cashier.csrfToken)
+          .send({ cashReceivedCentavos: 20000 });
+        expect(newConfirmRes.status).toBe(201);
+        expect(newConfirmRes.body.sale.items[0].includedGripo).toBe("PUSH_TYPE");
+
+        // End Day succeeds cleanly once the legacy PAYMENT_PENDING checkout is resolved
+        const endDayRes = await request(upgradeApp)
+          .post("/api/pos/day/end")
+          .set("Cookie", owner.cookie)
+          .set("X-CSRF-Token", owner.csrfToken)
+          .send({});
+        expect(endDayRes.status).toBe(200);
+        expect(endDayRes.body.state).toBe("CLOSED");
+      } finally {
+        await upgradeDb.close();
+      }
+    });
+
+    it("Finding 7: blocks pre-0010 unpaid DRAFT container checkouts missing gripo while preserving PAYMENT_PENDING recovery", async () => {
+      const upgradeDb = await createPgliteDatabase();
+      try {
+        await upgradeDb.exec(`
+          CREATE TABLE IF NOT EXISTS schema_migrations (
+            name text PRIMARY KEY,
+            applied_at timestamptz NOT NULL DEFAULT now()
+          );
+        `);
+        const pre0009Files = (await readdir(MIGRATIONS_DIR))
+          .filter((f) => /^000[1-8]_.+\.sql$/.test(f))
+          .sort();
+        for (const file of pre0009Files) {
+          const sql = await readFile(path.join(MIGRATIONS_DIR, file), "utf8");
+          await upgradeDb.exec(sql);
+          await upgradeDb.query("INSERT INTO schema_migrations (name) VALUES ($1)", [file]);
+        }
+
+        const current0009 = await readFile(
+          path.join(MIGRATIONS_DIR, "0009_inventory_management_and_containers.sql"),
+          "utf8",
+        );
+        const original0009 = current0009
+          .replace(
+            /ALTER TABLE pos_sale_items\s+ADD COLUMN included_gripo text[\s\S]*?TWIST_TYPE'\)\);/m,
+            "",
+          )
+          .replace(/\s+AND included_gripo IS NULL/g, "")
+          .replace(/\s+AND included_gripo IN \('PUSH_TYPE', 'TWIST_TYPE'\)/g, "");
+        await upgradeDb.exec(original0009);
+        await upgradeDb.query("INSERT INTO schema_migrations (name) VALUES ($1)", [
+          "0009_inventory_management_and_containers.sql",
+        ]);
+
+        const clock = new ManualClock("2026-11-22T11:30:00+08:00");
+        const upgradeApp = createApp({ db: upgradeDb, clock });
+        const upCtx: TestContext = {
+          db: upgradeDb,
+          clock,
+          app: upgradeApp,
+          close: () => upgradeDb.close(),
+        };
+        const upOwner = await activatedAccount(upCtx, "f7owner", "OWNER");
+        const upCashier = await activatedAccount(upCtx, "f7cashier", "CASHIER");
+
+        const { rows: userRows } = await upgradeDb.query<{ id: string; username: string }>(
+          `SELECT id, username FROM app_users WHERE username IN ('f7owner', 'f7cashier')`,
+        );
+        const ownerId = userRows.find((r) => r.username === "f7owner")!.id;
+        const cashierId = userRows.find((r) => r.username === "f7cashier")!.id;
+
+        const { rows: roundRows } = await upgradeDb.query<{ id: string }>(
+          `UPDATE inventory_items
+              SET show_in_pos = true,
+                  pos_section = 'CONTAINERS',
+                  current_quantity = 5,
+                  stock_revision = 1
+            WHERE category = 'CONTAINER' AND container_shape = 'ROUND'
+            RETURNING id`,
+        );
+        const roundId = roundRows[0]!.id;
+        await upgradeDb.query(
+          `INSERT INTO inventory_opening_counts (item_id, quantity, unit, recorded_by_user_id, recorded_at)
+           VALUES ($1, 5, 'containers', $2, '2026-11-22T09:00:00+08:00')`,
+          [roundId, ownerId],
+        );
+
+        const { rows: dayRows } = await upgradeDb.query<{ id: string }>(
+          `INSERT INTO pos_business_days (business_date, started_by_user_id, started_at, next_reference_seq)
+           VALUES ('2026-11-22', $1, '2026-11-22T09:00:00+08:00', 3)
+           RETURNING id`,
+          [ownerId],
+        );
+        const dayId = dayRows[0]!.id;
+
+        const legacyQuoteSnapshot = [
+          {
+            lineIndex: 0,
+            kind: "CONTAINER_PACKAGE",
+            catalogCode: "ROUND_EMPTY",
+            waterType: null,
+            productId: roundId,
+            stockUnit: "containers",
+            posSection: "CONTAINERS",
+            displayLabel: "Empty Round Container",
+            unitVolumeMl: 0,
+            unitVolumeLiters: 0,
+            unitPriceCentavos: 17500,
+            quantity: 1,
+            lineTotalCentavos: 17500,
+            lineVolumeMl: 0,
+            lineVolumeLiters: 0,
+          },
+        ];
+        const snapshotJson = JSON.stringify(legacyQuoteSnapshot);
+
+        // Two legacy unpaid DRAFT checkouts (no includedGripo) and one legacy PAYMENT_PENDING checkout
+        const draftBeginRef = "HD-1122-001";
+        const draftDirectConfirmRef = "HD-1122-002";
+        const pendingRef = "HD-1122-003";
+
+        const { rows: d1Rows } = await upgradeDb.query<{ id: string }>(
+          `INSERT INTO pos_checkouts (
+             reference, business_day_id, business_date, created_by_user_id,
+             status, quote_hash, quote_snapshot, total_centavos, total_containers, total_volume_ml,
+             created_at, updated_at
+           )
+           VALUES ($1, $2, '2026-11-22', $3, 'DRAFT', 'legacy-draft-1', $4::jsonb, 17500, 0, 0,
+                   '2026-11-22T11:10:00+08:00', '2026-11-22T11:10:00+08:00')
+           RETURNING id`,
+          [draftBeginRef, dayId, cashierId, snapshotJson],
+        );
+        const { rows: d2Rows } = await upgradeDb.query<{ id: string }>(
+          `INSERT INTO pos_checkouts (
+             reference, business_day_id, business_date, created_by_user_id,
+             status, quote_hash, quote_snapshot, total_centavos, total_containers, total_volume_ml,
+             created_at, updated_at
+           )
+           VALUES ($1, $2, '2026-11-22', $3, 'DRAFT', 'legacy-draft-2', $4::jsonb, 17500, 0, 0,
+                   '2026-11-22T11:12:00+08:00', '2026-11-22T11:12:00+08:00')
+           RETURNING id`,
+          [draftDirectConfirmRef, dayId, cashierId, snapshotJson],
+        );
+        const { rows: pendingRows } = await upgradeDb.query<{ id: string }>(
+          `INSERT INTO pos_checkouts (
+             reference, business_day_id, business_date, created_by_user_id,
+             status, quote_hash, quote_snapshot, total_centavos, total_containers, total_volume_ml,
+             payment_started_at, created_at, updated_at
+           )
+           VALUES ($1, $2, '2026-11-22', $3, 'PAYMENT_PENDING', 'legacy-pending-3', $4::jsonb, 17500, 0, 0,
+                   '2026-11-22T11:15:00+08:00', '2026-11-22T11:14:00+08:00', '2026-11-22T11:15:00+08:00')
+           RETURNING id`,
+          [pendingRef, dayId, cashierId, snapshotJson],
+        );
+        await upgradeDb.query(
+          `INSERT INTO pos_checkout_stock_commitments (checkout_id, item_id, quantity, status, created_at)
+           VALUES ($1, $2, 1, 'ACTIVE', '2026-11-22T11:15:00+08:00')`,
+          [pendingRows[0]!.id, roundId],
+        );
+
+        const applied = await runMigrations(upgradeDb);
+        expect(applied).toEqual([
+          "0010_pos_container_included_gripo.sql",
+          "0011_pos_legacy_pending_container_gripo.sql",
+          "0012_pos_prior_day_merchandise_settlement.sql",
+        ]);
+
+        const cashier = await signIn(upgradeApp, "f7cashier", upCashier.password);
+        const owner = await signIn(upgradeApp, "f7owner", upOwner.password);
+
+        // 1. Legacy DRAFT cannot start cash payment without a faucet choice
+        const beginRes = await request(upgradeApp)
+          .post(`/api/pos/checkouts/${draftBeginRef}/begin-payment`)
+          .set("Cookie", cashier.cookie)
+          .set("X-CSRF-Token", cashier.csrfToken)
+          .send({});
+        expect(beginRes.status).toBe(409);
+        expect(beginRes.body.error.code).toBe("GRIPO_CHOICE_REQUIRED");
+
+        const { rows: d1Commit } = await upgradeDb.query<{ count: string }>(
+          `SELECT COUNT(*)::text AS count FROM pos_checkout_stock_commitments WHERE checkout_id = $1`,
+          [d1Rows[0]!.id],
+        );
+        expect(d1Commit[0]!.count).toBe("0");
+
+        // 2. Legacy DRAFT cannot confirm directly either (with or without items)
+        const directConfirmNoItems = await request(upgradeApp)
+          .post(`/api/pos/checkouts/${draftDirectConfirmRef}/confirm`)
+          .set("Cookie", cashier.cookie)
+          .set("X-CSRF-Token", cashier.csrfToken)
+          .send({ cashReceivedCentavos: 20000 });
+        expect(directConfirmNoItems.status).toBe(409);
+        expect(directConfirmNoItems.body.error.code).toBe("GRIPO_CHOICE_REQUIRED");
+
+        const directConfirmWithItems = await request(upgradeApp)
+          .post(`/api/pos/checkouts/${draftDirectConfirmRef}/confirm`)
+          .set("Cookie", cashier.cookie)
+          .set("X-CSRF-Token", cashier.csrfToken)
+          .send({
+            cashReceivedCentavos: 20000,
+            items: [{ kind: "CONTAINER_PACKAGE", packageCode: "ROUND_EMPTY", quantity: 1 }],
+            expectedTotalCentavos: 17500,
+          });
+        expect(directConfirmWithItems.status).toBe(409);
+        expect(directConfirmWithItems.body.error.code).toBe("GRIPO_CHOICE_REQUIRED");
+
+        const { rows: d2Sales } = await upgradeDb.query<{ count: string }>(
+          `SELECT COUNT(*)::text AS count FROM pos_sales WHERE checkout_id = $1`,
+          [d2Rows[0]!.id],
+        );
+        expect(d2Sales[0]!.count).toBe("0");
+
+        // 3. Staff can cancel both unpaid drafts, then prepare & confirm a replacement with TWIST_TYPE
+        for (const ref of [draftBeginRef, draftDirectConfirmRef]) {
+          const cancelRes = await request(upgradeApp)
+            .post(`/api/pos/checkouts/${ref}/cancel`)
+            .set("Cookie", cashier.cookie)
+            .set("X-CSRF-Token", cashier.csrfToken)
+            .send({ reason: "Returned to refill selection" });
+          expect(cancelRes.status).toBe(200);
+          expect(cancelRes.body.checkout.status).toBe("CANCELLED_DRAFT");
+        }
+
+        const freshPrep = await request(upgradeApp)
+          .post("/api/pos/checkouts")
+          .set("Cookie", cashier.cookie)
+          .set("X-CSRF-Token", cashier.csrfToken)
+          .send({
+            items: [
+              {
+                kind: "CONTAINER_PACKAGE",
+                packageCode: "ROUND_EMPTY",
+                includedGripo: "TWIST_TYPE",
+                quantity: 1,
+              },
+            ],
+          });
+        expect(freshPrep.status).toBe(201);
+        const freshConfirm = await request(upgradeApp)
+          .post(`/api/pos/checkouts/${freshPrep.body.checkout.reference}/confirm`)
+          .set("Cookie", cashier.cookie)
+          .set("X-CSRF-Token", cashier.csrfToken)
+          .send({ cashReceivedCentavos: 20000 });
+        expect(freshConfirm.status).toBe(201);
+        expect(freshConfirm.body.sale.items[0].includedGripo).toBe("TWIST_TYPE");
+
+        // 4. Finding 6 preserved: already-started PAYMENT_PENDING checkout still confirms with null gripo
+        const pendingConfirm = await request(upgradeApp)
+          .post(`/api/pos/checkouts/${pendingRef}/confirm`)
+          .set("Cookie", cashier.cookie)
+          .set("X-CSRF-Token", cashier.csrfToken)
+          .send({
+            cashReceivedCentavos: 20000,
+            items: [{ kind: "CONTAINER_PACKAGE", packageCode: "ROUND_EMPTY", quantity: 1 }],
+            expectedTotalCentavos: 17500,
+          });
+        expect(pendingConfirm.status).toBe(201);
+        expect(pendingConfirm.body.sale.items[0].includedGripo).toBeNull();
+
+        const pendingReplay = await request(upgradeApp)
+          .post(`/api/pos/checkouts/${pendingRef}/confirm`)
+          .set("Cookie", cashier.cookie)
+          .set("X-CSRF-Token", cashier.csrfToken)
+          .send({ cashReceivedCentavos: 20000 });
+        expect(pendingReplay.status).toBe(200);
+        expect(pendingReplay.body.replayed).toBe(true);
+
+        // Stock deducted twice total: 1 for fresh TWIST_TYPE sale + 1 for pendingRef recovery = 5 -> 3
+        const { rows: stockRows } = await upgradeDb.query<{ current_quantity: number }>(
+          `SELECT current_quantity FROM inventory_items WHERE id = $1`,
+          [roundId],
+        );
+        expect(Number(stockRows[0]!.current_quantity)).toBe(3);
+
+        // End Day closes cleanly
+        const endDayRes = await request(upgradeApp)
+          .post("/api/pos/day/end")
+          .set("Cookie", owner.cookie)
+          .set("X-CSRF-Token", owner.csrfToken)
+          .send({});
+        expect(endDayRes.status).toBe(200);
+        expect(endDayRes.body.state).toBe("CLOSED");
+      } finally {
+        await upgradeDb.close();
+      }
+    });
+
+    it("Finding 7 date boundary: confirm after midnight checks unpaid DRAFT missing gripo before date rules, records no cash/stock change, and lets End Day clear it", async () => {
+      const upgradeDb = await createPgliteDatabase();
+      try {
+        await upgradeDb.exec(`
+          CREATE TABLE IF NOT EXISTS schema_migrations (
+            name text PRIMARY KEY,
+            applied_at timestamptz NOT NULL DEFAULT now()
+          );
+        `);
+        const pre0009Files = (await readdir(MIGRATIONS_DIR))
+          .filter((f) => /^000[1-8]_.+\.sql$/.test(f))
+          .sort();
+        for (const file of pre0009Files) {
+          const sql = await readFile(path.join(MIGRATIONS_DIR, file), "utf8");
+          await upgradeDb.exec(sql);
+          await upgradeDb.query("INSERT INTO schema_migrations (name) VALUES ($1)", [file]);
+        }
+
+        const current0009 = await readFile(
+          path.join(MIGRATIONS_DIR, "0009_inventory_management_and_containers.sql"),
+          "utf8",
+        );
+        const original0009 = current0009
+          .replace(
+            /ALTER TABLE pos_sale_items\s+ADD COLUMN included_gripo text[\s\S]*?TWIST_TYPE'\)\);/m,
+            "",
+          )
+          .replace(/\s+AND included_gripo IS NULL/g, "")
+          .replace(/\s+AND included_gripo IN \('PUSH_TYPE', 'TWIST_TYPE'\)/g, "");
+        await upgradeDb.exec(original0009);
+        await upgradeDb.query("INSERT INTO schema_migrations (name) VALUES ($1)", [
+          "0009_inventory_management_and_containers.sql",
+        ]);
+
+        const clock = new ManualClock("2026-11-22T23:45:00+08:00");
+        const upgradeApp = createApp({ db: upgradeDb, clock });
+        const upCtx: TestContext = {
+          db: upgradeDb,
+          clock,
+          app: upgradeApp,
+          close: () => upgradeDb.close(),
+        };
+        const upOwner = await activatedAccount(upCtx, "f7bowner", "OWNER");
+        const upCashier = await activatedAccount(upCtx, "f7bcashier", "CASHIER");
+
+        const { rows: userRows } = await upgradeDb.query<{ id: string; username: string }>(
+          `SELECT id, username FROM app_users WHERE username IN ('f7bowner', 'f7bcashier')`,
+        );
+        const ownerId = userRows.find((r) => r.username === "f7bowner")!.id;
+        const cashierId = userRows.find((r) => r.username === "f7bcashier")!.id;
+
+        const { rows: roundRows } = await upgradeDb.query<{ id: string }>(
+          `UPDATE inventory_items
+              SET show_in_pos = true,
+                  pos_section = 'CONTAINERS',
+                  current_quantity = 5,
+                  stock_revision = 1
+            WHERE category = 'CONTAINER' AND container_shape = 'ROUND'
+            RETURNING id`,
+        );
+        const roundId = roundRows[0]!.id;
+        await upgradeDb.query(
+          `INSERT INTO inventory_opening_counts (item_id, quantity, unit, recorded_by_user_id, recorded_at)
+           VALUES ($1, 5, 'containers', $2, '2026-11-22T09:00:00+08:00')`,
+          [roundId, ownerId],
+        );
+
+        const { rows: dayRows } = await upgradeDb.query<{ id: string }>(
+          `INSERT INTO pos_business_days (business_date, started_by_user_id, started_at, next_reference_seq)
+           VALUES ('2026-11-22', $1, '2026-11-22T09:00:00+08:00', 1)
+           RETURNING id`,
+          [ownerId],
+        );
+        const dayId = dayRows[0]!.id;
+
+        const draftRef = "HD-1122-001";
+        const legacyQuoteSnapshot = [
+          {
+            lineIndex: 0,
+            kind: "CONTAINER_PACKAGE",
+            catalogCode: "ROUND_EMPTY",
+            waterType: null,
+            productId: roundId,
+            stockUnit: "containers",
+            posSection: "CONTAINERS",
+            displayLabel: "Empty Round Container",
+            unitVolumeMl: 0,
+            unitVolumeLiters: 0,
+            unitPriceCentavos: 17500,
+            quantity: 1,
+            lineTotalCentavos: 17500,
+            lineVolumeMl: 0,
+            lineVolumeLiters: 0,
+          },
+        ];
+        const { rows: draftRows } = await upgradeDb.query<{ id: string }>(
+          `INSERT INTO pos_checkouts (
+             reference, business_day_id, business_date, created_by_user_id,
+             status, quote_hash, quote_snapshot, total_centavos, total_containers, total_volume_ml,
+             created_at, updated_at
+           )
+           VALUES ($1, $2, '2026-11-22', $3, 'DRAFT', 'legacy-midnight-draft', $4::jsonb, 17500, 0, 0,
+                   '2026-11-22T23:40:00+08:00', '2026-11-22T23:40:00+08:00')
+           RETURNING id`,
+          [draftRef, dayId, cashierId, JSON.stringify(legacyQuoteSnapshot)],
+        );
+
+        const applied = await runMigrations(upgradeDb);
+        expect(applied).toEqual([
+          "0010_pos_container_included_gripo.sql",
+          "0011_pos_legacy_pending_container_gripo.sql",
+          "0012_pos_prior_day_merchandise_settlement.sql",
+        ]);
+
+        // Cross Asia/Manila midnight with cash collection never started on draftRef
+        clock.set("2026-11-23T00:15:00+08:00");
+
+        const cashier = await signIn(upgradeApp, "f7bcashier", upCashier.password);
+        const owner = await signIn(upgradeApp, "f7bowner", upOwner.password);
+
+        const lateDraftConfirm = await request(upgradeApp)
+          .post(`/api/pos/checkouts/${draftRef}/confirm`)
+          .set("Cookie", cashier.cookie)
+          .set("X-CSRF-Token", cashier.csrfToken)
+          .send({ cashReceivedCentavos: 20000 });
+        expect(lateDraftConfirm.status).toBe(409);
+        expect(lateDraftConfirm.body.error.code).toBe("GRIPO_CHOICE_REQUIRED");
+
+        // Draft remains unpaid with zero cash snapshot and no review-required status change
+        const { rows: afterConfirmRows } = await upgradeDb.query<{
+          status: string;
+          cash_received_centavos: number | null;
+          change_centavos: number | null;
+          resolution_reason: string | null;
+        }>(
+          `SELECT status, cash_received_centavos, change_centavos, resolution_reason
+             FROM pos_checkouts
+            WHERE id = $1`,
+          [draftRows[0]!.id],
+        );
+        expect(afterConfirmRows[0]).toEqual({
+          status: "DRAFT",
+          cash_received_centavos: null,
+          change_centavos: null,
+          resolution_reason: null,
+        });
+
+        // No sale, commitment, or stock movement recorded
+        const { rows: saleCount } = await upgradeDb.query<{ count: string }>(
+          `SELECT COUNT(*)::text AS count FROM pos_sales`,
+        );
+        expect(saleCount[0]!.count).toBe("0");
+        const { rows: commitCount } = await upgradeDb.query<{ count: string }>(
+          `SELECT COUNT(*)::text AS count FROM pos_checkout_stock_commitments`,
+        );
+        expect(commitCount[0]!.count).toBe("0");
+        const { rows: moveCount } = await upgradeDb.query<{ count: string }>(
+          `SELECT COUNT(*)::text AS count FROM inventory_stock_movements`,
+        );
+        expect(moveCount[0]!.count).toBe("0");
+        const { rows: stockBeforeEnd } = await upgradeDb.query<{ current_quantity: number }>(
+          `SELECT current_quantity FROM inventory_items WHERE id = $1`,
+          [roundId],
+        );
+        expect(Number(stockBeforeEnd[0]!.current_quantity)).toBe(5);
+
+        // Owner clears the unpaid draft on End Day and starts 2026-11-23 cleanly
+        const endDayRes = await request(upgradeApp)
+          .post("/api/pos/day/end")
+          .set("Cookie", owner.cookie)
+          .set("X-CSRF-Token", owner.csrfToken)
+          .send({
+            clearUnpaidDrafts: true,
+            expectedBusinessDate: "2026-11-22",
+          });
+        expect(endDayRes.status).toBe(200);
+        expect(endDayRes.body.clearedDraftReferences).toEqual([draftRef]);
+
+        const { rows: clearedRows } = await upgradeDb.query<{ status: string }>(
+          `SELECT status FROM pos_checkouts WHERE id = $1`,
+          [draftRows[0]!.id],
+        );
+        expect(clearedRows[0]!.status).toBe("CANCELLED_DRAFT");
+
+        const startNextDayRes = await request(upgradeApp)
+          .post("/api/pos/day/start")
+          .set("Cookie", owner.cookie)
+          .set("X-CSRF-Token", owner.csrfToken)
+          .send({});
+        expect(startNextDayRes.status).toBe(201);
+        expect(startNextDayRes.body.state).toBe("OPEN");
+        expect(startNextDayRes.body.todayDate).toBe("2026-11-23");
+
+        // Finding 8: retrying the same confirm after End Day leaves the cleared unpaid draft cancelled
+        const postEndRetry = await request(upgradeApp)
+          .post(`/api/pos/checkouts/${draftRef}/confirm`)
+          .set("Cookie", cashier.cookie)
+          .set("X-CSRF-Token", cashier.csrfToken)
+          .send({ cashReceivedCentavos: 20000 });
+        expect(postEndRetry.status).toBe(409);
+        expect(postEndRetry.body.error.code).toBe("GRIPO_CHOICE_REQUIRED");
+
+        const { rows: postEndCheckoutRows } = await upgradeDb.query<{
+          status: string;
+          cash_received_centavos: number | null;
+          change_centavos: number | null;
+          resolution_reason: string | null;
+        }>(
+          `SELECT status, cash_received_centavos, change_centavos, resolution_reason
+             FROM pos_checkouts
+            WHERE id = $1`,
+          [draftRows[0]!.id],
+        );
+        expect(postEndCheckoutRows[0]).toEqual({
+          status: "CANCELLED_DRAFT",
+          cash_received_centavos: null,
+          change_centavos: null,
+          resolution_reason: "CLEARED_ON_END_DAY",
+        });
+
+        const { rows: postEndSaleCount } = await upgradeDb.query<{ count: string }>(
+          `SELECT COUNT(*)::text AS count FROM pos_sales`,
+        );
+        expect(postEndSaleCount[0]!.count).toBe("0");
+        const { rows: postEndCommitCount } = await upgradeDb.query<{ count: string }>(
+          `SELECT COUNT(*)::text AS count FROM pos_checkout_stock_commitments`,
+        );
+        expect(postEndCommitCount[0]!.count).toBe("0");
+        const { rows: postEndMoveCount } = await upgradeDb.query<{ count: string }>(
+          `SELECT COUNT(*)::text AS count FROM inventory_stock_movements`,
+        );
+        expect(postEndMoveCount[0]!.count).toBe("0");
+        const { rows: stockAfterRetry } = await upgradeDb.query<{ current_quantity: number }>(
+          `SELECT current_quantity FROM inventory_items WHERE id = $1`,
+          [roundId],
+        );
+        expect(Number(stockAfterRetry[0]!.current_quantity)).toBe(5);
+
+        const dayAfterRetryRes = await request(upgradeApp)
+          .get("/api/pos/day")
+          .set("Cookie", owner.cookie);
+        expect(dayAfterRetryRes.status).toBe(200);
+        expect(dayAfterRetryRes.body.priorDayReviewCheckouts ?? []).toEqual([]);
+        expect(dayAfterRetryRes.body.unresolvedCheckouts ?? []).toEqual([]);
+      } finally {
+        await upgradeDb.close();
+      }
+    });
+
+    it("DEC-075: Owner settles prior-day paid-and-handed-over merchandise and container packages once, deducts stock once, preserves closed reports, and unblocks End Day then Start Day", async () => {
+      const faucetRes = await createProduct({
+        name: "Disposable Settlement Faucet",
+        unit: "pcs",
+        unitConfirmed: true,
+        unitPriceCentavos: 4000,
+        showInPos: true,
+        posSection: "CHANGE_OF_GRIPO",
+      });
+      expect(faucetRes.status).toBe(201);
+      const faucetId = faucetRes.body.item.id as string;
+      expect((await setOpeningStock(faucetId, 5)).status).toBe(201);
+
+      const pubRound = await request(ctx.app)
+        .patch("/api/inventory/containers/ROUND")
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ showInPos: true });
+      expect(pubRound.status).toBe(200);
+      expect((await setOpeningStock("ROUND", 4)).status).toBe(201);
+
+      const startDay1 = await startDay(ctx, owner, { requestKey: "dec075-start-day1" });
+      expect(startDay1.status).toBe(201);
+      const day1Date = startDay1.body.todayDate as string;
+
+      // Saved prior-day merchandise sale (stock 5 -> 4); must stay ALREADY_SAVED if settle is hit
+      const savedPrep = await prepareCheckout(ctx, cashier, {
+        items: [{ kind: "MERCHANDISE", productId: faucetId, quantity: 1 }],
+      });
+      expect(savedPrep.status).toBe(201);
+      const savedRef = savedPrep.body.checkout.reference as string;
+      const savedConfirm = await confirmCheckout(ctx.app, cashier, savedRef, {
+        cashReceivedCentavos: 5000,
+      });
+      expect(savedConfirm.status).toBe(201);
+
+      // Start cash collection (PAYMENT_PENDING) on standalone faucet & TWIST_TYPE container package
+      const merchPrep = await prepareCheckout(ctx, cashier, {
+        items: [{ kind: "MERCHANDISE", productId: faucetId, quantity: 1 }],
+      });
+      expect(merchPrep.status).toBe(201);
+      const merchRef = merchPrep.body.checkout.reference as string;
+      const merchBegin = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(merchRef)}/begin-payment`)
+        .set("Cookie", cashier.cookie)
+        .set("X-CSRF-Token", cashier.csrfToken)
+        .send({});
+      expect(merchBegin.status).toBe(200);
+
+      const pkgPrep = await prepareCheckout(ctx, cashier, {
+        items: [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_PURIFIED",
+            includedGripo: "TWIST_TYPE",
+            quantity: 1,
+          },
+        ],
+      });
+      expect(pkgPrep.status).toBe(201);
+      const pkgRef = pkgPrep.body.checkout.reference as string;
+      const pkgBegin = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(pkgRef)}/begin-payment`)
+        .set("Cookie", cashier.cookie)
+        .set("X-CSRF-Token", cashier.csrfToken)
+        .send({});
+      expect(pkgBegin.status).toBe(200);
+
+      // Advance past Manila midnight
+      ctx.clock.advance(24 * 60 * 60_000);
+      owner = await reauth(ctx, "owner1", owner);
+      cashier = await reauth(ctx, "cashier1", cashier);
+
+      const dayAfterMidnight = await request(ctx.app)
+        .get("/api/pos/day")
+        .set("Cookie", owner.cookie);
+      expect(dayAfterMidnight.status).toBe(200);
+      expect(dayAfterMidnight.body.state).toBe("PREVIOUS_DAY_OPEN");
+      const day2Date = dayAfterMidnight.body.todayDate as string;
+      expect(day2Date > day1Date).toBe(true);
+
+      // End Day is blocked until unresolved prior-day checkouts are settled
+      const blockedEnd = await endDay(ctx, owner, { requestKey: "dec075-blocked-end" });
+      expect(blockedEnd.status).toBe(409);
+      expect(blockedEnd.body.error.code).toBe("UNRESOLVED_CHECKOUTS");
+
+      // Cashier is forbidden from settling; Owner missing handover confirmation gets 400
+      const cashierAttempt = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(merchRef)}/settle`)
+        .set("Cookie", cashier.cookie)
+        .set("X-CSRF-Token", cashier.csrfToken)
+        .send({ paymentKeptConfirmed: true, itemsHandedOverConfirmed: true });
+      expect(cashierAttempt.status).toBe(403);
+
+      const incompleteAttempt = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(merchRef)}/settle`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ paymentKeptConfirmed: true, itemsHandedOverConfirmed: false });
+      expect(incompleteAttempt.status).toBe(400);
+      expect(incompleteAttempt.body.error.code).toBe("VALIDATION_FAILED");
+
+      // Finding 9: refillDeliveredConfirmed cannot substitute for itemsHandedOverConfirmed on merchandise checkouts,
+      // and missing handover flag also rejects without mutating checkout cash, settlement rows, stock, or reservations.
+      const wrongFlagMerch = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(merchRef)}/settle`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          paymentKeptConfirmed: true,
+          refillDeliveredConfirmed: true,
+          cashReceivedCentavos: 5000,
+        });
+      expect(wrongFlagMerch.status).toBe(400);
+      expect(wrongFlagMerch.body.error.code).toBe("VALIDATION_FAILED");
+
+      const omittedHandoverMerch = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(merchRef)}/settle`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ paymentKeptConfirmed: true });
+      expect(omittedHandoverMerch.status).toBe(400);
+      expect(omittedHandoverMerch.body.error.code).toBe("VALIDATION_FAILED");
+
+      const { rows: unmutatedCheckout } = await ctx.db.query<{
+        status: string;
+        cash_received_centavos: number | null;
+        change_centavos: number | null;
+      }>(
+        `SELECT status, cash_received_centavos, change_centavos
+           FROM pos_checkouts
+          WHERE reference = $1`,
+        [merchRef],
+      );
+      expect(unmutatedCheckout[0]).toEqual({
+        status: "PAYMENT_PENDING",
+        cash_received_centavos: null,
+        change_centavos: null,
+      });
+
+      const { rows: zeroSettlements } = await ctx.db.query<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM pos_prior_day_settlements WHERE checkout_reference = $1`,
+        [merchRef],
+      );
+      expect(zeroSettlements[0]!.count).toBe("0");
+
+      const { rows: untouchedStock } = await ctx.db.query<{ current_quantity: number }>(
+        `SELECT current_quantity FROM inventory_items WHERE id = $1`,
+        [faucetId],
+      );
+      expect(Number(untouchedStock[0]!.current_quantity)).toBe(4);
+
+      const { rows: zeroSettleMovements } = await ctx.db.query<{ count: string }>(
+        `SELECT COUNT(*)::text AS count
+           FROM inventory_stock_movements
+          WHERE item_id = $1 AND movement_type = 'PRIOR_DAY_SETTLEMENT'`,
+        [faucetId],
+      );
+      expect(zeroSettleMovements[0]!.count).toBe("0");
+
+      const { rows: stillActiveCommit } = await ctx.db.query<{ status: string }>(
+        `SELECT c.status
+           FROM pos_checkout_stock_commitments c
+           JOIN pos_checkouts pc ON pc.id = c.checkout_id
+          WHERE pc.reference = $1`,
+        [merchRef],
+      );
+      expect(stillActiveCommit[0]!.status).toBe("ACTIVE");
+
+      // Lookup confirms Owner eligibility for prior-day merchandise checkout
+      const merchLookup = await request(ctx.app)
+        .get(`/api/pos/checkouts/${encodeURIComponent(merchRef)}`)
+        .set("Cookie", owner.cookie);
+      expect(merchLookup.status).toBe(200);
+      expect(merchLookup.body.canSettlePriorDay).toBe(true);
+
+      // Owner settles standalone faucet checkout once
+      const settleMerch = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(merchRef)}/settle`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          paymentKeptConfirmed: true,
+          itemsHandedOverConfirmed: true,
+          cashReceivedCentavos: 5000,
+          note: "Cash kept and faucet handed over",
+        });
+      expect(settleMerch.status).toBe(201);
+      expect(settleMerch.body).toMatchObject({
+        outcome: "SETTLED",
+        replayed: false,
+        settlement: {
+          checkoutReference: merchRef,
+          originalBusinessDate: day1Date,
+          settlementDate: day2Date,
+          netAmountKeptCentavos: 4000,
+          cashReceivedCentavos: 5000,
+          changeCentavos: 1000,
+          totalContainers: 0,
+          totalVolumeLiters: 0,
+          note: "Cash kept and faucet handed over",
+        },
+        checkout: {
+          reference: merchRef,
+          status: "SETTLED_PRIOR_DAY",
+        },
+      });
+
+      // Retry settle -> idempotent replay (200) without duplicate stock deduction
+      const replayMerch = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(merchRef)}/settle`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          paymentKeptConfirmed: true,
+          itemsHandedOverConfirmed: true,
+          cashReceivedCentavos: 5000,
+        });
+      expect(replayMerch.status).toBe(200);
+      expect(replayMerch.body.outcome).toBe("SETTLED");
+      expect(replayMerch.body.replayed).toBe(true);
+
+      // Already-saved sale remains protected if settle is called on it
+      const settleSaved = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(savedRef)}/settle`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ paymentKeptConfirmed: true, itemsHandedOverConfirmed: true });
+      expect(settleSaved.status).toBe(200);
+      expect(settleSaved.body.outcome).toBe("ALREADY_SAVED");
+      expect(settleSaved.body.settlement).toBeNull();
+
+      // Faucet stock is 5 - 1 (saved) - 1 (settled) = 3, with one PRIOR_DAY_SETTLEMENT movement and CONSUMED commitment
+      const { rows: faucetStockRows } = await ctx.db.query<{ current_quantity: number }>(
+        `SELECT current_quantity FROM inventory_items WHERE id = $1`,
+        [faucetId],
+      );
+      expect(Number(faucetStockRows[0]!.current_quantity)).toBe(3);
+
+      const { rows: faucetMovements } = await ctx.db.query<{
+        movement_type: string;
+        quantity_delta: number;
+        pos_reference: string;
+      }>(
+        `SELECT movement_type, quantity_delta, pos_reference
+           FROM inventory_stock_movements
+          WHERE item_id = $1
+          ORDER BY recorded_at ASC`,
+        [faucetId],
+      );
+      expect(faucetMovements).toEqual([
+        { movement_type: "POS_SALE", quantity_delta: -1, pos_reference: savedRef },
+        { movement_type: "PRIOR_DAY_SETTLEMENT", quantity_delta: -1, pos_reference: merchRef },
+      ]);
+
+      const { rows: merchCommit } = await ctx.db.query<{ status: string }>(
+        `SELECT c.status
+           FROM pos_checkout_stock_commitments c
+           JOIN pos_checkouts pc ON pc.id = c.checkout_id
+          WHERE pc.reference = $1`,
+        [merchRef],
+      );
+      expect(merchCommit[0]!.status).toBe("CONSUMED");
+
+      // Owner settles container package checkout (ROUND_PURIFIED + TWIST_TYPE) and preserves package details
+      const settlePkg = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(pkgRef)}/settle`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          paymentKeptConfirmed: true,
+          itemsHandedOverConfirmed: true,
+          note: "Twist container handed over",
+        });
+      expect(settlePkg.status).toBe(201);
+      expect(settlePkg.body.settlement).toMatchObject({
+        checkoutReference: pkgRef,
+        originalBusinessDate: day1Date,
+        settlementDate: day2Date,
+        totalContainers: 0,
+        totalVolumeLiters: 25,
+      });
+      expect(settlePkg.body.settlement.items[0]).toMatchObject({
+        kind: "CONTAINER_PACKAGE",
+        catalogCode: "ROUND_PURIFIED",
+        includedGripo: "TWIST_TYPE",
+        displayLabel: "Round Container (Purified · 25 L) · Twist-Type gripo",
+      });
+
+      const { rows: roundStockRows } = await ctx.db.query<{ current_quantity: number }>(
+        `SELECT current_quantity FROM inventory_items WHERE category = 'CONTAINER' AND container_shape = 'ROUND'`,
+      );
+      expect(Number(roundStockRows[0]!.current_quantity)).toBe(3);
+
+      // Owner can now close yesterday (summary keeps only saved sales, excluding prior-day settlements) and open today
+      const closeDay1 = await endDay(ctx, owner, { requestKey: "dec075-close-day1" });
+      expect(closeDay1.status).toBe(200);
+      expect(closeDay1.body.state).toBe("CLOSED");
+      expect(closeDay1.body.summary).toMatchObject({
+        businessDate: day1Date,
+        totalSalesCentavos: 4000,
+        validTransactionCount: 1,
+      });
+
+      const startDay2 = await startDay(ctx, owner, { requestKey: "dec075-start-day2" });
+      expect(startDay2.status).toBe(201);
+      expect(startDay2.body.state).toBe("OPEN");
+      expect(startDay2.body.todayDate).toBe(day2Date);
+
+      // History separates prior-day settlements onto settlementDate without altering closed day1 sales
+      const day2History = await request(ctx.app)
+        .get(`/api/pos/sales?date=${day2Date}`)
+        .set("Cookie", owner.cookie);
+      expect(day2History.status).toBe(200);
+      expect(day2History.body.sales).toEqual([]);
+      expect(
+        day2History.body.priorDaySettlements.map((s: { checkoutReference: string }) => s.checkoutReference),
+      ).toEqual([pkgRef, merchRef]);
+
+      const day1History = await request(ctx.app)
+        .get(`/api/pos/sales?date=${day1Date}`)
+        .set("Cookie", owner.cookie);
+      expect(day1History.status).toBe(200);
+      expect(day1History.body.sales.map((s: { reference: string }) => s.reference)).toEqual([savedRef]);
+      expect(day1History.body.priorDaySettlements).toEqual([]);
     });
   });
 });

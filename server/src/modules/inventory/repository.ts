@@ -1,26 +1,81 @@
+import { randomUUID } from "node:crypto";
 import type { Database, Queryable } from "../../db/database.js";
-import { type ContainerShape, formatManilaIso, type InventoryItemView } from "./inventory.js";
+import {
+  BUILT_IN_POS_SECTIONS,
+  type ContainerShape,
+  formatManilaIso,
+  type InventoryCategory,
+  type InventoryItemView,
+  type PosSection,
+  type PosSectionView,
+  type StockReconciliationView,
+} from "./inventory.js";
 
 export interface InventoryItemDbRow {
   id: string;
   code: string;
   name: string;
-  category: "CONTAINER";
-  containerShape: ContainerShape;
+  category: InventoryCategory;
+  containerShape: ContainerShape | null;
+  description: string | null;
   unit: string;
+  unitPriceCentavos: number | string | null;
+  showInPos: boolean;
+  posSection: PosSection | null;
   currentQuantity: number | string | null;
+  stockRevision: number | string;
+  archivedAt: Date | string | null;
+  archivedByUsername: string | null;
+  createdByUsername: string | null;
+  createdAt: Date | string;
   openingQuantity: number | string | null;
   openingUnit: string | null;
   recordedByUsername: string | null;
   recordedAt: Date | string | null;
+  latestRecId: string | null;
+  latestRecBalanceBefore: number | string | null;
+  latestRecPhysicalCount: number | string | null;
+  latestRecQuantityDelta: number | string | null;
+  latestRecBalanceAfter: number | string | null;
+  latestRecUnit: string | null;
+  latestRecReason: string | null;
+  latestRecRecordedBy: string | null;
+  latestRecRecordedAt: Date | string | null;
+}
+
+interface PosSectionDbRow {
+  code: string;
+  name: string;
+  isBuiltIn: boolean;
+  sortOrder: number | string;
+  createdByUsername: string | null;
+  createdAt: Date | string;
+}
+
+interface ReconciliationDbRow {
+  id: string;
+  itemId: string;
+  requestKey: string | null;
+  balanceBefore: number | string;
+  physicalCount: number | string;
+  quantityDelta: number | string;
+  balanceAfter: number | string;
+  unit: string;
+  reason: string;
+  recordedByUsername: string;
+  recordedAt: Date | string;
 }
 
 interface LockedItemRow {
   id: string;
   code: string;
   name: string;
+  category: InventoryCategory;
+  containerShape: ContainerShape | null;
   unit: string;
   currentQuantity: number | string | null;
+  stockRevision: number | string;
+  archivedAt: Date | string | null;
 }
 
 function toDate(value: Date | string): Date {
@@ -30,6 +85,32 @@ function toDate(value: Date | string): Date {
 function toOptionalInt(value: number | string | null | undefined): number | null {
   if (value === null || value === undefined) return null;
   return Number(value);
+}
+
+function toPosSectionView(row: PosSectionDbRow): PosSectionView {
+  return {
+    code: row.code,
+    name: row.name,
+    isBuiltIn: Boolean(row.isBuiltIn),
+    sortOrder: Number(row.sortOrder),
+    createdBy: row.createdByUsername ?? null,
+    createdAt: formatManilaIso(toDate(row.createdAt)),
+  };
+}
+
+function toReconciliationView(row: ReconciliationDbRow): StockReconciliationView {
+  return {
+    id: row.id,
+    itemId: row.itemId,
+    balanceBefore: Number(row.balanceBefore),
+    physicalCount: Number(row.physicalCount),
+    quantityDelta: Number(row.quantityDelta),
+    balanceAfter: Number(row.balanceAfter),
+    unit: row.unit,
+    reason: row.reason,
+    recordedBy: row.recordedByUsername,
+    recordedAt: formatManilaIso(toDate(row.recordedAt)),
+  };
 }
 
 export function toInventoryItemView(row: InventoryItemDbRow): InventoryItemView {
@@ -48,15 +129,50 @@ export function toInventoryItemView(row: InventoryItemDbRow): InventoryItemView 
       }
     : null;
 
+  const latestReconciliation: StockReconciliationView | null =
+    row.latestRecId !== null &&
+    row.latestRecBalanceBefore !== null &&
+    row.latestRecPhysicalCount !== null &&
+    row.latestRecQuantityDelta !== null &&
+    row.latestRecBalanceAfter !== null &&
+    row.latestRecUnit !== null &&
+    row.latestRecReason !== null &&
+    row.latestRecRecordedBy !== null &&
+    row.latestRecRecordedAt !== null
+      ? {
+          id: row.latestRecId,
+          itemId: row.id,
+          balanceBefore: Number(row.latestRecBalanceBefore),
+          physicalCount: Number(row.latestRecPhysicalCount),
+          quantityDelta: Number(row.latestRecQuantityDelta),
+          balanceAfter: Number(row.latestRecBalanceAfter),
+          unit: row.latestRecUnit,
+          reason: row.latestRecReason,
+          recordedBy: row.latestRecRecordedBy,
+          recordedAt: formatManilaIso(toDate(row.latestRecRecordedAt)),
+        }
+      : null;
+
   return {
+    id: row.id,
     code: row.code,
     name: row.name,
     category: row.category,
     shape: row.containerShape,
+    description: row.description ?? null,
     unit: row.unit,
+    unitPriceCentavos: toOptionalInt(row.unitPriceCentavos),
+    showInPos: Boolean(row.showInPos),
+    posSection: row.posSection ?? null,
     status: openingStock ? "INITIALIZED" : "NOT_SET",
     currentQuantity: openingStock ? toOptionalInt(row.currentQuantity) : null,
+    stockRevision: Number(row.stockRevision ?? 0),
     openingStock,
+    latestReconciliation,
+    archivedAt: row.archivedAt ? formatManilaIso(toDate(row.archivedAt)) : null,
+    archivedBy: row.archivedByUsername ?? null,
+    createdBy: row.createdByUsername ?? null,
+    createdAt: formatManilaIso(toDate(row.createdAt)),
   };
 }
 
@@ -66,45 +182,383 @@ const ITEM_SELECT = `
          i.name,
          i.category,
          i.container_shape AS "containerShape",
+         i.description,
          i.unit,
+         i.unit_price_centavos AS "unitPriceCentavos",
+         i.show_in_pos AS "showInPos",
+         i.pos_section AS "posSection",
          i.current_quantity AS "currentQuantity",
+         i.stock_revision AS "stockRevision",
+         i.archived_at AS "archivedAt",
+         archiver.username AS "archivedByUsername",
+         creator.username AS "createdByUsername",
+         i.created_at AS "createdAt",
          oc.quantity AS "openingQuantity",
          oc.unit AS "openingUnit",
          u.username AS "recordedByUsername",
-         oc.recorded_at AS "recordedAt"
+         oc.recorded_at AS "recordedAt",
+         rec.id AS "latestRecId",
+         rec.balance_before AS "latestRecBalanceBefore",
+         rec.physical_count AS "latestRecPhysicalCount",
+         rec.quantity_delta AS "latestRecQuantityDelta",
+         rec.balance_after AS "latestRecBalanceAfter",
+         rec.unit AS "latestRecUnit",
+         rec.reason AS "latestRecReason",
+         rec.recorded_by_username AS "latestRecRecordedBy",
+         rec.recorded_at AS "latestRecRecordedAt"
     FROM inventory_items i
+    LEFT JOIN app_users creator ON creator.id = i.created_by_user_id
+    LEFT JOIN app_users archiver ON archiver.id = i.archived_by_user_id
     LEFT JOIN inventory_opening_counts oc ON oc.item_id = i.id
-    LEFT JOIN app_users u ON u.id = oc.recorded_by_user_id`;
+    LEFT JOIN app_users u ON u.id = oc.recorded_by_user_id
+    LEFT JOIN inventory_pos_sections ps ON ps.code = i.pos_section
+    LEFT JOIN (
+      SELECT DISTINCT ON (r.item_id)
+             r.item_id,
+             r.id,
+             r.balance_before,
+             r.physical_count,
+             r.quantity_delta,
+             r.balance_after,
+             r.unit,
+             r.reason,
+             ru.username AS recorded_by_username,
+             r.recorded_at
+        FROM inventory_reconciliations r
+        JOIN app_users ru ON ru.id = r.actor_user_id
+       ORDER BY r.item_id, r.recorded_at DESC, r.id DESC
+    ) rec ON rec.item_id = i.id`;
+
+const RECONCILIATION_SELECT = `
+  SELECT r.id,
+         r.item_id AS "itemId",
+         r.request_key AS "requestKey",
+         r.balance_before AS "balanceBefore",
+         r.physical_count AS "physicalCount",
+         r.quantity_delta AS "quantityDelta",
+         r.balance_after AS "balanceAfter",
+         r.unit,
+         r.reason,
+         u.username AS "recordedByUsername",
+         r.recorded_at AS "recordedAt"
+    FROM inventory_reconciliations r
+    JOIN app_users u ON u.id = r.actor_user_id`;
+
+export type OpeningStockTarget =
+  | { kind: "shape"; shape: ContainerShape }
+  | { kind: "id"; id: string };
 
 export type RecordOpeningStockResult =
   | { kind: "created"; item: InventoryItemView }
   | { kind: "already-set"; item: InventoryItemView }
+  | { kind: "archived" }
   | { kind: "not-found" };
 
-async function findContainerItemByShape(db: Queryable, shape: ContainerShape): Promise<InventoryItemView | undefined> {
-  const { rows } = await db.query<InventoryItemDbRow>(
-    `${ITEM_SELECT}
-      WHERE i.category = 'CONTAINER' AND i.container_shape = $1`,
-    [shape],
-  );
+export type CreateMerchandiseResult =
+  | { kind: "created"; item: InventoryItemView }
+  | { kind: "duplicate-name" };
+
+export type UpdateMerchandiseResult =
+  | { kind: "updated"; item: InventoryItemView }
+  | { kind: "not-found" }
+  | { kind: "archived" }
+  | { kind: "duplicate-name" };
+
+export type CreatePosSectionResult =
+  | { kind: "created"; section: PosSectionView }
+  | { kind: "duplicate-name" };
+
+export type ArchiveMerchandiseResult =
+  | { kind: "archived"; item: InventoryItemView }
+  | { kind: "not-found" }
+  | { kind: "cannot-archive-container" }
+  | { kind: "already-archived" };
+
+export type ReconcileStockResult =
+  | { kind: "created"; item: InventoryItemView; reconciliation: StockReconciliationView }
+  | { kind: "replayed"; item: InventoryItemView; reconciliation: StockReconciliationView }
+  | { kind: "key-conflict" }
+  | { kind: "not-found" }
+  | { kind: "archived" }
+  | { kind: "not-set" }
+  | { kind: "stale"; item: InventoryItemView }
+  | { kind: "active-commitment"; activeCommitted: number; item: InventoryItemView };
+
+async function findItemById(db: Queryable, id: string): Promise<InventoryItemView | undefined> {
+  const { rows } = await db.query<InventoryItemDbRow>(`${ITEM_SELECT} WHERE i.id = $1`, [id]);
   return rows[0] ? toInventoryItemView(rows[0]) : undefined;
 }
 
-/** PostgreSQL persistence adapter for Inventory container opening stock. */
+async function findItemByTarget(db: Queryable, target: OpeningStockTarget): Promise<InventoryItemView | undefined> {
+  if (target.kind === "shape") {
+    const { rows } = await db.query<InventoryItemDbRow>(
+      `${ITEM_SELECT} WHERE i.category = 'CONTAINER' AND i.container_shape = $1`,
+      [target.shape],
+    );
+    return rows[0] ? toInventoryItemView(rows[0]) : undefined;
+  }
+  return findItemById(db, target.id);
+}
+
+/** PostgreSQL persistence adapter for Inventory containers, merchandise, sections, archiving, and INV-009 reconciliations. */
 export const inventoryRepository = {
-  async listContainerItems(db: Queryable): Promise<InventoryItemView[]> {
+  async listPosSections(db: Queryable): Promise<PosSectionView[]> {
+    const { rows } = await db.query<PosSectionDbRow>(
+      `SELECT s.code,
+              s.name,
+              s.is_built_in AS "isBuiltIn",
+              s.sort_order AS "sortOrder",
+              u.username AS "createdByUsername",
+              s.created_at AS "createdAt"
+         FROM inventory_pos_sections s
+         LEFT JOIN app_users u ON u.id = s.created_by_user_id
+        ORDER BY s.sort_order ASC, LOWER(s.name) ASC, s.created_at ASC`,
+    );
+    return rows.map(toPosSectionView);
+  },
+
+  async findPosSectionByCode(db: Queryable, code: string): Promise<PosSectionView | undefined> {
+    const { rows } = await db.query<PosSectionDbRow>(
+      `SELECT s.code,
+              s.name,
+              s.is_built_in AS "isBuiltIn",
+              s.sort_order AS "sortOrder",
+              u.username AS "createdByUsername",
+              s.created_at AS "createdAt"
+         FROM inventory_pos_sections s
+         LEFT JOIN app_users u ON u.id = s.created_by_user_id
+        WHERE s.code = $1`,
+      [code],
+    );
+    return rows[0] ? toPosSectionView(rows[0]) : undefined;
+  },
+
+  async createPosSection(
+    db: Database,
+    input: {
+      name: string;
+      createdByUserId: string;
+      createdAt: Date;
+    },
+  ): Promise<CreatePosSectionResult> {
+    const code = `CUSTOM_${randomUUID().replace(/-/g, "").slice(0, 12).toUpperCase()}`;
+    try {
+      await db.query(
+        `INSERT INTO inventory_pos_sections (code, name, is_built_in, sort_order, created_by_user_id, created_at)
+         VALUES ($1, $2, false, 100, $3, $4)`,
+        [code, input.name, input.createdByUserId, input.createdAt],
+      );
+      const created = await this.findPosSectionByCode(db, code);
+      return { kind: "created", section: created! };
+    } catch (error) {
+      if ((error as { code?: string } | null)?.code === "23505") {
+        return { kind: "duplicate-name" };
+      }
+      throw error;
+    }
+  },
+
+  async listItems(
+    db: Queryable,
+    options: { includeArchived?: boolean } = {},
+  ): Promise<InventoryItemView[]> {
+    const whereClause = options.includeArchived ? "" : "WHERE i.archived_at IS NULL";
     const { rows } = await db.query<InventoryItemDbRow>(
       `${ITEM_SELECT}
-        WHERE i.category = 'CONTAINER'
-        ORDER BY CASE i.container_shape WHEN 'ROUND' THEN 1 WHEN 'SLIM' THEN 2 ELSE 3 END, i.code ASC`,
+        ${whereClause}
+        ORDER BY CASE WHEN i.archived_at IS NULL THEN 1 ELSE 2 END,
+                 CASE i.category WHEN 'CONTAINER' THEN 1 ELSE 2 END,
+                 CASE i.container_shape WHEN 'ROUND' THEN 1 WHEN 'SLIM' THEN 2 ELSE 3 END,
+                 COALESCE(ps.sort_order, 999) ASC,
+                 LOWER(COALESCE(ps.name, '')) ASC,
+                 LOWER(i.name) ASC,
+                 i.created_at ASC`,
     );
     return rows.map(toInventoryItemView);
+  },
+
+  async findMerchandiseById(db: Queryable, id: string): Promise<InventoryItemView | undefined> {
+    const { rows } = await db.query<InventoryItemDbRow>(
+      `${ITEM_SELECT} WHERE i.id = $1 AND i.category = 'MERCHANDISE'`,
+      [id],
+    );
+    return rows[0] ? toInventoryItemView(rows[0]) : undefined;
+  },
+
+  async createMerchandiseProduct(
+    db: Database,
+    input: {
+      name: string;
+      description: string | null;
+      unit: string;
+      unitPriceCentavos: number;
+      showInPos: boolean;
+      posSection: PosSection | null;
+      createdByUserId: string;
+      createdAt: Date;
+    },
+  ): Promise<CreateMerchandiseResult> {
+    const code = `MERCH-${randomUUID().replace(/-/g, "").slice(0, 12).toUpperCase()}`;
+    try {
+      const { rows } = await db.query<{ id: string }>(
+        `INSERT INTO inventory_items (
+           code, name, category, container_shape, description, unit,
+           unit_price_centavos, show_in_pos, pos_section, current_quantity,
+           created_by_user_id, created_at
+         )
+         VALUES ($1, $2, 'MERCHANDISE', NULL, $3, $4, $5, $6, $7, NULL, $8, $9)
+         RETURNING id`,
+        [
+          code,
+          input.name,
+          input.description,
+          input.unit,
+          input.unitPriceCentavos,
+          input.showInPos,
+          input.posSection,
+          input.createdByUserId,
+          input.createdAt,
+        ],
+      );
+      const created = await findItemById(db, rows[0]!.id);
+      return { kind: "created", item: created! };
+    } catch (error) {
+      if ((error as { code?: string } | null)?.code === "23505") {
+        return { kind: "duplicate-name" };
+      }
+      throw error;
+    }
+  },
+
+  async updateMerchandiseProduct(
+    db: Database,
+    input: {
+      id: string;
+      name: string;
+      description: string | null;
+      unitPriceCentavos: number;
+      showInPos: boolean;
+      posSection: PosSection | null;
+    },
+  ): Promise<UpdateMerchandiseResult> {
+    try {
+      return await db.transaction(async (tx) => {
+        const { rows: lockedRows } = await tx.query<{
+          id: string;
+          category: InventoryCategory;
+          archivedAt: Date | string | null;
+        }>(
+          `SELECT id, category, archived_at AS "archivedAt"
+             FROM inventory_items
+            WHERE id = $1 AND category = 'MERCHANDISE'
+            FOR UPDATE`,
+          [input.id],
+        );
+        const locked = lockedRows[0];
+        if (!locked) {
+          return { kind: "not-found" as const };
+        }
+        if (locked.archivedAt !== null) {
+          return { kind: "archived" as const };
+        }
+
+        await tx.query(
+          `UPDATE inventory_items
+              SET name = $2,
+                  description = $3,
+                  unit_price_centavos = $4,
+                  show_in_pos = $5,
+                  pos_section = $6
+            WHERE id = $1`,
+          [
+            input.id,
+            input.name,
+            input.description,
+            input.unitPriceCentavos,
+            input.showInPos,
+            input.posSection,
+          ],
+        );
+        const updated = await findItemById(tx, input.id);
+        return updated ? { kind: "updated" as const, item: updated } : { kind: "not-found" as const };
+      });
+    } catch (error) {
+      if ((error as { code?: string } | null)?.code === "23505") {
+        return { kind: "duplicate-name" };
+      }
+      throw error;
+    }
+  },
+
+  async updateContainerVisibility(
+    db: Database,
+    input: {
+      shape: ContainerShape;
+      showInPos: boolean;
+    },
+  ): Promise<InventoryItemView | undefined> {
+    const { rows } = await db.query<{ id: string }>(
+      `UPDATE inventory_items
+          SET show_in_pos = $2,
+              pos_section = CASE WHEN $2 THEN $3 ELSE pos_section END
+        WHERE category = 'CONTAINER'
+          AND container_shape = $1
+          AND archived_at IS NULL
+        RETURNING id`,
+      [input.shape, input.showInPos, BUILT_IN_POS_SECTIONS.CONTAINERS],
+    );
+    if (!rows[0]) return undefined;
+    return findItemById(db, rows[0].id);
+  },
+
+  async archiveMerchandiseProduct(
+    db: Database,
+    input: {
+      id: string;
+      archivedByUserId: string;
+      archivedAt: Date;
+    },
+  ): Promise<ArchiveMerchandiseResult> {
+    return db.transaction(async (tx) => {
+      const { rows: lockedRows } = await tx.query<{
+        id: string;
+        category: InventoryCategory;
+        archivedAt: Date | string | null;
+      }>(
+        `SELECT id, category, archived_at AS "archivedAt"
+           FROM inventory_items
+          WHERE id = $1
+          FOR UPDATE`,
+        [input.id],
+      );
+      const locked = lockedRows[0];
+      if (!locked) {
+        return { kind: "not-found" as const };
+      }
+      if (locked.category !== "MERCHANDISE") {
+        return { kind: "cannot-archive-container" as const };
+      }
+      if (locked.archivedAt !== null) {
+        return { kind: "already-archived" as const };
+      }
+
+      await tx.query(
+        `UPDATE inventory_items
+            SET archived_at = $2,
+                archived_by_user_id = $3,
+                show_in_pos = false
+          WHERE id = $1`,
+        [locked.id, input.archivedAt, input.archivedByUserId],
+      );
+      const updated = await findItemById(tx, locked.id);
+      return updated ? { kind: "archived" as const, item: updated } : { kind: "not-found" as const };
+    });
   },
 
   async recordOpeningStock(
     db: Database,
     input: {
-      shape: ContainerShape;
+      target: OpeningStockTarget;
       quantity: number;
       recordedByUserId: string;
       recordedAt: Date;
@@ -112,20 +566,33 @@ export const inventoryRepository = {
   ): Promise<RecordOpeningStockResult> {
     try {
       return await db.transaction(async (tx) => {
+        const whereSql =
+          input.target.kind === "shape"
+            ? `category = 'CONTAINER' AND container_shape = $1`
+            : `id = $1`;
+        const whereParam = input.target.kind === "shape" ? input.target.shape : input.target.id;
+
         const { rows: lockedRows } = await tx.query<LockedItemRow>(
           `SELECT id,
                   code,
                   name,
+                  category,
+                  container_shape AS "containerShape",
                   unit,
-                  current_quantity AS "currentQuantity"
+                  current_quantity AS "currentQuantity",
+                  stock_revision AS "stockRevision",
+                  archived_at AS "archivedAt"
              FROM inventory_items
-            WHERE category = 'CONTAINER' AND container_shape = $1
+            WHERE ${whereSql}
             FOR UPDATE`,
-          [input.shape],
+          [whereParam],
         );
         const locked = lockedRows[0];
         if (!locked) {
           return { kind: "not-found" as const };
+        }
+        if (locked.archivedAt !== null) {
+          return { kind: "archived" as const };
         }
 
         const { rows: existingCounts } = await tx.query<{ id: string }>(
@@ -134,7 +601,7 @@ export const inventoryRepository = {
         );
 
         if (existingCounts.length > 0 || locked.currentQuantity !== null) {
-          const current = await findContainerItemByShape(tx, input.shape);
+          const current = await findItemById(tx, locked.id);
           if (!current) return { kind: "not-found" as const };
           return { kind: "already-set" as const, item: current };
         }
@@ -147,11 +614,14 @@ export const inventoryRepository = {
         );
 
         await tx.query(
-          `UPDATE inventory_items SET current_quantity = $1 WHERE id = $2`,
+          `UPDATE inventory_items
+              SET current_quantity = $1,
+                  stock_revision = stock_revision + 1
+            WHERE id = $2`,
           [input.quantity, locked.id],
         );
 
-        const created = await findContainerItemByShape(tx, input.shape);
+        const created = await findItemById(tx, locked.id);
         if (!created) {
           return { kind: "not-found" as const };
         }
@@ -159,12 +629,201 @@ export const inventoryRepository = {
       });
     } catch (error) {
       if ((error as { code?: string } | null)?.code === "23505") {
-        const current = await findContainerItemByShape(db, input.shape);
+        const current = await findItemByTarget(db, input.target);
         if (current) {
           return { kind: "already-set", item: current };
         }
       }
       throw error;
     }
+  },
+
+  async recordPhysicalCountReconciliation(
+    db: Database,
+    input: {
+      target: OpeningStockTarget;
+      physicalCount: number;
+      reason: string;
+      expectedRevision: number;
+      expectedCurrentQuantity: number;
+      requestKey: string | null;
+      actorUserId: string;
+      recordedAt: Date;
+    },
+  ): Promise<ReconcileStockResult> {
+    return db.transaction(async (tx) => {
+      const whereSql =
+        input.target.kind === "shape"
+          ? `category = 'CONTAINER' AND container_shape = $1`
+          : `id = $1`;
+      const whereParam = input.target.kind === "shape" ? input.target.shape : input.target.id;
+
+      const { rows: lockedRows } = await tx.query<LockedItemRow>(
+        `SELECT id,
+                code,
+                name,
+                category,
+                container_shape AS "containerShape",
+                unit,
+                current_quantity AS "currentQuantity",
+                stock_revision AS "stockRevision",
+                archived_at AS "archivedAt"
+           FROM inventory_items
+          WHERE ${whereSql}
+          FOR UPDATE`,
+        [whereParam],
+      );
+      const locked = lockedRows[0];
+      if (!locked) {
+        return { kind: "not-found" as const };
+      }
+
+      if (input.requestKey) {
+        const { rows: existingRecRows } = await tx.query<ReconciliationDbRow>(
+          `${RECONCILIATION_SELECT} WHERE r.request_key = $1`,
+          [input.requestKey],
+        );
+        const existingRec = existingRecRows[0];
+        if (existingRec) {
+          if (
+            existingRec.itemId !== locked.id ||
+            Number(existingRec.physicalCount) !== input.physicalCount ||
+            existingRec.reason !== input.reason
+          ) {
+            return { kind: "key-conflict" as const };
+          }
+          const currentItem = await findItemById(tx, locked.id);
+          return {
+            kind: "replayed" as const,
+            item: currentItem!,
+            reconciliation: toReconciliationView(existingRec),
+          };
+        }
+      }
+
+      if (locked.archivedAt !== null) {
+        return { kind: "archived" as const };
+      }
+
+      const { rows: openingRows } = await tx.query<{ id: string }>(
+        `SELECT id FROM inventory_opening_counts WHERE item_id = $1`,
+        [locked.id],
+      );
+
+      if (openingRows.length === 0 || locked.currentQuantity === null) {
+        return { kind: "not-set" as const };
+      }
+
+      const currentQuantity = Number(locked.currentQuantity);
+      const stockRevision = Number(locked.stockRevision);
+      if (
+        stockRevision !== input.expectedRevision ||
+        currentQuantity !== input.expectedCurrentQuantity
+      ) {
+        const latestItem = await findItemById(tx, locked.id);
+        return { kind: "stale" as const, item: latestItem! };
+      }
+
+      const { rows: committedRows } = await tx.query<{ activeCommitted: number | string }>(
+        `SELECT COALESCE(SUM(quantity), 0)::integer AS "activeCommitted"
+           FROM pos_checkout_stock_commitments
+          WHERE item_id = $1
+            AND status = 'ACTIVE'`,
+        [locked.id],
+      );
+      const activeCommitted = Number(committedRows[0]?.activeCommitted ?? 0);
+      if (input.physicalCount < activeCommitted) {
+        const latestItem = await findItemById(tx, locked.id);
+        return {
+          kind: "active-commitment" as const,
+          activeCommitted,
+          item: latestItem!,
+        };
+      }
+
+      const quantityDelta = input.physicalCount - currentQuantity;
+
+      const { rows: insertedRec } = await tx.query<{ id: string }>(
+        `INSERT INTO inventory_reconciliations (
+           item_id, request_key, balance_before, physical_count, quantity_delta,
+           balance_after, unit, reason, actor_user_id, recorded_at
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+         RETURNING id`,
+        [
+          locked.id,
+          input.requestKey,
+          currentQuantity,
+          input.physicalCount,
+          quantityDelta,
+          input.physicalCount,
+          locked.unit,
+          input.reason,
+          input.actorUserId,
+          input.recordedAt,
+        ],
+      );
+      const reconciliationId = insertedRec[0]!.id;
+
+      if (quantityDelta !== 0) {
+        await tx.query(
+          `INSERT INTO inventory_stock_movements (
+             item_id, movement_type, quantity_delta, balance_before, balance_after,
+             unit, reconciliation_id, note, actor_user_id, recorded_at
+           )
+           VALUES ($1, 'PHYSICAL_COUNT_RECONCILIATION', $2, $3, $4, $5, $6, $7, $8, $9)`,
+          [
+            locked.id,
+            quantityDelta,
+            currentQuantity,
+            input.physicalCount,
+            locked.unit,
+            reconciliationId,
+            input.reason,
+            input.actorUserId,
+            input.recordedAt,
+          ],
+        );
+      }
+
+      await tx.query(
+        `UPDATE inventory_items
+            SET current_quantity = $2,
+                stock_revision = stock_revision + 1
+          WHERE id = $1`,
+        [locked.id, input.physicalCount],
+      );
+
+      const [{ rows: recRows }, updatedItem] = await Promise.all([
+        tx.query<ReconciliationDbRow>(`${RECONCILIATION_SELECT} WHERE r.id = $1`, [reconciliationId]),
+        findItemById(tx, locked.id),
+      ]);
+
+      return {
+        kind: "created" as const,
+        item: updatedItem!,
+        reconciliation: toReconciliationView(recRows[0]!),
+      };
+    });
+  },
+
+  async listReconciliations(
+    db: Queryable,
+    target: OpeningStockTarget,
+  ): Promise<{ found: boolean; reconciliations: StockReconciliationView[] }> {
+    const item = await findItemByTarget(db, target);
+    if (!item) {
+      return { found: false, reconciliations: [] };
+    }
+    const { rows } = await db.query<ReconciliationDbRow>(
+      `${RECONCILIATION_SELECT}
+        WHERE r.item_id = $1
+        ORDER BY r.recorded_at DESC, r.id DESC`,
+      [item.id],
+    );
+    return {
+      found: true,
+      reconciliations: rows.map(toReconciliationView),
+    };
   },
 };

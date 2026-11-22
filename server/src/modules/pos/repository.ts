@@ -1,14 +1,22 @@
 import type { Queryable } from "../../db/database.js";
 import {
+  aggregateMerchandiseDemand,
   type CheckoutStatus,
   type CheckoutView,
   type CatalogRefill,
+  CONTAINER_PACKAGE_DEFINITIONS,
+  type ContainerShape,
   type DaySummaryView,
   type DayView,
   formatManilaIso,
   formatSaleReference,
+  type IncludedGripoType,
   type ItemKind,
   mlToLiters,
+  type PosContainerPackageItem,
+  type PosMerchandiseItem,
+  type PosSection,
+  type PosSectionInfo,
   type PriorDaySettlementView,
   type QuoteLineItem,
   type SaleActionView,
@@ -23,6 +31,34 @@ export interface CatalogDbRow {
   displayName: string;
   unitVolumeMl: number | string;
   unitPriceCentavos: number | string;
+}
+
+export interface MerchandiseCatalogDbRow {
+  id: string;
+  code: string;
+  name: string;
+  description: string | null;
+  unit: string;
+  unitPriceCentavos: number | string;
+  posSection: PosSection;
+  currentQuantity: number | string | null;
+  activeCommitted: number | string;
+}
+
+export interface LockedMerchandiseItem {
+  id: string;
+  code: string;
+  name: string;
+  category: "CONTAINER" | "MERCHANDISE";
+  containerShape: ContainerShape | null;
+  description: string | null;
+  unit: string;
+  unitPriceCentavos: number | null;
+  showInPos: boolean;
+  posSection: PosSection | null;
+  currentQuantity: number | null;
+  archivedAt: string | null;
+  otherActiveCommitted: number;
 }
 
 export interface DayDbRow {
@@ -95,7 +131,11 @@ interface SaleItemDbRow {
   lineIndex: number | string;
   itemKind: ItemKind;
   catalogCode: string | null;
-  waterType: WaterType;
+  waterType: WaterType | null;
+  productId: string | null;
+  stockUnit: string | null;
+  posSection: PosSection | null;
+  includedGripo: IncludedGripoType | null;
   displayLabel: string;
   unitVolumeMl: number | string;
   unitPriceCentavos: number | string;
@@ -156,6 +196,31 @@ export function toCatalogRefill(row: CatalogDbRow): CatalogRefill {
     unitVolumeMl,
     unitVolumeLiters: mlToLiters(unitVolumeMl),
     unitPriceCentavos: Number(row.unitPriceCentavos),
+  };
+}
+
+export function toPosMerchandiseItem(row: MerchandiseCatalogDbRow): PosMerchandiseItem {
+  const currentQuantity = row.currentQuantity === null ? null : Number(row.currentQuantity);
+  const activeCommitted = Number(row.activeCommitted ?? 0);
+  const availableQuantity =
+    currentQuantity === null ? null : Math.max(0, currentQuantity - activeCommitted);
+  const stockStatus =
+    currentQuantity === null
+      ? "NOT_SET"
+      : availableQuantity === 0
+        ? "OUT_OF_STOCK"
+        : "IN_STOCK";
+  return {
+    id: row.id,
+    code: row.code,
+    name: row.name,
+    description: row.description ?? null,
+    unit: row.unit,
+    unitPriceCentavos: Number(row.unitPriceCentavos),
+    posSection: row.posSection,
+    stockStatus,
+    currentQuantity,
+    availableQuantity,
   };
 }
 
@@ -375,6 +440,10 @@ async function loadSaleViews(
               item_kind AS "itemKind",
               catalog_code AS "catalogCode",
               water_type AS "waterType",
+              inventory_item_id AS "productId",
+              stock_unit AS "stockUnit",
+              pos_section AS "posSection",
+              included_gripo AS "includedGripo",
               display_label AS "displayLabel",
               unit_volume_ml AS "unitVolumeMl",
               unit_price_centavos AS "unitPriceCentavos",
@@ -409,6 +478,16 @@ async function loadSaleViews(
       kind: row.itemKind,
       catalogCode: row.catalogCode,
       waterType: row.waterType,
+      ...(row.itemKind === "MERCHANDISE" || row.itemKind === "CONTAINER_PACKAGE"
+        ? {
+            productId: row.productId,
+            stockUnit: row.stockUnit,
+            posSection: row.posSection,
+            ...(row.itemKind === "CONTAINER_PACKAGE"
+              ? { includedGripo: row.includedGripo }
+              : {}),
+          }
+        : {}),
       displayLabel: row.displayLabel,
       unitVolumeMl,
       unitVolumeLiters: mlToLiters(unitVolumeMl),
@@ -477,6 +556,288 @@ export const posRepository = {
         ORDER BY CASE water_type WHEN 'PURIFIED' THEN 1 ELSE 2 END, code ASC`,
     );
     return rows.map(toCatalogRefill);
+  },
+
+  async listPosSections(db: Queryable): Promise<PosSectionInfo[]> {
+    const { rows } = await db.query<{
+      code: string;
+      name: string;
+      isBuiltIn: boolean;
+      sortOrder: number | string;
+    }>(
+      `SELECT code,
+              name,
+              is_built_in AS "isBuiltIn",
+              sort_order AS "sortOrder"
+         FROM inventory_pos_sections
+        ORDER BY sort_order ASC, LOWER(name) ASC, created_at ASC`,
+    );
+    return rows.map((row) => ({
+      code: row.code,
+      name: row.name,
+      isBuiltIn: Boolean(row.isBuiltIn),
+      sortOrder: Number(row.sortOrder),
+    }));
+  },
+
+  async listVisiblePosContainerPackages(db: Queryable): Promise<PosContainerPackageItem[]> {
+    const { rows } = await db.query<{
+      id: string;
+      containerShape: ContainerShape;
+      unit: string;
+      currentQuantity: number | string | null;
+      activeCommitted: number | string;
+    }>(
+      `SELECT i.id,
+              i.container_shape AS "containerShape",
+              i.unit,
+              i.current_quantity AS "currentQuantity",
+              COALESCE(c.committed_qty, 0) AS "activeCommitted"
+         FROM inventory_items i
+         LEFT JOIN (
+           SELECT item_id, SUM(quantity)::integer AS committed_qty
+             FROM pos_checkout_stock_commitments
+            WHERE status = 'ACTIVE'
+            GROUP BY item_id
+         ) c ON c.item_id = i.id
+        WHERE i.category = 'CONTAINER'
+          AND i.show_in_pos = true
+          AND i.archived_at IS NULL
+        ORDER BY CASE i.container_shape WHEN 'ROUND' THEN 1 WHEN 'SLIM' THEN 2 ELSE 3 END`,
+    );
+
+    const byShape = new Map<
+      ContainerShape,
+      {
+        id: string;
+        unit: string;
+        currentQuantity: number | null;
+        availableQuantity: number | null;
+        stockStatus: "NOT_SET" | "OUT_OF_STOCK" | "IN_STOCK";
+      }
+    >();
+
+    for (const row of rows) {
+      const currentQuantity = row.currentQuantity === null ? null : Number(row.currentQuantity);
+      const activeCommitted = Number(row.activeCommitted ?? 0);
+      const availableQuantity =
+        currentQuantity === null ? null : Math.max(0, currentQuantity - activeCommitted);
+      const stockStatus =
+        currentQuantity === null
+          ? "NOT_SET"
+          : availableQuantity === 0
+            ? "OUT_OF_STOCK"
+            : "IN_STOCK";
+      byShape.set(row.containerShape, {
+        id: row.id,
+        unit: row.unit,
+        currentQuantity,
+        availableQuantity,
+        stockStatus,
+      });
+    }
+
+    const packages: PosContainerPackageItem[] = [];
+    for (const def of CONTAINER_PACKAGE_DEFINITIONS) {
+      const container = byShape.get(def.shape);
+      if (!container) continue;
+      packages.push({
+        packageCode: def.packageCode,
+        shape: def.shape,
+        productId: container.id,
+        name: def.name,
+        description: def.description,
+        unit: container.unit,
+        waterType: def.waterType,
+        unitVolumeMl: def.unitVolumeMl,
+        unitVolumeLiters: def.unitVolumeLiters,
+        unitPriceCentavos: def.unitPriceCentavos,
+        posSection: "CONTAINERS",
+        stockStatus: container.stockStatus,
+        currentQuantity: container.currentQuantity,
+        availableQuantity: container.availableQuantity,
+      });
+    }
+    return packages;
+  },
+
+  async listVisiblePosMerchandise(db: Queryable): Promise<PosMerchandiseItem[]> {
+    const { rows } = await db.query<MerchandiseCatalogDbRow>(
+      `SELECT i.id,
+              i.code,
+              i.name,
+              i.description,
+              i.unit,
+              i.unit_price_centavos AS "unitPriceCentavos",
+              i.pos_section AS "posSection",
+              i.current_quantity AS "currentQuantity",
+              COALESCE(c.committed_qty, 0) AS "activeCommitted"
+         FROM inventory_items i
+         LEFT JOIN inventory_pos_sections s ON s.code = i.pos_section
+         LEFT JOIN (
+           SELECT item_id, SUM(quantity)::integer AS committed_qty
+             FROM pos_checkout_stock_commitments
+            WHERE status = 'ACTIVE'
+            GROUP BY item_id
+         ) c ON c.item_id = i.id
+        WHERE i.category = 'MERCHANDISE'
+          AND i.show_in_pos = true
+          AND i.archived_at IS NULL
+        ORDER BY COALESCE(s.sort_order, 100) ASC,
+                 LOWER(COALESCE(s.name, '')) ASC,
+                 LOWER(i.name) ASC,
+                 i.created_at ASC`,
+    );
+    return rows.map(toPosMerchandiseItem);
+  },
+
+  async lockMerchandiseItemsForUpdate(
+    tx: Queryable,
+    productIds: string[],
+    excludeCheckoutId?: string,
+  ): Promise<Map<string, LockedMerchandiseItem>> {
+    const uniqueSorted = Array.from(new Set(productIds)).sort();
+    const map = new Map<string, LockedMerchandiseItem>();
+    if (uniqueSorted.length === 0) return map;
+
+    const { rows } = await tx.query<{
+      id: string;
+      code: string;
+      name: string;
+      category: "CONTAINER" | "MERCHANDISE";
+      containerShape: ContainerShape | null;
+      description: string | null;
+      unit: string;
+      unitPriceCentavos: number | string | null;
+      showInPos: boolean;
+      posSection: PosSection | null;
+      currentQuantity: number | string | null;
+      archivedAt: Date | string | null;
+    }>(
+      `SELECT id,
+              code,
+              name,
+              category,
+              container_shape AS "containerShape",
+              description,
+              unit,
+              unit_price_centavos AS "unitPriceCentavos",
+              show_in_pos AS "showInPos",
+              pos_section AS "posSection",
+              current_quantity AS "currentQuantity",
+              archived_at AS "archivedAt"
+         FROM inventory_items
+        WHERE id = ANY($1::uuid[])
+        ORDER BY id ASC
+        FOR UPDATE`,
+      [uniqueSorted],
+    );
+
+    const committedRes = excludeCheckoutId
+      ? await tx.query<{ itemId: string; committedQty: number | string }>(
+          `SELECT item_id AS "itemId", SUM(quantity)::integer AS "committedQty"
+             FROM pos_checkout_stock_commitments
+            WHERE item_id = ANY($1::uuid[])
+              AND status = 'ACTIVE'
+              AND checkout_id <> $2
+            GROUP BY item_id`,
+          [uniqueSorted, excludeCheckoutId],
+        )
+      : await tx.query<{ itemId: string; committedQty: number | string }>(
+          `SELECT item_id AS "itemId", SUM(quantity)::integer AS "committedQty"
+             FROM pos_checkout_stock_commitments
+            WHERE item_id = ANY($1::uuid[])
+              AND status = 'ACTIVE'
+            GROUP BY item_id`,
+          [uniqueSorted],
+        );
+
+    const committedByItem = new Map<string, number>();
+    for (const c of committedRes.rows) {
+      committedByItem.set(c.itemId, Number(c.committedQty));
+    }
+
+    for (const row of rows) {
+      if (row.category === "MERCHANDISE" && row.unitPriceCentavos === null) continue;
+      map.set(row.id, {
+        id: row.id,
+        code: row.code,
+        name: row.name,
+        category: row.category,
+        containerShape: row.containerShape,
+        description: row.description ?? null,
+        unit: row.unit,
+        unitPriceCentavos: row.unitPriceCentavos === null ? null : Number(row.unitPriceCentavos),
+        showInPos: Boolean(row.showInPos),
+        posSection: row.posSection ?? null,
+        currentQuantity: row.currentQuantity === null ? null : Number(row.currentQuantity),
+        archivedAt: row.archivedAt ? formatManilaIso(toDate(row.archivedAt)) : null,
+        otherActiveCommitted: committedByItem.get(row.id) ?? 0,
+      });
+    }
+    return map;
+  },
+
+  async lockPublishedContainerShapesForUpdate(
+    tx: Queryable,
+    shapes: ContainerShape[],
+  ): Promise<Map<ContainerShape, LockedMerchandiseItem>> {
+    const uniqueSorted = Array.from(new Set(shapes)).sort();
+    const byShape = new Map<ContainerShape, LockedMerchandiseItem>();
+    if (uniqueSorted.length === 0) return byShape;
+
+    const { rows } = await tx.query<{ id: string }>(
+      `SELECT id
+         FROM inventory_items
+        WHERE category = 'CONTAINER'
+          AND container_shape = ANY($1::text[])
+        ORDER BY id ASC`,
+      [uniqueSorted],
+    );
+    const byId = await this.lockMerchandiseItemsForUpdate(
+      tx,
+      rows.map((r) => r.id),
+    );
+    for (const item of byId.values()) {
+      if (item.containerShape) {
+        byShape.set(item.containerShape, item);
+      }
+    }
+    return byShape;
+  },
+
+  async upsertActiveCommitments(
+    tx: Queryable,
+    checkoutId: string,
+    demandMap: ReadonlyMap<string, number>,
+    now: Date,
+  ): Promise<void> {
+    for (const [itemId, qty] of demandMap.entries()) {
+      await tx.query(
+        `INSERT INTO pos_checkout_stock_commitments
+           (checkout_id, item_id, quantity, status, created_at, resolved_at)
+         VALUES ($1, $2, $3, 'ACTIVE', $4, NULL)
+         ON CONFLICT (checkout_id, item_id)
+         DO UPDATE SET quantity = EXCLUDED.quantity,
+                       status = 'ACTIVE',
+                       resolved_at = NULL`,
+        [checkoutId, itemId, qty, now],
+      );
+    }
+  },
+
+  async releaseCommitmentsForCheckout(
+    tx: Queryable,
+    checkoutId: string,
+    now: Date,
+  ): Promise<void> {
+    await tx.query(
+      `UPDATE pos_checkout_stock_commitments
+          SET status = 'RELEASED',
+              resolved_at = $2
+        WHERE checkout_id = $1 AND status = 'ACTIVE'`,
+      [checkoutId, now],
+    );
   },
 
   async lockDaysTable(tx: Queryable): Promise<void> {
@@ -836,20 +1197,30 @@ export const posRepository = {
         WHERE id = $1`,
       [input.checkoutId, input.reason, input.now],
     );
+    await this.releaseCommitmentsForCheckout(tx, input.checkoutId, input.now);
     return (await this.findCheckoutByReference(tx, input.reference))!;
   },
 
   async clearUnpaidDraftsForDay(tx: Queryable, dayId: string, now: Date): Promise<string[]> {
-    const { rows } = await tx.query<{ reference: string }>(
+    const { rows } = await tx.query<{ id: string; reference: string }>(
       `UPDATE pos_checkouts
           SET status = 'CANCELLED_DRAFT',
               resolution_reason = 'CLEARED_ON_END_DAY',
               cancellation_origin = 'AUTO_END_DAY',
               updated_at = $2
         WHERE business_day_id = $1 AND status = 'DRAFT'
-        RETURNING reference`,
+        RETURNING id, reference`,
       [dayId, now],
     );
+    if (rows.length > 0) {
+      await tx.query(
+        `UPDATE pos_checkout_stock_commitments
+            SET status = 'RELEASED',
+                resolved_at = $2
+          WHERE checkout_id = ANY($1::uuid[]) AND status = 'ACTIVE'`,
+        [rows.map((r) => r.id), now],
+      );
+    }
     return rows.map((r) => r.reference).sort();
   },
 
@@ -867,6 +1238,7 @@ export const posRepository = {
       totalVolumeMl: number;
       createdByUserId: string;
       items: QuoteLineItem[];
+      lockedMerchandise?: ReadonlyMap<string, LockedMerchandiseItem>;
       now: Date;
     },
   ): Promise<{ sale: SaleView; checkout: CheckoutView }> {
@@ -897,16 +1269,21 @@ export const posRepository = {
     for (const item of input.items) {
       await tx.query(
         `INSERT INTO pos_sale_items (
-           sale_id, line_index, item_kind, catalog_code, water_type, display_label,
+           sale_id, line_index, item_kind, catalog_code, water_type,
+           inventory_item_id, stock_unit, pos_section, included_gripo, display_label,
            unit_volume_ml, unit_price_centavos, quantity, line_total_centavos, line_volume_ml
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
         [
           saleId,
           item.lineIndex,
           item.kind,
           item.catalogCode,
           item.waterType,
+          item.productId ?? null,
+          item.stockUnit ?? null,
+          item.posSection ?? null,
+          item.includedGripo ?? null,
           item.displayLabel,
           item.unitVolumeMl,
           item.unitPriceCentavos,
@@ -915,6 +1292,59 @@ export const posRepository = {
           item.lineVolumeMl,
         ],
       );
+    }
+
+    const demandMap = aggregateMerchandiseDemand(input.items);
+    if (demandMap.size > 0) {
+      for (const [productId, qty] of demandMap.entries()) {
+        const locked = input.lockedMerchandise?.get(productId);
+        if (!locked || locked.currentQuantity === null) {
+          throw new Error(`Missing locked stock for merchandise item ${productId}`);
+        }
+        const balanceBefore = locked.currentQuantity;
+        const balanceAfter = balanceBefore - qty;
+        if (balanceAfter < 0) {
+          throw new Error(`Negative stock prevented for merchandise item ${productId}`);
+        }
+
+        await tx.query(
+          `UPDATE inventory_items
+              SET current_quantity = $2,
+                  stock_revision = stock_revision + 1
+            WHERE id = $1`,
+          [productId, balanceAfter],
+        );
+
+        await tx.query(
+          `INSERT INTO inventory_stock_movements (
+             item_id, movement_type, quantity_delta, balance_before, balance_after,
+             unit, pos_sale_id, pos_reference, actor_user_id, recorded_at
+           )
+           VALUES ($1, 'POS_SALE', $2, $3, $4, $5, $6, $7, $8, $9)`,
+          [
+            productId,
+            -qty,
+            balanceBefore,
+            balanceAfter,
+            locked.unit,
+            saleId,
+            input.reference,
+            input.createdByUserId,
+            input.now,
+          ],
+        );
+
+        await tx.query(
+          `INSERT INTO pos_checkout_stock_commitments
+             (checkout_id, item_id, quantity, status, created_at, resolved_at)
+           VALUES ($1, $2, $3, 'CONSUMED', $4, $4)
+           ON CONFLICT (checkout_id, item_id)
+           DO UPDATE SET quantity = EXCLUDED.quantity,
+                         status = 'CONSUMED',
+                         resolved_at = $4`,
+          [input.checkoutId, productId, qty, input.now],
+        );
+      }
     }
 
     await tx.query(
@@ -1054,9 +1484,10 @@ export const posRepository = {
       settledByUserId: string;
       settledAt: Date;
       note: string | null;
+      lockedMerchandise?: Map<string, LockedMerchandiseItem>;
     },
   ): Promise<{ settlement: PriorDaySettlementView; checkout: CheckoutView }> {
-    await tx.query(
+    const { rows: settlementRows } = await tx.query<{ id: string }>(
       `INSERT INTO pos_prior_day_settlements (
          checkout_id, checkout_reference, original_business_day_id,
          original_business_date, settlement_date, outcome,
@@ -1069,7 +1500,8 @@ export const posRepository = {
        VALUES (
          $1, $2, $3, $4::date, $5::date, 'PAID_AND_DELIVERED',
          $6, $7, $8, $9, $10, $11::jsonb, $12, $13, $14, true, true, $15, $16, $17
-       )`,
+       )
+       RETURNING id`,
       [
         input.checkoutId,
         input.checkoutReference,
@@ -1090,6 +1522,7 @@ export const posRepository = {
         input.note,
       ],
     );
+    const settlementId = settlementRows[0]!.id;
 
     await tx.query(
       `UPDATE pos_checkouts
@@ -1106,6 +1539,61 @@ export const posRepository = {
         input.settledAt,
       ],
     );
+
+    const demandMap = aggregateMerchandiseDemand(input.items);
+    if (demandMap.size > 0) {
+      for (const productId of Array.from(demandMap.keys()).sort()) {
+        const qty = demandMap.get(productId)!;
+        const locked = input.lockedMerchandise?.get(productId);
+        if (!locked || locked.currentQuantity === null) {
+          throw new Error(`Missing locked stock for merchandise item ${productId}`);
+        }
+        const balanceBefore = locked.currentQuantity;
+        const balanceAfter = balanceBefore - qty;
+        if (balanceAfter < 0) {
+          throw new Error(`Negative stock prevented for merchandise item ${productId}`);
+        }
+
+        await tx.query(
+          `UPDATE inventory_items
+              SET current_quantity = $2,
+                  stock_revision = stock_revision + 1
+            WHERE id = $1`,
+          [productId, balanceAfter],
+        );
+
+        await tx.query(
+          `INSERT INTO inventory_stock_movements (
+             item_id, movement_type, quantity_delta, balance_before, balance_after,
+             unit, pos_sale_id, prior_day_settlement_id, pos_reference, actor_user_id, recorded_at, note
+           )
+           VALUES ($1, 'PRIOR_DAY_SETTLEMENT', $2, $3, $4, $5, NULL, $6, $7, $8, $9, $10)`,
+          [
+            productId,
+            -qty,
+            balanceBefore,
+            balanceAfter,
+            locked.unit,
+            settlementId,
+            input.checkoutReference,
+            input.settledByUserId,
+            input.settledAt,
+            input.note,
+          ],
+        );
+
+        await tx.query(
+          `INSERT INTO pos_checkout_stock_commitments
+             (checkout_id, item_id, quantity, status, created_at, resolved_at)
+           VALUES ($1, $2, $3, 'CONSUMED', $4, $4)
+           ON CONFLICT (checkout_id, item_id)
+           DO UPDATE SET quantity = EXCLUDED.quantity,
+                         status = 'CONSUMED',
+                         resolved_at = $4`,
+          [input.checkoutId, productId, qty, input.settledAt],
+        );
+      }
+    }
 
     const [settlement, checkout] = await Promise.all([
       this.findPriorDaySettlementByCheckoutId(tx, input.checkoutId),

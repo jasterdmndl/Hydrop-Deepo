@@ -6,6 +6,7 @@ import {
   formatLiters,
   formatManilaTimeOnly,
   formatManilaTimestamp,
+  isPriorDayMerchandiseOnly,
   type PriorDaySettlementView,
   type SalesListResponse,
   type SaleView,
@@ -30,6 +31,25 @@ function saleStatusPill(status: SaleView["status"]): string {
 
 function saleActionLabel(action: SaleView["actionHistory"][number]["action"]): string {
   return action === "SALE_SAVED" ? "Sale saved" : "Sale voided";
+}
+
+function formatHistoryItemsSubtitle(
+  totalContainers: number,
+  totalVolumeLiters: number,
+  items: SaleView["items"],
+): string {
+  const merchQty = items
+    .filter((item) => item.kind === "MERCHANDISE" || item.kind === "CONTAINER_PACKAGE")
+    .reduce((sum, item) => sum + item.quantity, 0);
+  const parts: string[] = [];
+  if (totalContainers > 0 || merchQty === 0) {
+    parts.push(`${totalContainers} container${totalContainers === 1 ? "" : "s"}`);
+  }
+  if (merchQty > 0) {
+    parts.push(`${merchQty} item${merchQty === 1 ? "" : "s"}`);
+  }
+  parts.push(formatLiters(totalVolumeLiters));
+  return parts.join(" · ");
 }
 
 export function SaleHistory({
@@ -358,8 +378,11 @@ export function SaleHistory({
                             >
                               <strong className="mono-ref">{sale.reference}</strong>
                               <span className="muted-sm">
-                                {sale.totalContainers} container{sale.totalContainers === 1 ? "" : "s"} ·{" "}
-                                {formatLiters(sale.totalVolumeLiters)}
+                                {formatHistoryItemsSubtitle(
+                                  sale.totalContainers,
+                                  sale.totalVolumeLiters,
+                                  sale.items,
+                                )}
                               </span>
                             </button>
                           </td>
@@ -542,14 +565,20 @@ export function SaleHistory({
                     <dt>Confirmed by Owner</dt>
                     <dd>{selectedSettlement.settledBy}</dd>
                   </div>
-                  <div className="detail-list__row">
-                    <dt>Containers</dt>
-                    <dd>{selectedSettlement.totalContainers}</dd>
-                  </div>
-                  <div className="detail-list__row">
-                    <dt>Water volume</dt>
-                    <dd>{formatLiters(selectedSettlement.totalVolumeLiters)}</dd>
-                  </div>
+                  {(!isPriorDayMerchandiseOnly(selectedSettlement.items) ||
+                    selectedSettlement.totalContainers > 0 ||
+                    selectedSettlement.totalVolumeLiters > 0) && (
+                    <>
+                      <div className="detail-list__row">
+                        <dt>Containers</dt>
+                        <dd>{selectedSettlement.totalContainers}</dd>
+                      </div>
+                      <div className="detail-list__row">
+                        <dt>Water volume</dt>
+                        <dd>{formatLiters(selectedSettlement.totalVolumeLiters)}</dd>
+                      </div>
+                    </>
+                  )}
                 </dl>
 
                 <ul className="pos-summary-lines">
@@ -558,8 +587,8 @@ export function SaleHistory({
                       <div className="pos-summary-line__meta">
                         <strong>{item.displayLabel}</strong>
                         <span className="muted-sm">
-                          {item.quantity} × {formatCentavos(item.unitPriceCentavos)} ·{" "}
-                          {formatLiters(item.lineVolumeLiters)}
+                          {item.quantity} × {formatCentavos(item.unitPriceCentavos)}
+                          {item.kind !== "MERCHANDISE" ? ` · ${formatLiters(item.lineVolumeLiters)}` : ""}
                         </span>
                       </div>
                       <span className="pos-summary-line__amount">
@@ -594,8 +623,12 @@ export function SaleHistory({
                   <h3>Settlement confirmation</h3>
                   <ul className="pos-action-log">
                     <li>
-                      <strong>Payment kept &amp; refill delivered</strong> confirmed by{" "}
-                      {selectedSettlement.settledBy} ·{" "}
+                      <strong>
+                        {isPriorDayMerchandiseOnly(selectedSettlement.items)
+                          ? "Payment kept & all items handed over"
+                          : "Payment kept & refill delivered"}
+                      </strong>{" "}
+                      confirmed by {selectedSettlement.settledBy} ·{" "}
                       {formatManilaTimestamp(selectedSettlement.settledAt)}
                       {selectedSettlement.note ? ` — ${selectedSettlement.note}` : ""}
                     </li>
@@ -634,8 +667,12 @@ export function SaleHistory({
                       <div className="pos-summary-line__meta">
                         <strong>{item.displayLabel}</strong>
                         <span className="muted-sm">
-                          {item.quantity} × {formatCentavos(item.unitPriceCentavos)} ·{" "}
-                          {formatLiters(item.lineVolumeLiters)}
+                          {item.quantity} × {formatCentavos(item.unitPriceCentavos)}
+                          {item.kind === "STANDARD" ||
+                          item.kind === "CUSTOM" ||
+                          (item.kind === "CONTAINER_PACKAGE" && item.lineVolumeLiters > 0)
+                            ? ` · ${formatLiters(item.lineVolumeLiters)}`
+                            : ""}
                         </span>
                       </div>
                       <span className="pos-summary-line__amount">{formatCentavos(item.lineTotalCentavos)}</span>

@@ -2,13 +2,68 @@ import { Router } from "express";
 import type { Database } from "../../db/database.js";
 import { sendError } from "../../shared/http.js";
 import { requireRole } from "../auth/guards.js";
-import { inventoryPermissions, parseContainerShape, parseOpeningQuantity } from "./inventory.js";
-import { inventoryRepository as repo } from "./repository.js";
+import {
+  BUILT_IN_POS_SECTIONS,
+  inventoryPermissions,
+  isUuid,
+  MAX_OPENING_QUANTITY,
+  parseContainerShape,
+  parseOpeningQuantity,
+  parsePhysicalCount,
+  parsePosSectionCode,
+  parsePosSectionName,
+  parseProductDescription,
+  parseProductName,
+  parseReconciliationReason,
+  parseStockUnit,
+  parseUnitPriceCentavos,
+} from "./inventory.js";
+import { inventoryRepository as repo, type OpeningStockTarget } from "./repository.js";
+
+const CREATE_PRODUCT_KEYS = new Set([
+  "name",
+  "description",
+  "unit",
+  "unitConfirmed",
+  "unitPriceCentavos",
+  "showInPos",
+  "posSection",
+]);
+
+const UPDATE_PRODUCT_KEYS = new Set([
+  "name",
+  "description",
+  "unitPriceCentavos",
+  "showInPos",
+  "posSection",
+]);
+
+const CREATE_SECTION_KEYS = new Set(["name"]);
+const CONTAINER_VISIBILITY_KEYS = new Set(["showInPos"]);
+const RECONCILE_KEYS = new Set([
+  "physicalCount",
+  "reason",
+  "expectedRevision",
+  "expectedCurrentQuantity",
+  "requestKey",
+]);
+
+function resolveItemTarget(rawKey: string): OpeningStockTarget | null {
+  const shape = parseContainerShape(rawKey);
+  if (shape) {
+    return { kind: "shape", shape };
+  }
+  if (isUuid(rawKey)) {
+    return { kind: "id", id: rawKey };
+  }
+  return null;
+}
 
 /**
  * Inventory HTTP endpoints, mounted at /api/inventory behind the shared
- * module-access guards. Both roles can view; only OWNER can initialize
- * Round and Slim opening stock once per shape (DEC-065, INV-005).
+ * module-access guards. Both roles can view; only OWNER can manage products,
+ * custom POS sections, container visibility, archiving, opening stock, and
+ * INV-009 physical-count reconciliations.
  */
 export function inventoryRoutes(db: Database): Router {
   const router = Router();
@@ -18,47 +73,418 @@ export function inventoryRoutes(db: Database): Router {
   });
 
   router.get("/items", async (req, res) => {
-    const items = await repo.listContainerItems(db);
+    const includeArchived = req.query.includeArchived === "true";
+    const [items, posSections] = await Promise.all([
+      repo.listItems(db, { includeArchived }),
+      repo.listPosSections(db),
+    ]);
     res.json({
       permissions: inventoryPermissions(req.auth!.user.role),
       items,
+      posSections,
     });
   });
 
-  router.post("/items/:shape/opening-stock", requireRole("OWNER"), async (req, res) => {
-    const shape = parseContainerShape(req.params.shape);
-    if (!shape) {
-      sendError(res, 400, "VALIDATION_FAILED", "Choose Round or Slim container.");
+  router.post("/pos-sections", requireRole("OWNER"), async (req, res) => {
+    const body = req.body as Record<string, unknown> | null | undefined;
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      sendError(res, 400, "VALIDATION_FAILED", "Enter a valid POS section name.");
+      return;
+    }
+
+    const extraKeys = Object.keys(body).filter((key) => !CREATE_SECTION_KEYS.has(key));
+    if (extraKeys.length > 0) {
+      sendError(res, 400, "VALIDATION_FAILED", "Unexpected POS section fields provided.");
+      return;
+    }
+
+    const name = parsePosSectionName(body.name);
+    if (!name) {
+      sendError(res, 400, "VALIDATION_FAILED", "Enter a POS section name (1 to 60 characters).");
+      return;
+    }
+
+    const outcome = await repo.createPosSection(db, {
+      name,
+      createdByUserId: req.auth!.user.id,
+      createdAt: req.now,
+    });
+
+    if (outcome.kind === "duplicate-name") {
+      sendError(res, 409, "SECTION_ALREADY_EXISTS", `A POS section named "${name}" already exists.`);
+      return;
+    }
+
+    res.status(201).json({ section: outcome.section });
+  });
+
+  router.post("/products", requireRole("OWNER"), async (req, res) => {
+    const body = req.body as Record<string, unknown> | null | undefined;
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      sendError(res, 400, "VALIDATION_FAILED", "Enter valid product details.");
+      return;
+    }
+
+    const extraKeys = Object.keys(body).filter((key) => !CREATE_PRODUCT_KEYS.has(key));
+    if (extraKeys.length > 0) {
+      sendError(res, 400, "VALIDATION_FAILED", "Unexpected product fields provided.");
+      return;
+    }
+
+    const name = parseProductName(body.name);
+    if (!name) {
+      sendError(res, 400, "VALIDATION_FAILED", "Enter a product name (1 to 80 characters).");
+      return;
+    }
+
+    const descResult = parseProductDescription(body.description);
+    if (!descResult.ok) {
+      sendError(res, 400, "VALIDATION_FAILED", "Description must be 160 characters or fewer.");
+      return;
+    }
+
+    const unit = parseStockUnit(body.unit);
+    if (!unit) {
+      sendError(res, 400, "VALIDATION_FAILED", "Enter the confirmed stock unit (e.g. pcs).");
+      return;
+    }
+
+    if (body.unitConfirmed !== true) {
+      sendError(res, 400, "VALIDATION_FAILED", "Confirm the stock recording unit before saving.");
+      return;
+    }
+
+    const unitPriceCentavos = parseUnitPriceCentavos(body.unitPriceCentavos);
+    if (unitPriceCentavos === null) {
+      sendError(res, 400, "VALIDATION_FAILED", "Enter a valid positive selling price.");
+      return;
+    }
+
+    const showInPos = body.showInPos === undefined ? false : body.showInPos;
+    if (typeof showInPos !== "boolean") {
+      sendError(res, 400, "VALIDATION_FAILED", "Show in POS must be checked or unchecked.");
+      return;
+    }
+
+    const sectionResult = parsePosSectionCode(body.posSection);
+    if (!sectionResult.ok) {
+      sendError(res, 400, "VALIDATION_FAILED", "Choose a valid POS section for this product.");
+      return;
+    }
+
+    let validatedSection: string | null = sectionResult.value;
+    if (validatedSection !== null) {
+      if (validatedSection === BUILT_IN_POS_SECTIONS.CONTAINERS) {
+        sendError(
+          res,
+          400,
+          "VALIDATION_FAILED",
+          "The Containers POS section is reserved for Round and Slim containers.",
+        );
+        return;
+      }
+      const foundSection = await repo.findPosSectionByCode(db, validatedSection);
+      if (!foundSection) {
+        sendError(res, 400, "VALIDATION_FAILED", "Choose a valid POS section for this product.");
+        return;
+      }
+      validatedSection = foundSection.code;
+    }
+
+    if (showInPos && !validatedSection) {
+      sendError(
+        res,
+        400,
+        "VALIDATION_FAILED",
+        "Choose a POS section when Show in POS is enabled.",
+      );
+      return;
+    }
+
+    const outcome = await repo.createMerchandiseProduct(db, {
+      name,
+      description: descResult.value,
+      unit,
+      unitPriceCentavos,
+      showInPos,
+      posSection: validatedSection,
+      createdByUserId: req.auth!.user.id,
+      createdAt: req.now,
+    });
+
+    if (outcome.kind === "duplicate-name") {
+      sendError(res, 409, "PRODUCT_ALREADY_EXISTS", `A product named "${name}" already exists.`);
+      return;
+    }
+
+    res.status(201).json({ item: outcome.item });
+  });
+
+  router.patch("/products/:id", requireRole("OWNER"), async (req, res) => {
+    const id = typeof req.params.id === "string" ? req.params.id.trim() : "";
+    if (!isUuid(id)) {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid product identifier.");
       return;
     }
 
     const body = req.body as Record<string, unknown> | null | undefined;
     if (!body || typeof body !== "object" || Array.isArray(body)) {
-      sendError(res, 400, "VALIDATION_FAILED", "Enter a whole number of containers (0 or more).");
+      sendError(res, 400, "VALIDATION_FAILED", "Enter valid product changes.");
+      return;
+    }
+
+    const keys = Object.keys(body);
+    if (keys.length === 0 || keys.some((key) => !UPDATE_PRODUCT_KEYS.has(key))) {
+      sendError(res, 400, "VALIDATION_FAILED", "Provide valid product fields to update.");
+      return;
+    }
+
+    const existing = await repo.findMerchandiseById(db, id);
+    if (!existing) {
+      sendError(res, 404, "NOT_FOUND", "Merchandise product not found.");
+      return;
+    }
+    if (existing.archivedAt !== null) {
+      sendError(
+        res,
+        409,
+        "PRODUCT_ARCHIVED",
+        "Archived products cannot be edited in active Inventory.",
+      );
+      return;
+    }
+
+    let nextName = existing.name;
+    if ("name" in body) {
+      const parsedName = parseProductName(body.name);
+      if (!parsedName) {
+        sendError(res, 400, "VALIDATION_FAILED", "Enter a product name (1 to 80 characters).");
+        return;
+      }
+      nextName = parsedName;
+    }
+
+    let nextDescription = existing.description;
+    if ("description" in body) {
+      const parsedDesc = parseProductDescription(body.description);
+      if (!parsedDesc.ok) {
+        sendError(res, 400, "VALIDATION_FAILED", "Description must be 160 characters or fewer.");
+        return;
+      }
+      nextDescription = parsedDesc.value;
+    }
+
+    let nextPrice = existing.unitPriceCentavos;
+    if ("unitPriceCentavos" in body) {
+      const parsedPrice = parseUnitPriceCentavos(body.unitPriceCentavos);
+      if (parsedPrice === null) {
+        sendError(res, 400, "VALIDATION_FAILED", "Enter a valid positive selling price.");
+        return;
+      }
+      nextPrice = parsedPrice;
+    }
+
+    let nextShowInPos = existing.showInPos;
+    if ("showInPos" in body) {
+      if (typeof body.showInPos !== "boolean") {
+        sendError(res, 400, "VALIDATION_FAILED", "Show in POS must be checked or unchecked.");
+        return;
+      }
+      nextShowInPos = body.showInPos;
+    }
+
+    let nextPosSection = existing.posSection;
+    if ("posSection" in body) {
+      const parsedSection = parsePosSectionCode(body.posSection);
+      if (!parsedSection.ok) {
+        sendError(res, 400, "VALIDATION_FAILED", "Choose a valid POS section for this product.");
+        return;
+      }
+      if (parsedSection.value === null) {
+        nextPosSection = null;
+      } else {
+        if (parsedSection.value === BUILT_IN_POS_SECTIONS.CONTAINERS) {
+          sendError(
+            res,
+            400,
+            "VALIDATION_FAILED",
+            "The Containers POS section is reserved for Round and Slim containers.",
+          );
+          return;
+        }
+        const foundSection = await repo.findPosSectionByCode(db, parsedSection.value);
+        if (!foundSection) {
+          sendError(res, 400, "VALIDATION_FAILED", "Choose a valid POS section for this product.");
+          return;
+        }
+        nextPosSection = foundSection.code;
+      }
+    }
+
+    if (nextShowInPos && (!nextPosSection || nextPrice === null || nextPrice <= 0)) {
+      sendError(
+        res,
+        400,
+        "VALIDATION_FAILED",
+        "Choose a valid POS section and selling price before showing this product in POS.",
+      );
+      return;
+    }
+
+    const outcome = await repo.updateMerchandiseProduct(db, {
+      id,
+      name: nextName,
+      description: nextDescription,
+      unitPriceCentavos: nextPrice!,
+      showInPos: nextShowInPos,
+      posSection: nextPosSection,
+    });
+
+    if (outcome.kind === "not-found") {
+      sendError(res, 404, "NOT_FOUND", "Merchandise product not found.");
+      return;
+    }
+    if (outcome.kind === "archived") {
+      sendError(
+        res,
+        409,
+        "PRODUCT_ARCHIVED",
+        "Archived products cannot be edited in active Inventory.",
+      );
+      return;
+    }
+    if (outcome.kind === "duplicate-name") {
+      sendError(
+        res,
+        409,
+        "PRODUCT_ALREADY_EXISTS",
+        `A product named "${nextName}" already exists.`,
+      );
+      return;
+    }
+
+    res.json({ item: outcome.item });
+  });
+
+  router.patch("/containers/:shape", requireRole("OWNER"), async (req, res) => {
+    const rawShape = typeof req.params.shape === "string" ? req.params.shape : "";
+    const shape = parseContainerShape(rawShape);
+    if (!shape) {
+      sendError(res, 400, "VALIDATION_FAILED", "Choose a valid container shape (ROUND or SLIM).");
+      return;
+    }
+
+    const body = req.body as Record<string, unknown> | null | undefined;
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      sendError(res, 400, "VALIDATION_FAILED", "Provide Show in POS setting.");
+      return;
+    }
+
+    const keys = Object.keys(body);
+    if (
+      keys.length === 0 ||
+      keys.some((key) => !CONTAINER_VISIBILITY_KEYS.has(key)) ||
+      typeof body.showInPos !== "boolean"
+    ) {
+      sendError(res, 400, "VALIDATION_FAILED", "Show in POS must be checked or unchecked.");
+      return;
+    }
+
+    const updated = await repo.updateContainerVisibility(db, {
+      shape,
+      showInPos: body.showInPos,
+    });
+    if (!updated) {
+      sendError(res, 404, "NOT_FOUND", "Container product not found.");
+      return;
+    }
+
+    res.json({ item: updated });
+  });
+
+  router.post("/products/:id/archive", requireRole("OWNER"), async (req, res) => {
+    const id = typeof req.params.id === "string" ? req.params.id.trim() : "";
+    if (!isUuid(id)) {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid product identifier.");
+      return;
+    }
+
+    const outcome = await repo.archiveMerchandiseProduct(db, {
+      id,
+      archivedByUserId: req.auth!.user.id,
+      archivedAt: req.now,
+    });
+
+    if (outcome.kind === "not-found") {
+      sendError(res, 404, "NOT_FOUND", "Merchandise product not found.");
+      return;
+    }
+    if (outcome.kind === "cannot-archive-container") {
+      sendError(
+        res,
+        400,
+        "VALIDATION_FAILED",
+        "Round and Slim containers cannot be archived.",
+      );
+      return;
+    }
+    if (outcome.kind === "already-archived") {
+      sendError(
+        res,
+        409,
+        "PRODUCT_ALREADY_ARCHIVED",
+        "This product has already been archived.",
+      );
+      return;
+    }
+
+    res.json({ item: outcome.item });
+  });
+
+  router.post("/items/:itemKey/opening-stock", requireRole("OWNER"), async (req, res) => {
+    const rawKey = typeof req.params.itemKey === "string" ? req.params.itemKey.trim() : "";
+    const target = resolveItemTarget(rawKey);
+    if (!target) {
+      sendError(res, 400, "VALIDATION_FAILED", "Choose a valid Inventory item.");
+      return;
+    }
+
+    const body = req.body as Record<string, unknown> | null | undefined;
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      sendError(res, 400, "VALIDATION_FAILED", "Enter a whole number (0 or more).");
       return;
     }
 
     const extraKeys = Object.keys(body).filter((key) => key !== "quantity");
     if (extraKeys.length > 0) {
-      sendError(res, 400, "VALIDATION_FAILED", "Enter a whole number of containers (0 or more).");
+      sendError(res, 400, "VALIDATION_FAILED", "Enter a whole number (0 or more).");
       return;
     }
 
     const quantity = parseOpeningQuantity(body.quantity);
     if (quantity === null) {
-      sendError(res, 400, "VALIDATION_FAILED", "Enter a whole number of containers (0 or more).");
+      sendError(res, 400, "VALIDATION_FAILED", "Enter a whole number (0 or more).");
       return;
     }
 
     const outcome = await repo.recordOpeningStock(db, {
-      shape,
+      target,
       quantity,
       recordedByUserId: req.auth!.user.id,
       recordedAt: req.now,
     });
 
     if (outcome.kind === "not-found") {
-      sendError(res, 404, "NOT_FOUND", "Container item not found.");
+      sendError(res, 404, "NOT_FOUND", "Inventory item not found.");
+      return;
+    }
+    if (outcome.kind === "archived") {
+      sendError(
+        res,
+        409,
+        "PRODUCT_ARCHIVED",
+        "Archived products cannot record new opening counts.",
+      );
       return;
     }
 
@@ -74,6 +500,167 @@ export function inventoryRoutes(db: Database): Router {
     }
 
     res.status(201).json({ item: outcome.item });
+  });
+
+  router.get("/items/:itemKey/reconciliations", async (req, res) => {
+    const rawKey = typeof req.params.itemKey === "string" ? req.params.itemKey.trim() : "";
+    const target = resolveItemTarget(rawKey);
+    if (!target) {
+      sendError(res, 400, "VALIDATION_FAILED", "Choose a valid Inventory item.");
+      return;
+    }
+
+    const result = await repo.listReconciliations(db, target);
+    if (!result.found) {
+      sendError(res, 404, "NOT_FOUND", "Inventory item not found.");
+      return;
+    }
+
+    res.json({ reconciliations: result.reconciliations });
+  });
+
+  router.post("/items/:itemKey/reconciliations", requireRole("OWNER"), async (req, res) => {
+    const rawKey = typeof req.params.itemKey === "string" ? req.params.itemKey.trim() : "";
+    const target = resolveItemTarget(rawKey);
+    if (!target) {
+      sendError(res, 400, "VALIDATION_FAILED", "Choose a valid Inventory item.");
+      return;
+    }
+
+    const body = req.body as Record<string, unknown> | null | undefined;
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      sendError(res, 400, "VALIDATION_FAILED", "Enter a valid physical count and reason.");
+      return;
+    }
+
+    const extraKeys = Object.keys(body).filter((key) => !RECONCILE_KEYS.has(key));
+    if (extraKeys.length > 0) {
+      sendError(res, 400, "VALIDATION_FAILED", "Unexpected stock correction fields provided.");
+      return;
+    }
+
+    const physicalCount = parsePhysicalCount(body.physicalCount);
+    if (physicalCount === null) {
+      sendError(
+        res,
+        400,
+        "VALIDATION_FAILED",
+        `Enter a whole physical count from 0 to ${MAX_OPENING_QUANTITY.toLocaleString("en-US")}.`,
+      );
+      return;
+    }
+
+    const reason = parseReconciliationReason(body.reason);
+    if (!reason) {
+      sendError(
+        res,
+        400,
+        "VALIDATION_FAILED",
+        "Enter a factual reason for the physical count (1 to 240 characters).",
+      );
+      return;
+    }
+
+    if (
+      typeof body.expectedRevision !== "number" ||
+      !Number.isInteger(body.expectedRevision) ||
+      body.expectedRevision < 0
+    ) {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid stock revision baseline.");
+      return;
+    }
+
+    if (
+      typeof body.expectedCurrentQuantity !== "number" ||
+      !Number.isInteger(body.expectedCurrentQuantity) ||
+      body.expectedCurrentQuantity < 0
+    ) {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid recorded stock baseline.");
+      return;
+    }
+
+    let requestKey: string | null = null;
+    if (body.requestKey !== undefined) {
+      if (
+        typeof body.requestKey !== "string" ||
+        !body.requestKey.trim() ||
+        body.requestKey.trim().length > 128
+      ) {
+        sendError(res, 400, "VALIDATION_FAILED", "Invalid reconciliation request key.");
+        return;
+      }
+      requestKey = body.requestKey.trim();
+    }
+
+    const outcome = await repo.recordPhysicalCountReconciliation(db, {
+      target,
+      physicalCount,
+      reason,
+      expectedRevision: body.expectedRevision,
+      expectedCurrentQuantity: body.expectedCurrentQuantity,
+      requestKey,
+      actorUserId: req.auth!.user.id,
+      recordedAt: req.now,
+    });
+
+    if (outcome.kind === "not-found") {
+      sendError(res, 404, "NOT_FOUND", "Inventory item not found.");
+      return;
+    }
+    if (outcome.kind === "archived") {
+      sendError(
+        res,
+        409,
+        "PRODUCT_ARCHIVED",
+        "Archived products cannot receive stock reconciliations.",
+      );
+      return;
+    }
+    if (outcome.kind === "not-set") {
+      sendError(
+        res,
+        409,
+        "OPENING_STOCK_NOT_SET",
+        "Record an opening stock count before correcting current stock.",
+      );
+      return;
+    }
+    if (outcome.kind === "key-conflict") {
+      sendError(
+        res,
+        409,
+        "REQUEST_KEY_CONFLICT",
+        "This reconciliation request key was already used for a different physical count.",
+      );
+      return;
+    }
+    if (outcome.kind === "stale") {
+      res.status(409).json({
+        error: {
+          code: "STALE_STOCK_COUNT",
+          message: `Recorded stock for ${outcome.item.name} changed to ${outcome.item.currentQuantity} ${outcome.item.unit} during counting. Refresh and confirm a new physical recount.`,
+        },
+        item: outcome.item,
+      });
+      return;
+    }
+    if (outcome.kind === "active-commitment") {
+      res.status(409).json({
+        error: {
+          code: "ACTIVE_PAYMENT_COMMITMENT",
+          message: `Cannot set stock for ${outcome.item.name} to ${physicalCount} ${outcome.item.unit} while ${outcome.activeCommitted} ${outcome.item.unit} are reserved by an in-progress POS cash payment. Finish or cancel the pending checkout first.`,
+        },
+        activeCommitted: outcome.activeCommitted,
+        item: outcome.item,
+      });
+      return;
+    }
+
+    res.status(outcome.kind === "replayed" ? 200 : 201).json({
+      item: outcome.item,
+      reconciliation: outcome.reconciliation,
+      replayed: outcome.kind === "replayed",
+    });
   });
 
   return router;

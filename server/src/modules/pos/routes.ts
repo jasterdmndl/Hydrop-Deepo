@@ -4,15 +4,21 @@ import type { Database } from "../../db/database.js";
 import { sendError } from "../../shared/http.js";
 import { requireRole } from "../auth/guards.js";
 import {
+  type LockedMerchandiseItem,
   posRepository as repo,
   toCheckoutView,
   toClosedDayView,
   toDayViewWithSummary,
 } from "./repository.js";
 import {
+  aggregateMerchandiseDemand,
   buildValidatedQuote,
   type CatalogRefill,
   type CheckoutView,
+  classifyCheckoutComposition,
+  CONTAINER_PACKAGE_DEFINITIONS,
+  type ContainerPackageCode,
+  containerShapeFromPackageCode,
   deriveCheckoutLookup,
   deriveDayStatus,
   formatManilaDate,
@@ -25,9 +31,21 @@ import {
   MAX_TOTAL_CENTAVOS,
   MAX_UNIT_PRICE_CENTAVOS,
   MIN_UNIT_PRICE_CENTAVOS,
+  type PosContainerPackageItem,
+  type PosMerchandiseItem,
+  type QuoteLineItem,
   submittedItemsMatchQuote,
   type WaterType,
 } from "./sales.js";
+
+function hasMissingContainerGripo(items: QuoteLineItem[]): boolean {
+  return items.some(
+    (item) =>
+      item.kind === "CONTAINER_PACKAGE" &&
+      item.includedGripo !== "PUSH_TYPE" &&
+      item.includedGripo !== "TWIST_TYPE",
+  );
+}
 
 const standardItemSchema = z
   .object({
@@ -47,7 +65,47 @@ const customItemSchema = z
   })
   .strict();
 
-const cartItemSchema = z.discriminatedUnion("kind", [standardItemSchema, customItemSchema]);
+const merchandiseItemSchema = z
+  .object({
+    kind: z.literal("MERCHANDISE"),
+    productId: z.string().uuid(),
+    quantity: z.number().int().min(1).max(MAX_QUANTITY_PER_LINE),
+  })
+  .strict();
+
+const containerPackageItemSchema = z
+  .object({
+    kind: z.literal("CONTAINER_PACKAGE"),
+    packageCode: z.enum([
+      "ROUND_EMPTY",
+      "ROUND_PURIFIED",
+      "ROUND_ALKALINE",
+      "SLIM_EMPTY",
+      "SLIM_PURIFIED",
+      "SLIM_ALKALINE",
+    ]),
+    includedGripo: z.enum(["PUSH_TYPE", "TWIST_TYPE"]),
+    quantity: z.number().int().min(1).max(MAX_QUANTITY_PER_LINE),
+  })
+  .strict();
+
+const confirmContainerPackageItemSchema = containerPackageItemSchema.extend({
+  includedGripo: z.enum(["PUSH_TYPE", "TWIST_TYPE"]).optional(),
+});
+
+const cartItemSchema = z.discriminatedUnion("kind", [
+  standardItemSchema,
+  customItemSchema,
+  merchandiseItemSchema,
+  containerPackageItemSchema,
+]);
+
+const confirmCartItemSchema = z.discriminatedUnion("kind", [
+  standardItemSchema,
+  customItemSchema,
+  merchandiseItemSchema,
+  confirmContainerPackageItemSchema,
+]);
 
 const startDayBody = z
   .object({
@@ -74,7 +132,7 @@ const prepareCheckoutBody = z
 const confirmCheckoutBody = z
   .object({
     cashReceivedCentavos: z.number().int().min(1).max(MAX_CASH_CENTAVOS),
-    items: z.array(cartItemSchema).min(1).max(MAX_ITEMS_PER_SALE).optional(),
+    items: z.array(confirmCartItemSchema).min(1).max(MAX_ITEMS_PER_SALE).optional(),
     expectedTotalCentavos: z.number().int().min(1).max(MAX_TOTAL_CENTAVOS).optional(),
   })
   .strict();
@@ -91,7 +149,8 @@ const cancelCheckoutBody = z
 const settlePriorDayCheckoutBody = z
   .object({
     paymentKeptConfirmed: z.boolean(),
-    refillDeliveredConfirmed: z.boolean(),
+    refillDeliveredConfirmed: z.boolean().optional(),
+    itemsHandedOverConfirmed: z.boolean().optional(),
     cashReceivedCentavos: z.number().int().min(1).max(MAX_CASH_CENTAVOS).optional(),
     note: z.string().trim().max(240).optional(),
   })
@@ -136,8 +195,13 @@ export function posRoutes(db: Database): Router {
   router.use(requireRole("OWNER", "CASHIER"));
 
   router.get("/catalog", async (_req, res) => {
-    const items = await repo.listActiveCatalog(db);
-    res.json({ items });
+    const [items, merchandise, containerPackages, posSections] = await Promise.all([
+      repo.listActiveCatalog(db),
+      repo.listVisiblePosMerchandise(db),
+      repo.listVisiblePosContainerPackages(db),
+      repo.listPosSections(db),
+    ]);
+    res.json({ items, merchandise, containerPackages, posSections });
   });
 
   router.get("/day", async (req, res) => {
@@ -466,17 +530,18 @@ export function posRoutes(db: Database): Router {
 
     const prepareKey = keyResult.key;
     const todayDate = formatManilaDate(req.now);
-    const catalog = await repo.listActiveCatalog(db);
-    const catalogByWaterType = new Map<WaterType, CatalogRefill>(
-      catalog.map((item) => [item.waterType, item]),
-    );
-
-    const quoteResult = buildValidatedQuote(parsed.data.items, catalogByWaterType);
-    if (!quoteResult.ok) {
-      sendError(res, 400, "VALIDATION_FAILED", quoteResult.message);
-      return;
-    }
-    const quote = quoteResult.quote;
+    const merchandiseIds = parsed.data.items
+      .filter(
+        (item): item is { kind: "MERCHANDISE"; productId: string; quantity: number } =>
+          item.kind === "MERCHANDISE",
+      )
+      .map((item) => item.productId);
+    const containerShapes = parsed.data.items
+      .filter(
+        (item): item is Extract<typeof item, { kind: "CONTAINER_PACKAGE" }> =>
+          item.kind === "CONTAINER_PACKAGE",
+      )
+      .map((item) => containerShapeFromPackageCode(item.packageCode));
 
     const outcome = await db.transaction(async (tx) => {
       if (prepareKey) {
@@ -485,7 +550,8 @@ export function posRoutes(db: Database): Router {
           if (existing.createdByUserId !== req.auth!.user.id) {
             return { kind: "forbidden" as const };
           }
-          if (existing.quoteHash !== quote.quoteHash) {
+          const existingView = toCheckoutView(existing);
+          if (!submittedItemsMatchQuote(parsed.data.items, existingView.items)) {
             return { kind: "key-conflict" as const };
           }
           return { kind: "replayed" as const, row: existing };
@@ -505,6 +571,127 @@ export function posRoutes(db: Database): Router {
         return { kind: "previous-day-open" as const };
       }
 
+      const catalog = await repo.listActiveCatalog(tx);
+      const catalogByWaterType = new Map<WaterType, CatalogRefill>(
+        catalog.map((item) => [item.waterType, item]),
+      );
+
+      const merchandiseById = new Map<string, PosMerchandiseItem>();
+      const containerPackagesByCode = new Map<ContainerPackageCode, PosContainerPackageItem>();
+      const lockedById = new Map<string, LockedMerchandiseItem>();
+
+      if (merchandiseIds.length > 0) {
+        const lockedMerchandise = await repo.lockMerchandiseItemsForUpdate(tx, merchandiseIds);
+        for (const [id, item] of lockedMerchandise.entries()) {
+          lockedById.set(id, item);
+          if (
+            item.category !== "MERCHANDISE" ||
+            !item.showInPos ||
+            item.archivedAt !== null ||
+            !item.posSection ||
+            item.unitPriceCentavos === null
+          ) {
+            continue;
+          }
+          const available =
+            item.currentQuantity === null
+              ? null
+              : Math.max(0, item.currentQuantity - item.otherActiveCommitted);
+          merchandiseById.set(id, {
+            id: item.id,
+            code: item.code,
+            name: item.name,
+            description: item.description,
+            unit: item.unit,
+            unitPriceCentavos: item.unitPriceCentavos,
+            posSection: item.posSection,
+            stockStatus:
+              item.currentQuantity === null
+                ? "NOT_SET"
+                : available === 0
+                  ? "OUT_OF_STOCK"
+                  : "IN_STOCK",
+            currentQuantity: item.currentQuantity,
+            availableQuantity: available,
+          });
+        }
+      }
+
+      if (containerShapes.length > 0) {
+        const lockedContainers = await repo.lockPublishedContainerShapesForUpdate(tx, containerShapes);
+        for (const item of lockedContainers.values()) {
+          lockedById.set(item.id, item);
+          if (!item.showInPos || item.archivedAt !== null || !item.containerShape) continue;
+          const available =
+            item.currentQuantity === null
+              ? null
+              : Math.max(0, item.currentQuantity - item.otherActiveCommitted);
+          const stockStatus =
+            item.currentQuantity === null
+              ? "NOT_SET"
+              : available === 0
+                ? "OUT_OF_STOCK"
+                : "IN_STOCK";
+          for (const def of CONTAINER_PACKAGE_DEFINITIONS) {
+            if (def.shape !== item.containerShape) continue;
+            containerPackagesByCode.set(def.packageCode, {
+              packageCode: def.packageCode,
+              shape: def.shape,
+              productId: item.id,
+              name: def.name,
+              description: def.description,
+              unit: item.unit,
+              waterType: def.waterType,
+              unitVolumeMl: def.unitVolumeMl,
+              unitVolumeLiters: def.unitVolumeLiters,
+              unitPriceCentavos: def.unitPriceCentavos,
+              posSection: "CONTAINERS",
+              stockStatus,
+              currentQuantity: item.currentQuantity,
+              availableQuantity: available,
+            });
+          }
+        }
+      }
+
+      const quoteResult = buildValidatedQuote(
+        parsed.data.items,
+        catalogByWaterType,
+        merchandiseById,
+        containerPackagesByCode,
+      );
+      if (!quoteResult.ok) {
+        if (quoteResult.code === "PRODUCT_UNAVAILABLE") {
+          return { kind: "product-unavailable" as const, message: quoteResult.message };
+        }
+        return { kind: "validation-failed" as const, message: quoteResult.message };
+      }
+      const quote = quoteResult.quote;
+
+      const demandMap = aggregateMerchandiseDemand(quote.items);
+      for (const [productId, demandedQty] of demandMap.entries()) {
+        const locked = lockedById.get(productId);
+        if (!locked || !locked.showInPos || locked.archivedAt !== null) {
+          return {
+            kind: "product-unavailable" as const,
+            message: "One or more selected merchandise items are unavailable in POS.",
+          };
+        }
+        if (locked.currentQuantity === null) {
+          return {
+            kind: "insufficient-stock" as const,
+            message: `Opening stock for ${locked.name} is not set yet.`,
+          };
+        }
+        const available = Math.max(0, locked.currentQuantity - locked.otherActiveCommitted);
+        if (available < demandedQty) {
+          return {
+            kind: "insufficient-stock" as const,
+            message: `Insufficient stock for ${locked.name} (${available} ${locked.unit} available).`,
+          };
+        }
+      }
+
       const reference = await repo.allocateNextReference(tx, openDay.id, openDay.businessDate);
       const created = await repo.insertCheckout(tx, {
         reference,
@@ -521,6 +708,19 @@ export function posRoutes(db: Database): Router {
       });
       return { kind: "created" as const, row: created };
     });
+
+    if (outcome.kind === "validation-failed") {
+      sendError(res, 400, "VALIDATION_FAILED", outcome.message);
+      return;
+    }
+    if (outcome.kind === "product-unavailable") {
+      sendError(res, 400, "PRODUCT_UNAVAILABLE", outcome.message);
+      return;
+    }
+    if (outcome.kind === "insufficient-stock") {
+      sendError(res, 409, "INSUFFICIENT_STOCK", outcome.message);
+      return;
+    }
 
     if (outcome.kind === "forbidden") {
       sendError(
@@ -638,6 +838,44 @@ export function posRoutes(db: Database): Router {
         return { kind: "replayed" as const, checkout: toCheckoutView(checkoutRow) };
       }
 
+      const checkoutView = toCheckoutView(checkoutRow);
+      if (hasMissingContainerGripo(checkoutView.items)) {
+        return { kind: "missing-gripo-choice" as const };
+      }
+      const demandMap = aggregateMerchandiseDemand(checkoutView.items);
+      if (demandMap.size > 0) {
+        const lockedMerchandise = await repo.lockMerchandiseItemsForUpdate(
+          tx,
+          Array.from(demandMap.keys()),
+          checkoutRow.id,
+        );
+        for (const [productId, demandedQty] of demandMap.entries()) {
+          const locked = lockedMerchandise.get(productId);
+          if (!locked || locked.archivedAt !== null) {
+            return {
+              kind: "product-unavailable" as const,
+              message: locked
+                ? `${locked.name} has been archived and cannot enter cash payment.`
+                : "One or more selected merchandise items are no longer available.",
+            };
+          }
+          if (locked.currentQuantity === null) {
+            return {
+              kind: "insufficient-stock" as const,
+              message: `Opening stock for ${locked.name} is not set yet.`,
+            };
+          }
+          const available = Math.max(0, locked.currentQuantity - locked.otherActiveCommitted);
+          if (available < demandedQty) {
+            return {
+              kind: "insufficient-stock" as const,
+              message: `Insufficient stock for ${locked.name} (${available} ${locked.unit} available).`,
+            };
+          }
+        }
+        await repo.upsertActiveCommitments(tx, checkoutRow.id, demandMap, req.now);
+      }
+
       const updated = await repo.markCheckoutPaymentPending(tx, {
         checkoutId: checkoutRow.id,
         reference,
@@ -645,6 +883,24 @@ export function posRoutes(db: Database): Router {
       });
       return { kind: "started" as const, checkout: toCheckoutView(updated) };
     });
+
+    if (outcome.kind === "missing-gripo-choice") {
+      sendError(
+        res,
+        409,
+        "GRIPO_CHOICE_REQUIRED",
+        "Select Push-Type or Twist-Type gripo before starting cash payment. Return to selection to update this unpaid draft.",
+      );
+      return;
+    }
+    if (outcome.kind === "product-unavailable") {
+      sendError(res, 409, "PRODUCT_UNAVAILABLE", outcome.message);
+      return;
+    }
+    if (outcome.kind === "insufficient-stock") {
+      sendError(res, 409, "INSUFFICIENT_STOCK", outcome.message);
+      return;
+    }
 
     if (outcome.kind === "not-found") {
       sendError(res, 404, "NOT_FOUND", "Checkout reference not found.");
@@ -880,6 +1136,13 @@ export function posRoutes(db: Database): Router {
           return { kind: "cancelled" as const };
         }
 
+        if (
+          (checkoutRow.status === "DRAFT" || checkoutRow.status === "CANCELLED_DRAFT") &&
+          hasMissingContainerGripo(checkoutView.items)
+        ) {
+          return { kind: "missing-gripo-choice" as const };
+        }
+
         const changeCentavos = body.cashReceivedCentavos - checkoutView.totalCentavos;
 
         if (day.closedAt !== null) {
@@ -910,6 +1173,46 @@ export function posRoutes(db: Database): Router {
           return { kind: "cancelled" as const };
         }
 
+        const demandMap = aggregateMerchandiseDemand(checkoutView.items);
+        let lockedMerchandise:
+          | Awaited<ReturnType<typeof repo.lockMerchandiseItemsForUpdate>>
+          | undefined;
+        if (demandMap.size > 0) {
+          lockedMerchandise = await repo.lockMerchandiseItemsForUpdate(
+            tx,
+            Array.from(demandMap.keys()),
+            checkoutRow.id,
+          );
+          for (const [productId, demandedQty] of demandMap.entries()) {
+            const locked = lockedMerchandise.get(productId);
+            if (!locked) {
+              return {
+                kind: "product-unavailable" as const,
+                message: "One or more selected merchandise items are no longer available.",
+              };
+            }
+            if (checkoutRow.status === "DRAFT" && locked.archivedAt !== null) {
+              return {
+                kind: "product-unavailable" as const,
+                message: `${locked.name} has been archived and cannot be sold from an unpaid draft.`,
+              };
+            }
+            if (locked.currentQuantity === null) {
+              return {
+                kind: "insufficient-stock" as const,
+                message: `Opening stock for ${locked.name} is not set yet.`,
+              };
+            }
+            const available = Math.max(0, locked.currentQuantity - locked.otherActiveCommitted);
+            if (available < demandedQty) {
+              return {
+                kind: "insufficient-stock" as const,
+                message: `Insufficient stock for ${locked.name} (${available} ${locked.unit} available).`,
+              };
+            }
+          }
+        }
+
         const saved = await repo.insertSaleAtomic(tx, {
           reference,
           checkoutId: checkoutRow.id,
@@ -922,6 +1225,7 @@ export function posRoutes(db: Database): Router {
           totalVolumeMl: checkoutView.totalVolumeMl,
           createdByUserId: req.auth!.user.id,
           items: checkoutView.items,
+          lockedMerchandise,
           now: req.now,
         });
 
@@ -929,6 +1233,24 @@ export function posRoutes(db: Database): Router {
       });
     } finally {
       inFlight.leave(reference);
+    }
+
+    if (outcome.kind === "missing-gripo-choice") {
+      sendError(
+        res,
+        409,
+        "GRIPO_CHOICE_REQUIRED",
+        "Select Push-Type or Twist-Type gripo before confirming payment. Return to selection to update this unpaid draft.",
+      );
+      return;
+    }
+    if (outcome.kind === "product-unavailable") {
+      sendError(res, 409, "PRODUCT_UNAVAILABLE", outcome.message);
+      return;
+    }
+    if (outcome.kind === "insufficient-stock") {
+      sendError(res, 409, "INSUFFICIENT_STOCK", outcome.message);
+      return;
     }
 
     if (outcome.kind === "not-found") {
@@ -1139,12 +1461,15 @@ export function posRoutes(db: Database): Router {
     }
 
     const body = parsed.data;
-    if (!body.paymentKeptConfirmed || !body.refillDeliveredConfirmed) {
+    if (
+      !body.paymentKeptConfirmed ||
+      (!body.refillDeliveredConfirmed && !body.itemsHandedOverConfirmed)
+    ) {
       sendError(
         res,
         400,
         "VALIDATION_FAILED",
-        "Confirm both that payment was kept and that the refill was delivered. Leave all other outcomes pending.",
+        "Confirm both that payment was kept and that all items were delivered or handed over. Leave all other outcomes pending.",
       );
       return;
     }
@@ -1181,6 +1506,31 @@ export function posRoutes(db: Database): Router {
       }
 
       const checkoutView = toCheckoutView(checkoutRow);
+      const composition = classifyCheckoutComposition(checkoutView.items);
+
+      if (composition === "MIXED") {
+        return {
+          kind: "not-settlable" as const,
+          message:
+            "Mixed refill and merchandise prior-day settlement is not supported yet; leave pending for Owner review.",
+        };
+      }
+
+      if (composition === "REFILL_ONLY" && !body.refillDeliveredConfirmed) {
+        return {
+          kind: "validation-failed" as const,
+          message:
+            "Confirm both that payment was kept and that the refill was delivered. Leave all other outcomes pending.",
+        };
+      }
+
+      if (composition === "MERCHANDISE_ONLY" && !body.itemsHandedOverConfirmed) {
+        return {
+          kind: "validation-failed" as const,
+          message:
+            "Confirm both that payment was kept and that all items were handed over. Leave all other outcomes pending.",
+        };
+      }
 
       if (checkoutRow.status === "SAVED") {
         const existingSale = await repo.findSaleByCheckoutId(tx, checkoutRow.id);
@@ -1260,6 +1610,42 @@ export function posRoutes(db: Database): Router {
       const effectiveChange =
         effectiveCash !== null ? effectiveCash - checkoutView.totalCentavos : null;
 
+      let lockedMerchandise:
+        | Awaited<ReturnType<typeof repo.lockMerchandiseItemsForUpdate>>
+        | undefined;
+      if (composition === "MERCHANDISE_ONLY") {
+        const demandMap = aggregateMerchandiseDemand(checkoutView.items);
+        if (demandMap.size > 0) {
+          lockedMerchandise = await repo.lockMerchandiseItemsForUpdate(
+            tx,
+            Array.from(demandMap.keys()),
+            checkoutRow.id,
+          );
+          for (const [productId, demandedQty] of demandMap.entries()) {
+            const locked = lockedMerchandise.get(productId);
+            if (!locked) {
+              return {
+                kind: "not-settlable" as const,
+                message: "One or more merchandise items on this checkout no longer exist.",
+              };
+            }
+            if (locked.currentQuantity === null) {
+              return {
+                kind: "insufficient-stock" as const,
+                message: `Opening stock for ${locked.name} is not set yet.`,
+              };
+            }
+            const available = Math.max(0, locked.currentQuantity - locked.otherActiveCommitted);
+            if (available < demandedQty) {
+              return {
+                kind: "insufficient-stock" as const,
+                message: `Insufficient stock to settle ${locked.name} (${available} ${locked.unit} available).`,
+              };
+            }
+          }
+        }
+      }
+
       const originalPaymentStartedAt = checkoutRow.paymentStartedAt
         ? checkoutRow.paymentStartedAt instanceof Date
           ? checkoutRow.paymentStartedAt
@@ -1289,6 +1675,7 @@ export function posRoutes(db: Database): Router {
         settledByUserId: req.auth!.user.id,
         settledAt: req.now,
         note: body.note?.trim() || null,
+        lockedMerchandise,
       });
 
       return {
@@ -1300,6 +1687,14 @@ export function posRoutes(db: Database): Router {
 
     if (outcome.kind === "not-found") {
       sendError(res, 404, "NOT_FOUND", "Checkout reference not found.");
+      return;
+    }
+    if (outcome.kind === "validation-failed") {
+      sendError(res, 400, "VALIDATION_FAILED", outcome.message);
+      return;
+    }
+    if (outcome.kind === "insufficient-stock") {
+      sendError(res, 409, "INSUFFICIENT_STOCK", outcome.message);
       return;
     }
     if (outcome.kind === "not-settlable") {

@@ -39,6 +39,20 @@ function pillClassForTone(tone: RecoveryTone): string {
   }
 }
 
+function formatRecoveryCountPill(items: PendingCheckoutRecovery["quoteItems"], totalContainers: number): string {
+  const merchQty = items
+    .filter((item) => item.kind === "MERCHANDISE" || item.kind === "CONTAINER_PACKAGE")
+    .reduce((sum, item) => sum + item.quantity, 0);
+  const parts: string[] = [];
+  if (totalContainers > 0 || merchQty === 0) {
+    parts.push(`${totalContainers} container${totalContainers === 1 ? "" : "s"}`);
+  }
+  if (merchQty > 0) {
+    parts.push(`${merchQty} item${merchQty === 1 ? "" : "s"}`);
+  }
+  return parts.join(" · ");
+}
+
 function StatusBadgeIcon({ tone }: { tone: RecoveryTone }) {
   if (tone === "success") {
     return (
@@ -300,7 +314,7 @@ export function CheckoutRecovery({
           <div className="detail-card__header">
             <h2>Current sale</h2>
             <span className="pill pill--scheduled">
-              {presentation.amounts.totalContainers} container{presentation.amounts.totalContainers === 1 ? "" : "s"}
+              {formatRecoveryCountPill(presentation.amounts.items, presentation.amounts.totalContainers)}
             </span>
           </div>
 
@@ -310,7 +324,12 @@ export function CheckoutRecovery({
                 <div className="pos-summary-line__meta">
                   <strong>{item.displayLabel}</strong>
                   <span className="muted-sm">
-                    {item.quantity} × {formatCentavos(item.unitPriceCentavos)} · {formatLiters(item.lineVolumeLiters)}
+                    {item.quantity} × {formatCentavos(item.unitPriceCentavos)}
+                    {item.kind === "STANDARD" ||
+                    item.kind === "CUSTOM" ||
+                    (item.kind === "CONTAINER_PACKAGE" && item.lineVolumeLiters > 0)
+                      ? ` · ${formatLiters(item.lineVolumeLiters)}`
+                      : ""}
                   </span>
                 </div>
                 <span className="pos-summary-line__amount">{formatCentavos(item.lineTotalCentavos)}</span>

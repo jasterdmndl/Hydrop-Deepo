@@ -1,7 +1,21 @@
 /** Pure POS domain view types, formatting, cart scoping, and recovery state machine. */
 
 export type WaterType = "PURIFIED" | "ALKALINE";
-export type ItemKind = "STANDARD" | "CUSTOM";
+export type ItemKind = "STANDARD" | "CUSTOM" | "MERCHANDISE" | "CONTAINER_PACKAGE";
+export type PosSection = string;
+export type ContainerShape = "ROUND" | "SLIM";
+export type IncludedGripoType = "PUSH_TYPE" | "TWIST_TYPE";
+export type ContainerPackageCode =
+  | "ROUND_EMPTY"
+  | "ROUND_PURIFIED"
+  | "ROUND_ALKALINE"
+  | "SLIM_EMPTY"
+  | "SLIM_PURIFIED"
+  | "SLIM_ALKALINE";
+
+export function formatIncludedGripoLabel(gripo: IncludedGripoType): string {
+  return gripo === "PUSH_TYPE" ? "Push-Type gripo" : "Twist-Type gripo";
+}
 export type DayState = "NOT_STARTED" | "OPEN" | "CLOSED" | "PREVIOUS_DAY_OPEN";
 export type CheckoutStatus =
   | "DRAFT"
@@ -27,25 +41,77 @@ export interface CatalogRefill {
   unitPriceCentavos: number;
 }
 
+export interface PosSectionInfo {
+  code: string;
+  name: string;
+  isBuiltIn: boolean;
+  sortOrder: number;
+}
+
+export interface PosContainerPackageItem {
+  packageCode: ContainerPackageCode;
+  shape: ContainerShape;
+  productId: string;
+  name: string;
+  description: string;
+  unit: string;
+  waterType: WaterType | null;
+  unitVolumeMl: number;
+  unitVolumeLiters: number;
+  unitPriceCentavos: number;
+  posSection: "CONTAINERS";
+  stockStatus: "NOT_SET" | "OUT_OF_STOCK" | "IN_STOCK";
+  currentQuantity: number | null;
+  availableQuantity: number | null;
+}
+
+export interface PosMerchandiseItem {
+  id: string;
+  code: string;
+  name: string;
+  description: string | null;
+  unit: string;
+  unitPriceCentavos: number;
+  posSection: PosSection;
+  stockStatus: "NOT_SET" | "OUT_OF_STOCK" | "IN_STOCK";
+  currentQuantity: number | null;
+  availableQuantity: number | null;
+}
+
 export type CartItemInput =
   | {
-    kind: "STANDARD";
-    waterType: WaterType;
-    quantity: number;
-  }
+      kind: "STANDARD";
+      waterType: WaterType;
+      quantity: number;
+    }
   | {
-    kind: "CUSTOM";
-    waterType: WaterType;
-    unitVolumeLiters: number;
-    unitPriceCentavos: number;
-    quantity: number;
-  };
+      kind: "CUSTOM";
+      waterType: WaterType;
+      unitVolumeLiters: number;
+      unitPriceCentavos: number;
+      quantity: number;
+    }
+  | {
+      kind: "MERCHANDISE";
+      productId: string;
+      quantity: number;
+    }
+  | {
+      kind: "CONTAINER_PACKAGE";
+      packageCode: ContainerPackageCode;
+      includedGripo?: IncludedGripoType;
+      quantity: number;
+    };
 
 export interface QuoteLineItem {
   lineIndex: number;
   kind: ItemKind;
   catalogCode: string | null;
-  waterType: WaterType;
+  waterType: WaterType | null;
+  productId?: string | null;
+  stockUnit?: string | null;
+  posSection?: PosSection | null;
+  includedGripo?: IncludedGripoType | null;
   displayLabel: string;
   unitVolumeMl: number;
   unitVolumeLiters: number;
@@ -211,24 +277,48 @@ export interface SalesListResponse {
 
 export type CartDraftLine =
   | {
-    id: string;
-    kind: "STANDARD";
-    waterType: WaterType;
-    displayName: string;
-    unitVolumeMl: number;
-    unitVolumeLiters: number;
-    unitPriceCentavos: number;
-    quantity: number;
-  }
+      id: string;
+      kind: "STANDARD";
+      waterType: WaterType;
+      displayName: string;
+      unitVolumeMl: number;
+      unitVolumeLiters: number;
+      unitPriceCentavos: number;
+      quantity: number;
+    }
   | {
-    id: string;
-    kind: "CUSTOM";
-    waterType: WaterType;
-    displayName: string;
-    unitVolumeLiters: number;
-    unitPriceCentavos: number;
-    quantity: number;
-  };
+      id: string;
+      kind: "CUSTOM";
+      waterType: WaterType;
+      displayName: string;
+      unitVolumeLiters: number;
+      unitPriceCentavos: number;
+      quantity: number;
+    }
+  | {
+      id: string;
+      kind: "MERCHANDISE";
+      productId: string;
+      displayName: string;
+      description: string | null;
+      stockUnit: string;
+      posSection: PosSection;
+      unitPriceCentavos: number;
+      quantity: number;
+    }
+  | {
+      id: string;
+      kind: "CONTAINER_PACKAGE";
+      packageCode: ContainerPackageCode;
+      includedGripo: IncludedGripoType | null;
+      productId: string;
+      displayName: string;
+      unitVolumeMl: number;
+      unitVolumeLiters: number;
+      unitPriceCentavos: number;
+      stockUnit: string;
+      quantity: number;
+    };
 
 export interface UnpaidCartSnapshot {
   ownerUsername: string;
@@ -419,17 +509,33 @@ export function computeCashSummary(
 }
 
 export function toCartItemInputs(lines: CartDraftLine[]): CartItemInput[] {
-  return lines.map((line) =>
-    line.kind === "STANDARD"
-      ? { kind: "STANDARD", waterType: line.waterType, quantity: line.quantity }
-      : {
+  return lines.map((line) => {
+    if (line.kind === "STANDARD") {
+      return { kind: "STANDARD", waterType: line.waterType, quantity: line.quantity };
+    }
+    if (line.kind === "CUSTOM") {
+      return {
         kind: "CUSTOM",
         waterType: line.waterType,
         unitVolumeLiters: line.unitVolumeLiters,
         unitPriceCentavos: line.unitPriceCentavos,
         quantity: line.quantity,
-      },
-  );
+      };
+    }
+    if (line.kind === "CONTAINER_PACKAGE") {
+      return {
+        kind: "CONTAINER_PACKAGE",
+        packageCode: line.packageCode,
+        ...(line.includedGripo ? { includedGripo: line.includedGripo } : {}),
+        quantity: line.quantity,
+      };
+    }
+    return {
+      kind: "MERCHANDISE",
+      productId: line.productId,
+      quantity: line.quantity,
+    };
+  });
 }
 
 export function cartLinesSignature(lines: CartDraftLine[]): string {
@@ -641,6 +747,26 @@ export function clearUnpaidCartIfMatchesReference(
   return true;
 }
 
+export function isPriorDayMerchandiseOnly(items: QuoteLineItem[]): boolean {
+  const hasMerchandise = items.some(
+    (item) => item.kind === "MERCHANDISE" || item.kind === "CONTAINER_PACKAGE",
+  );
+  const hasRefill = items.some(
+    (item) => item.kind === "STANDARD" || item.kind === "CUSTOM",
+  );
+  return hasMerchandise && !hasRefill;
+}
+
+export function isPriorDaySettleableComposition(items: QuoteLineItem[]): boolean {
+  const hasMerchandise = items.some(
+    (item) => item.kind === "MERCHANDISE" || item.kind === "CONTAINER_PACKAGE",
+  );
+  const hasRefill = items.some(
+    (item) => item.kind === "STANDARD" || item.kind === "CUSTOM",
+  );
+  return !(hasMerchandise && hasRefill);
+}
+
 export function resolveRecoveryPresentation(
   record: PendingCheckoutRecovery,
   currentUsername: string,
@@ -696,6 +822,7 @@ export function resolveRecoveryPresentation(
 
   if (lookup && lookup.recoveryState === "SETTLED_PRIOR_DAY" && lookup.settlement) {
     const settlement = lookup.settlement;
+    const isMerchOnly = isPriorDayMerchandiseOnly(settlement.items);
     const cashReceived = settlement.cashReceivedCentavos ?? localCash;
     const change =
       settlement.changeCentavos ?? cashReceived - settlement.netAmountKeptCentavos;
@@ -710,10 +837,12 @@ export function resolveRecoveryPresentation(
       blocksNewSale: true,
       statusPillLabel: "Settled · prior day",
       statusPillTone: "success",
-      headline: "Prior-day refill settled",
+      headline: isMerchOnly ? "Prior-day merchandise settled" : "Prior-day refill settled",
       subline: `Settlement recorded on ${settlement.settlementDate} · checked at ${formatManilaTimeOnly(lookup.checkedAt)}.`,
       calloutTitle: "No further payment collected",
-      calloutBody: `Confirmed paid and delivered from ${settlement.originalBusinessDate}. Recorded separately from today's refill sales.`,
+      calloutBody: isMerchOnly
+        ? `Confirmed paid and handed over from ${settlement.originalBusinessDate}. Recorded separately from today's sales.`
+        : `Confirmed paid and delivered from ${settlement.originalBusinessDate}. Recorded separately from today's refill sales.`,
       calloutTone: "success",
       amounts: {
         totalCentavos: settlement.netAmountKeptCentavos,
@@ -741,6 +870,7 @@ export function resolveRecoveryPresentation(
       (lookup.checkedAt.length >= 10 &&
         lookup.checkout.businessDate < lookup.checkedAt.slice(0, 10));
     const canSettlePriorDay =
+      isPriorDaySettleableComposition(lookup.checkout.items) &&
       currentUserRole === "OWNER" &&
       isPriorDay &&
       (lookup.checkout.status === "REVIEW_REQUIRED" ||

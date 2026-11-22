@@ -4,6 +4,7 @@ import {
   type CheckoutView,
   formatCentavos,
   formatLiters,
+  isPriorDayMerchandiseOnly,
   type PriorDaySettlementView,
   type SaleView,
   type SettlePriorDayResponse,
@@ -31,6 +32,10 @@ export function PriorDaySettlementModal({
   const [note, setNote] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const isMerchandiseOnly = isPriorDayMerchandiseOnly(checkout.items);
+  const merchQty = checkout.items
+    .filter((item) => item.kind === "MERCHANDISE" || item.kind === "CONTAINER_PACKAGE")
+    .reduce((sum, item) => sum + item.quantity, 0);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -57,12 +62,15 @@ export function PriorDaySettlementModal({
     try {
       const payload: {
         paymentKeptConfirmed: boolean;
-        refillDeliveredConfirmed: boolean;
+        refillDeliveredConfirmed?: boolean;
+        itemsHandedOverConfirmed?: boolean;
         cashReceivedCentavos?: number;
         note?: string;
       } = {
         paymentKeptConfirmed: true,
-        refillDeliveredConfirmed: true,
+        ...(isMerchandiseOnly
+          ? { itemsHandedOverConfirmed: true }
+          : { refillDeliveredConfirmed: true }),
       };
       if (
         checkout.cashReceivedCentavos === null &&
@@ -120,7 +128,9 @@ export function PriorDaySettlementModal({
       >
         <div className="detail-card__header">
           <div>
-            <h2 id="prior-day-settle-title">Review prior-day refill</h2>
+            <h2 id="prior-day-settle-title">
+              {isMerchandiseOnly ? "Review prior-day merchandise" : "Review prior-day refill"}
+            </h2>
             <p className="muted-sm">
               Original reference <strong className="mono-ref">{checkout.reference}</strong> from{" "}
               <strong>{checkout.businessDate}</strong>
@@ -132,9 +142,9 @@ export function PriorDaySettlementModal({
         <div className="callout callout--info">
           <p className="callout__title">No further cash is collected</p>
           <p className="callout__body">
-            Record this settlement only if the station kept the payment and the customer already received the refill.
-            Leave all other outcomes pending; this records separately from today&apos;s refill sales and leaves closed
-            day summaries unchanged.
+            {isMerchandiseOnly
+              ? "Record this settlement only if the station kept the payment and the customer already received all merchandise items. Leave all other outcomes pending; this deducts stock once, records separately from today's sales, and leaves closed day summaries unchanged."
+              : "Record this settlement only if the station kept the payment and the customer already received the refill. Leave all other outcomes pending; this records separately from today's refill sales and leaves closed day summaries unchanged."}
           </p>
         </div>
 
@@ -155,13 +165,23 @@ export function PriorDaySettlementModal({
             <dt>Original operator</dt>
             <dd>{checkout.createdBy}</dd>
           </div>
-          <div className="detail-list__row">
-            <dt>Containers &amp; water</dt>
-            <dd>
-              {checkout.totalContainers} container{checkout.totalContainers === 1 ? "" : "s"} ·{" "}
-              {formatLiters(checkout.totalVolumeLiters)}
-            </dd>
-          </div>
+          {(!isMerchandiseOnly || checkout.totalContainers > 0 || checkout.totalVolumeLiters > 0) && (
+            <div className="detail-list__row">
+              <dt>Containers &amp; water</dt>
+              <dd>
+                {checkout.totalContainers} container{checkout.totalContainers === 1 ? "" : "s"} ·{" "}
+                {formatLiters(checkout.totalVolumeLiters)}
+              </dd>
+            </div>
+          )}
+          {isMerchandiseOnly && (
+            <div className="detail-list__row">
+              <dt>Merchandise items</dt>
+              <dd>
+                {merchQty} item{merchQty === 1 ? "" : "s"}
+              </dd>
+            </div>
+          )}
           <div className="detail-list__row detail-list__row--total">
             <dt>Net amount kept</dt>
             <dd>{formatCentavos(checkout.totalCentavos)}</dd>
@@ -188,8 +208,8 @@ export function PriorDaySettlementModal({
               <div className="pos-summary-line__meta">
                 <strong>{item.displayLabel}</strong>
                 <span className="muted-sm">
-                  {item.quantity} × {formatCentavos(item.unitPriceCentavos)} ·{" "}
-                  {formatLiters(item.lineVolumeLiters)}
+                  {item.quantity} × {formatCentavos(item.unitPriceCentavos)}
+                  {item.kind !== "MERCHANDISE" ? ` · ${formatLiters(item.lineVolumeLiters)}` : ""}
                 </span>
               </div>
               <span className="pos-summary-line__amount">
@@ -211,7 +231,11 @@ export function PriorDaySettlementModal({
                   setError(null);
                 }}
               />
-              <span>Confirm the station kept the payment for this refill</span>
+              <span>
+                {isMerchandiseOnly
+                  ? "Confirm the station kept the payment for this checkout"
+                  : "Confirm the station kept the payment for this refill"}
+              </span>
             </label>
             <label className="checkbox-field">
               <input
@@ -223,7 +247,11 @@ export function PriorDaySettlementModal({
                   setError(null);
                 }}
               />
-              <span>Confirm the customer received the refill</span>
+              <span>
+                {isMerchandiseOnly
+                  ? "Confirm the customer received all merchandise items"
+                  : "Confirm the customer received the refill"}
+              </span>
             </label>
           </div>
 

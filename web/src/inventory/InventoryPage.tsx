@@ -1,37 +1,280 @@
-import { type FormEvent, useCallback, useEffect, useRef, useState } from "react";
+import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError } from "../api";
 import { createRequestTracker } from "../calendar/calendarView";
 import { AppShell, useModulesData } from "../ChooseModule";
 import {
+  computeReconciliationPreview,
   type ContainerShape,
+  DEFAULT_POS_SECTIONS,
+  filterInventoryItems,
   formatAlreadySetNotice,
+  formatCentavosInputValue,
+  formatPesoCentavos,
   formatQuantityLabel,
   formatRecordedAtManila,
+  formatSignedDelta,
+  getContainerPackageSummary,
+  getContainerSubtitle,
+  getInventoryItemGroup,
+  getInventoryLoadPhase,
+  getInventorySummaryCounts,
+  getOpeningSubmitLabel,
+  getPosSectionLabel,
+  getStockStatusMeta,
+  groupInventoryItems,
+  type InventoryCategoryFilter,
   type InventoryItemsResponse,
   type InventoryItemView,
   type InventoryPermissions,
+  mergeRefreshedInventoryItems,
   parseOpeningQuantityInput,
+  parsePesoPriceToCentavos,
+  parsePhysicalCountInput,
+  type PosSectionView,
+  type StockReconciliationView,
 } from "./inventoryView";
 
 function isInventoryItemView(value: unknown): value is InventoryItemView {
-  return Boolean(value && typeof value === "object" && "shape" in value && "status" in value);
+  return Boolean(value && typeof value === "object" && "code" in value && "status" in value);
+}
+
+function getItemKey(item: InventoryItemView): string {
+  return item.id ?? item.shape ?? item.code;
+}
+
+function generateClientKey(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+interface PosSectionPickerProps {
+  label: string;
+  ariaLabel: string;
+  value: string;
+  onChange: (nextCode: string) => void;
+  sections: PosSectionView[];
+  allowBlank?: boolean;
+  disabled?: boolean;
+  helperText?: string;
+  onSectionCreated: (section: PosSectionView) => void;
+}
+
+function PosSectionPicker({
+  label,
+  ariaLabel,
+  value,
+  onChange,
+  sections,
+  allowBlank = false,
+  disabled = false,
+  helperText,
+  onSectionCreated,
+}: PosSectionPickerProps) {
+  const [creatingOpen, setCreatingOpen] = useState(false);
+  const [newSectionName, setNewSectionName] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [createError, setCreateError] = useState<string | null>(null);
+  const newSectionInputRef = useRef<HTMLInputElement | null>(null);
+
+  const merchandiseSections = useMemo(
+    () =>
+      [...sections]
+        .filter((s) => s.code !== "CONTAINERS")
+        .sort((a, b) => {
+          if (a.sortOrder !== b.sortOrder) return a.sortOrder - b.sortOrder;
+          return a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+        }),
+    [sections],
+  );
+
+  async function handleSaveSection() {
+    if (creating || disabled) return;
+    const trimmed = newSectionName.trim().replace(/\s+/g, " ");
+    if (!trimmed || trimmed.length > 60) {
+      setCreateError("Enter a section name (1 to 60 characters).");
+      newSectionInputRef.current?.focus();
+      return;
+    }
+
+    setCreating(true);
+    setCreateError(null);
+    try {
+      const response = await api<{ section: PosSectionView }>("/api/inventory/pos-sections", {
+        method: "POST",
+        body: { name: trimmed },
+      });
+      onSectionCreated(response.section);
+      onChange(response.section.code);
+      setNewSectionName("");
+      setCreatingOpen(false);
+    } catch (err) {
+      setCreateError(
+        err instanceof ApiError ? err.message : "Could not create POS section. Please try again.",
+      );
+    } finally {
+      setCreating(false);
+    }
+  }
+
+  return (
+    <div className="inventory-section-field">
+      <div className="inventory-section-field__header">
+        <span>{label}</span>
+        {!creatingOpen && (
+          <button
+            type="button"
+            className="button button--ghost button--sm"
+            disabled={disabled}
+            onClick={() => {
+              setCreateError(null);
+              setCreatingOpen(true);
+              setTimeout(() => newSectionInputRef.current?.focus(), 0);
+            }}
+          >
+            + Create section
+          </button>
+        )}
+      </div>
+
+      <select
+        aria-label={ariaLabel}
+        disabled={disabled || creating}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+      >
+        {allowBlank && <option value="">Select POS section…</option>}
+        {merchandiseSections.map((section) => (
+          <option key={section.code} value={section.code}>
+            {section.name}
+          </option>
+        ))}
+      </select>
+
+      {creatingOpen && (
+        <div className="inventory-create-section-box">
+          <label className="field">
+            <span>New POS section name</span>
+            <input
+              ref={newSectionInputRef}
+              type="text"
+              maxLength={60}
+              placeholder="e.g. Cleaning Supplies"
+              disabled={creating || disabled}
+              value={newSectionName}
+              onChange={(e) => {
+                setNewSectionName(e.target.value);
+                setCreateError(null);
+              }}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  void handleSaveSection();
+                } else if (e.key === "Escape" && !creating) {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setCreatingOpen(false);
+                  setCreateError(null);
+                }
+              }}
+            />
+          </label>
+          {createError && (
+            <div className="alert alert--error inventory-card-alert" role="alert">
+              {createError}
+            </div>
+          )}
+          <div className="inventory-section-picker__actions">
+            <button
+              type="button"
+              className="button button--primary button--sm"
+              disabled={creating || disabled}
+              onClick={() => void handleSaveSection()}
+            >
+              {creating ? "Creating…" : "Save section"}
+            </button>
+            <button
+              type="button"
+              className="button button--ghost button--sm"
+              disabled={creating}
+              onClick={() => {
+                setCreatingOpen(false);
+                setNewSectionName("");
+                setCreateError(null);
+              }}
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+
+      {helperText && <small>{helperText}</small>}
+    </div>
+  );
 }
 
 export function InventoryPage() {
   const { data: modulesData } = useModulesData();
   const [items, setItems] = useState<InventoryItemView[]>([]);
+  const [posSections, setPosSections] = useState<PosSectionView[]>([...DEFAULT_POS_SECTIONS]);
   const [permissions, setPermissions] = useState<InventoryPermissions | null>(null);
+  const [hasLoaded, setHasLoaded] = useState(false);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [activeFilter, setActiveFilter] = useState<InventoryCategoryFilter>("ALL");
 
-  const [inputs, setInputs] = useState<Record<ContainerShape, string>>({ ROUND: "", SLIM: "" });
-  const [fieldErrors, setFieldErrors] = useState<Partial<Record<ContainerShape, string>>>({});
-  const [conflictNotices, setConflictNotices] = useState<Partial<Record<ContainerShape, string>>>({});
-  const [submittingShape, setSubmittingShape] = useState<ContainerShape | null>(null);
-  const [saveNotice, setSaveNotice] = useState<string | null>(null);
+  const [inputs, setInputs] = useState<Record<string, string>>({});
+  const [fieldErrors, setFieldErrors] = useState<Record<string, string | undefined>>({});
+  const [conflictNotices, setConflictNotices] = useState<Record<string, string | undefined>>({});
+  const [submittingKey, setSubmittingKey] = useState<string | null>(null);
+  const [saveNotice, setSaveNotice] = useState<{ title: string; body: string } | null>(null);
+
+  const [addProductOpen, setAddProductOpen] = useState(false);
+  const [productName, setProductName] = useState("");
+  const [productDescription, setProductDescription] = useState("");
+  const [productUnit, setProductUnit] = useState("pcs");
+  const [productUnitConfirmed, setProductUnitConfirmed] = useState(false);
+  const [productPriceInput, setProductPriceInput] = useState("");
+  const [productShowInPos, setProductShowInPos] = useState(false);
+  const [productPosSection, setProductPosSection] = useState<string>("");
+  const [creatingProduct, setCreatingProduct] = useState(false);
+  const [addProductError, setAddProductError] = useState<string | null>(null);
+
+  const [editProductItem, setEditProductItem] = useState<InventoryItemView | null>(null);
+  const [editName, setEditName] = useState("");
+  const [editDescription, setEditDescription] = useState("");
+  const [editPriceInput, setEditPriceInput] = useState("");
+  const [editShowInPos, setEditShowInPos] = useState(false);
+  const [editPosSection, setEditPosSection] = useState("");
+  const [savingEdit, setSavingEdit] = useState(false);
+  const [editError, setEditError] = useState<string | null>(null);
+
+  const [archiveItem, setArchiveItem] = useState<InventoryItemView | null>(null);
+  const [archiving, setArchiving] = useState(false);
+  const [archiveError, setArchiveError] = useState<string | null>(null);
+
+  const [reconcileItem, setReconcileItem] = useState<InventoryItemView | null>(null);
+  const [reconcileCountInput, setReconcileCountInput] = useState("");
+  const [reconcileReasonInput, setReconcileReasonInput] = useState("");
+  const [reconcileRequestKey, setReconcileRequestKey] = useState("");
+  const [reconciling, setReconciling] = useState(false);
+  const [reconcileError, setReconcileError] = useState<string | null>(null);
+  const [reconcileStaleNotice, setReconcileStaleNotice] = useState<string | null>(null);
+
+  const [togglingItemKey, setTogglingItemKey] = useState<string | null>(null);
+  const [sectionPickerItemId, setSectionPickerItemId] = useState<string | null>(null);
+  const [sectionPickerValue, setSectionPickerValue] = useState<string>("CHANGE_OF_GRIPO");
+  const [cardActionError, setCardActionError] = useState<Record<string, string | undefined>>({});
 
   const loadTrackerRef = useRef(createRequestTracker());
-  const inputRefs = useRef<Partial<Record<ContainerShape, HTMLInputElement | null>>>({});
+  const loadingRef = useRef(true);
+  const submittingRef = useRef(false);
+  const inputRefs = useRef<Record<string, HTMLInputElement | null>>({});
+  const addNameInputRef = useRef<HTMLInputElement | null>(null);
+  const editNameInputRef = useRef<HTMLInputElement | null>(null);
+  const reconcileCountInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     const previousTitle = document.title;
@@ -41,8 +284,16 @@ export function InventoryPage() {
     };
   }, []);
 
-  const loadItems = useCallback(async (options: { preserveNotice?: boolean } = {}) => {
+  const handleSectionCreated = useCallback((section: PosSectionView) => {
+    setPosSections((prev) =>
+      prev.some((s) => s.code === section.code) ? prev : [...prev, section],
+    );
+  }, []);
+
+  const loadItems = useCallback(async (options: { preserveNotice?: boolean; force?: boolean } = {}) => {
+    if (!options.force && submittingRef.current) return;
     const requestId = loadTrackerRef.current.next();
+    loadingRef.current = true;
     setLoading(true);
     setLoadError(null);
     if (!options.preserveNotice) {
@@ -52,13 +303,18 @@ export function InventoryPage() {
     try {
       const response = await api<InventoryItemsResponse>("/api/inventory/items");
       if (!loadTrackerRef.current.isCurrent(requestId)) return;
-      setItems(response.items);
+      setItems((prev) => mergeRefreshedInventoryItems(prev, response.items));
+      if (Array.isArray(response.posSections) && response.posSections.length > 0) {
+        setPosSections(response.posSections);
+      }
       setPermissions(response.permissions);
+      setHasLoaded(true);
     } catch (err) {
       if (!loadTrackerRef.current.isCurrent(requestId)) return;
       setLoadError(err instanceof ApiError ? err.message : "Could not load inventory stock.");
     } finally {
       if (loadTrackerRef.current.isCurrent(requestId)) {
+        loadingRef.current = false;
         setLoading(false);
       }
     }
@@ -68,252 +324,1441 @@ export function InventoryPage() {
     void loadItems();
   }, [loadItems]);
 
-  async function handleOpeningSubmit(event: FormEvent, item: InventoryItemView) {
-    event.preventDefault();
-    if (submittingShape !== null || !permissions?.canInitializeOpeningStock) return;
+  useEffect(() => {
+    if (!addProductOpen && !editProductItem && !archiveItem && !reconcileItem) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.defaultPrevented || event.key !== "Escape") return;
+      if (addProductOpen && !creatingProduct) setAddProductOpen(false);
+      if (editProductItem && !savingEdit) setEditProductItem(null);
+      if (archiveItem && !archiving) setArchiveItem(null);
+      if (reconcileItem && !reconciling) setReconcileItem(null);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [
+    addProductOpen,
+    creatingProduct,
+    editProductItem,
+    savingEdit,
+    archiveItem,
+    archiving,
+    reconcileItem,
+    reconciling,
+  ]);
 
-    const shape = item.shape;
-    const parsed = parseOpeningQuantityInput(inputs[shape]);
-    if (!parsed.ok) {
-      setFieldErrors((prev) => ({ ...prev, [shape]: parsed.message }));
-      inputRefs.current[shape]?.focus();
+  function openAddProductModal() {
+    setProductName("");
+    setProductDescription("");
+    setProductUnit("pcs");
+    setProductUnitConfirmed(false);
+    setProductPriceInput("");
+    setProductShowInPos(false);
+    setProductPosSection("");
+    setAddProductError(null);
+    setAddProductOpen(true);
+    setTimeout(() => addNameInputRef.current?.focus(), 0);
+  }
+
+  function openEditProductModal(item: InventoryItemView) {
+    if (!item.id || item.category !== "MERCHANDISE") return;
+    setEditProductItem(item);
+    setEditName(item.name);
+    setEditDescription(item.description ?? "");
+    setEditPriceInput(
+      item.unitPriceCentavos != null ? formatCentavosInputValue(item.unitPriceCentavos) : "",
+    );
+    setEditShowInPos(Boolean(item.showInPos));
+    setEditPosSection(item.posSection ?? "");
+    setEditError(null);
+    setTimeout(() => editNameInputRef.current?.focus(), 0);
+  }
+
+  function openArchiveModal(item: InventoryItemView) {
+    if (!item.id || item.category !== "MERCHANDISE") return;
+    setArchiveItem(item);
+    setArchiveError(null);
+  }
+
+  function openReconcileModal(item: InventoryItemView) {
+    if (item.status !== "INITIALIZED" || item.currentQuantity === null) return;
+    setReconcileItem(item);
+    setReconcileCountInput(String(item.currentQuantity));
+    setReconcileReasonInput("");
+    setReconcileRequestKey(generateClientKey());
+    setReconcileError(null);
+    setReconcileStaleNotice(null);
+    setTimeout(() => reconcileCountInputRef.current?.focus(), 0);
+  }
+
+  async function handleCreateProduct(event: FormEvent) {
+    event.preventDefault();
+    if (creatingProduct || !permissions?.canCreateProduct) return;
+
+    const trimmedName = productName.trim().replace(/\s+/g, " ");
+    const trimmedDesc = productDescription.trim().replace(/\s+/g, " ");
+    const trimmedUnit = productUnit.trim().replace(/\s+/g, " ");
+    const parsedPriceCentavos = parsePesoPriceToCentavos(productPriceInput);
+
+    if (!trimmedName || trimmedName.length > 80) {
+      setAddProductError("Enter a product name (1 to 80 characters).");
+      return;
+    }
+    if (trimmedDesc.length > 160) {
+      setAddProductError("Short description must be 160 characters or fewer.");
+      return;
+    }
+    if (!trimmedUnit || trimmedUnit.length > 30) {
+      setAddProductError("Enter the stock unit (e.g. pcs).");
+      return;
+    }
+    if (!productUnitConfirmed) {
+      setAddProductError("Confirm the stock recording unit before saving.");
+      return;
+    }
+    if (parsedPriceCentavos === null) {
+      setAddProductError("Enter a valid positive selling price in pesos (e.g. 40.00).");
+      return;
+    }
+    if (productShowInPos && !productPosSection) {
+      setAddProductError("Choose a POS section when Show in POS is checked.");
       return;
     }
 
-    setSubmittingShape(shape);
-    setFieldErrors((prev) => ({ ...prev, [shape]: undefined }));
-    setConflictNotices((prev) => ({ ...prev, [shape]: undefined }));
+    setCreatingProduct(true);
+    setAddProductError(null);
+    setSaveNotice(null);
+    loadTrackerRef.current.next();
+
+    try {
+      const response = await api<{ item: InventoryItemView }>("/api/inventory/products", {
+        method: "POST",
+        body: {
+          name: trimmedName,
+          description: trimmedDesc || null,
+          unit: trimmedUnit,
+          unitConfirmed: true,
+          unitPriceCentavos: parsedPriceCentavos,
+          showInPos: productShowInPos,
+          posSection: productPosSection || null,
+        },
+      });
+      loadTrackerRef.current.next();
+      setItems((prev) => [...prev, response.item]);
+      setAddProductOpen(false);
+      setSaveNotice({
+        title: "Product saved",
+        body: `${response.item.name} (${formatPesoCentavos(response.item.unitPriceCentavos ?? parsedPriceCentavos)}) was added as ${response.item.showInPos ? "Shown in POS" : "Hidden from POS"} with opening stock Not Set.`,
+      });
+    } catch (err) {
+      setAddProductError(
+        err instanceof ApiError ? err.message : "Could not save product. Please try again.",
+      );
+    } finally {
+      setCreatingProduct(false);
+    }
+  }
+
+  async function handleSaveProductEdit(event: FormEvent) {
+    event.preventDefault();
+    if (!editProductItem?.id || savingEdit || !permissions?.canCreateProduct) return;
+
+    const trimmedName = editName.trim().replace(/\s+/g, " ");
+    const trimmedDesc = editDescription.trim().replace(/\s+/g, " ");
+    const parsedPriceCentavos = parsePesoPriceToCentavos(editPriceInput);
+
+    if (!trimmedName || trimmedName.length > 80) {
+      setEditError("Enter a product name (1 to 80 characters).");
+      return;
+    }
+    if (trimmedDesc.length > 160) {
+      setEditError("Short description must be 160 characters or fewer.");
+      return;
+    }
+    if (parsedPriceCentavos === null) {
+      setEditError("Enter a valid positive selling price in pesos (e.g. 40.00).");
+      return;
+    }
+    if (editShowInPos && !editPosSection) {
+      setEditError("Choose a POS section when Show in POS is checked.");
+      return;
+    }
+
+    setSavingEdit(true);
+    setEditError(null);
+    setSaveNotice(null);
+    loadTrackerRef.current.next();
+
+    try {
+      const response = await api<{ item: InventoryItemView }>(
+        `/api/inventory/products/${encodeURIComponent(editProductItem.id)}`,
+        {
+          method: "PATCH",
+          body: {
+            name: trimmedName,
+            description: trimmedDesc || null,
+            unitPriceCentavos: parsedPriceCentavos,
+            showInPos: editShowInPos,
+            posSection: editPosSection || null,
+          },
+        },
+      );
+      loadTrackerRef.current.next();
+      setItems((prev) =>
+        prev.map((entry) =>
+          getItemKey(entry) === getItemKey(response.item) ? response.item : entry,
+        ),
+      );
+      setEditProductItem(null);
+      setSaveNotice({
+        title: "Product details updated",
+        body: `${response.item.name} (${formatPesoCentavos(response.item.unitPriceCentavos ?? parsedPriceCentavos)}) was saved. Future POS checkouts will use these details while existing sales keep their original snapshots.`,
+      });
+    } catch (err) {
+      setEditError(
+        err instanceof ApiError ? err.message : "Could not update product details. Please try again.",
+      );
+    } finally {
+      setSavingEdit(false);
+    }
+  }
+
+  async function handleConfirmArchive() {
+    if (!archiveItem?.id || archiving || !permissions?.canCreateProduct) return;
+
+    setArchiving(true);
+    setArchiveError(null);
+    setSaveNotice(null);
+    loadTrackerRef.current.next();
+
+    try {
+      const response = await api<{ item: InventoryItemView }>(
+        `/api/inventory/products/${encodeURIComponent(archiveItem.id)}/archive`,
+        {
+          method: "POST",
+          body: {},
+        },
+      );
+      loadTrackerRef.current.next();
+      setItems((prev) => prev.filter((entry) => getItemKey(entry) !== getItemKey(response.item)));
+      setArchiveItem(null);
+      setSaveNotice({
+        title: "Product archived",
+        body: `${response.item.name} left active Inventory and new POS sales. Its ${formatQuantityLabel(response.item.currentQuantity, response.item.unit)} balance, opening count, and past sales remain preserved.`,
+      });
+    } catch (err) {
+      setArchiveError(
+        err instanceof ApiError ? err.message : "Could not archive product. Please try again.",
+      );
+    } finally {
+      setArchiving(false);
+    }
+  }
+
+  async function handleToggleContainerVisibility(shape: ContainerShape, nextShowInPos: boolean) {
+    if (togglingItemKey !== null || !permissions?.canCreateProduct) return;
+    const item = items.find((entry) => entry.category === "CONTAINER" && entry.shape === shape);
+    if (!item) return;
+    const itemKey = getItemKey(item);
+
+    setTogglingItemKey(itemKey);
+    setCardActionError((prev) => ({ ...prev, [itemKey]: undefined }));
+    setSaveNotice(null);
+    loadTrackerRef.current.next();
+
+    try {
+      const response = await api<{ item: InventoryItemView }>(
+        `/api/inventory/containers/${encodeURIComponent(shape)}`,
+        {
+          method: "PATCH",
+          body: { showInPos: nextShowInPos },
+        },
+      );
+      loadTrackerRef.current.next();
+      setItems((prev) =>
+        prev.map((entry) =>
+          getItemKey(entry) === getItemKey(response.item) ? response.item : entry,
+        ),
+      );
+      setSaveNotice({
+        title: response.item.showInPos
+          ? `${response.item.name} shown in POS`
+          : `${response.item.name} hidden from POS`,
+        body: response.item.showInPos
+          ? `${response.item.name} package options are now shown under Containers in POS using its shared ${formatQuantityLabel(response.item.currentQuantity, response.item.unit)} balance.`
+          : `${response.item.name} package options are now hidden from new POS sales.`,
+      });
+    } catch (err) {
+      setCardActionError((prev) => ({
+        ...prev,
+        [itemKey]: err instanceof ApiError ? err.message : "Could not update POS visibility.",
+      }));
+    } finally {
+      setTogglingItemKey(null);
+    }
+  }
+
+  async function handleToggleShowInPos(
+    item: InventoryItemView,
+    nextShowInPos: boolean,
+    explicitSection?: string,
+  ) {
+    if (!item.id || togglingItemKey !== null || !permissions?.canCreateProduct) return;
+    const itemKey = getItemKey(item);
+    if (nextShowInPos && !item.posSection && !explicitSection) {
+      setSectionPickerItemId(item.id);
+      setSectionPickerValue("CHANGE_OF_GRIPO");
+      setCardActionError((prev) => ({ ...prev, [itemKey]: undefined }));
+      return;
+    }
+
+    setTogglingItemKey(itemKey);
+    setCardActionError((prev) => ({ ...prev, [itemKey]: undefined }));
+    setSaveNotice(null);
+    loadTrackerRef.current.next();
+
+    try {
+      const response = await api<{ item: InventoryItemView }>(
+        `/api/inventory/products/${encodeURIComponent(item.id)}`,
+        {
+          method: "PATCH",
+          body: {
+            showInPos: nextShowInPos,
+            ...(explicitSection ? { posSection: explicitSection } : {}),
+          },
+        },
+      );
+      loadTrackerRef.current.next();
+      setItems((prev) =>
+        prev.map((entry) => (getItemKey(entry) === getItemKey(response.item) ? response.item : entry)),
+      );
+      setSectionPickerItemId(null);
+      setSaveNotice({
+        title: response.item.showInPos ? "Product shown in POS" : "Product hidden from POS",
+        body: `${response.item.name} is now ${response.item.showInPos ? "visible in Point of Sale" : "hidden from Point of Sale"}.`,
+      });
+    } catch (err) {
+      setCardActionError((prev) => ({
+        ...prev,
+        [itemKey]: err instanceof ApiError ? err.message : "Could not update POS visibility.",
+      }));
+    } finally {
+      setTogglingItemKey(null);
+    }
+  }
+
+  async function handleConfirmReconciliation(event: FormEvent) {
+    event.preventDefault();
+    if (
+      !reconcileItem ||
+      reconcileItem.currentQuantity === null ||
+      reconciling ||
+      !permissions?.canInitializeOpeningStock
+    ) {
+      return;
+    }
+
+    const parsedCount = parsePhysicalCountInput(reconcileCountInput, reconcileItem.unit);
+    if (!parsedCount.ok) {
+      setReconcileError(parsedCount.message);
+      reconcileCountInputRef.current?.focus();
+      return;
+    }
+
+    const trimmedReason = reconcileReasonInput.trim().replace(/\s+/g, " ");
+    if (!trimmedReason || trimmedReason.length > 240) {
+      setReconcileError("Enter a factual reason for this physical count (1 to 240 characters).");
+      return;
+    }
+
+    const endpointKey = reconcileItem.shape ?? reconcileItem.id ?? reconcileItem.code;
+    setReconciling(true);
+    setReconcileError(null);
+    setReconcileStaleNotice(null);
+    setSaveNotice(null);
+    loadTrackerRef.current.next();
+
+    try {
+      const response = await api<{
+        item: InventoryItemView;
+        reconciliation: StockReconciliationView;
+      }>(`/api/inventory/items/${encodeURIComponent(endpointKey)}/reconciliations`, {
+        method: "POST",
+        body: {
+          physicalCount: parsedCount.quantity,
+          reason: trimmedReason,
+          expectedRevision: reconcileItem.stockRevision ?? 0,
+          expectedCurrentQuantity: reconcileItem.currentQuantity,
+          requestKey: reconcileRequestKey,
+        },
+      });
+      loadTrackerRef.current.next();
+      setItems((prev) =>
+        prev.map((entry) =>
+          getItemKey(entry) === getItemKey(response.item) ? response.item : entry,
+        ),
+      );
+      setReconcileItem(null);
+      setSaveNotice({
+        title:
+          response.reconciliation.quantityDelta === 0
+            ? "Physical count verified"
+            : "Stock count corrected",
+        body:
+          response.reconciliation.quantityDelta === 0
+            ? `${response.item.name} verified at ${formatQuantityLabel(response.item.currentQuantity, response.item.unit)}. Original opening count remains preserved.`
+            : `${response.item.name} updated from ${formatQuantityLabel(response.reconciliation.balanceBefore, response.reconciliation.unit)} to ${formatQuantityLabel(response.reconciliation.balanceAfter, response.reconciliation.unit)} (${formatSignedDelta(response.reconciliation.quantityDelta, response.reconciliation.unit)}). Original opening count remains preserved.`,
+      });
+    } catch (err) {
+      if (err instanceof ApiError && err.code === "STALE_STOCK_COUNT") {
+        const latestItem = isInventoryItemView(err.details?.item) ? err.details.item : null;
+        if (latestItem) {
+          loadTrackerRef.current.next();
+          setItems((prev) =>
+            prev.map((entry) => (getItemKey(entry) === getItemKey(latestItem) ? latestItem : entry)),
+          );
+          setReconcileItem(latestItem);
+        }
+        setReconcileRequestKey(generateClientKey());
+        setReconcileStaleNotice(err.message);
+      } else if (err instanceof ApiError && err.code === "ACTIVE_PAYMENT_COMMITMENT") {
+        const latestItem = isInventoryItemView(err.details?.item) ? err.details.item : null;
+        if (latestItem) {
+          loadTrackerRef.current.next();
+          setItems((prev) =>
+            prev.map((entry) => (getItemKey(entry) === getItemKey(latestItem) ? latestItem : entry)),
+          );
+          setReconcileItem(latestItem);
+        }
+        setReconcileError(err.message);
+      } else {
+        setReconcileError(
+          err instanceof ApiError
+            ? err.message
+            : "Could not save physical count correction. Please try again.",
+        );
+      }
+    } finally {
+      setReconciling(false);
+    }
+  }
+
+  async function handleOpeningSubmit(event: FormEvent, item: InventoryItemView) {
+    event.preventDefault();
+    if (
+      loadingRef.current ||
+      loading ||
+      submittingRef.current ||
+      submittingKey !== null ||
+      !permissions?.canInitializeOpeningStock
+    ) {
+      return;
+    }
+
+    const itemKey = getItemKey(item);
+    const parsed = parseOpeningQuantityInput(inputs[itemKey] ?? "", item.unit);
+    if (!parsed.ok) {
+      setFieldErrors((prev) => ({ ...prev, [itemKey]: parsed.message }));
+      inputRefs.current[itemKey]?.focus();
+      return;
+    }
+
+    const endpointKey = item.shape ?? item.id ?? item.code;
+    submittingRef.current = true;
+    setSubmittingKey(itemKey);
+    loadTrackerRef.current.next();
+    setFieldErrors((prev) => ({ ...prev, [itemKey]: undefined }));
+    setConflictNotices((prev) => ({ ...prev, [itemKey]: undefined }));
     setSaveNotice(null);
 
     try {
       const response = await api<{ item: InventoryItemView }>(
-        `/api/inventory/items/${encodeURIComponent(shape)}/opening-stock`,
+        `/api/inventory/items/${encodeURIComponent(endpointKey)}/opening-stock`,
         {
           method: "POST",
           body: { quantity: parsed.quantity },
         },
       );
-      setItems((prev) => prev.map((entry) => (entry.shape === shape ? response.item : entry)));
-      setInputs((prev) => ({ ...prev, [shape]: "" }));
-      setSaveNotice(
-        `Saved opening count for ${response.item.name}: ${formatQuantityLabel(
+      loadTrackerRef.current.next();
+      setItems((prev) =>
+        prev.map((entry) => (getItemKey(entry) === itemKey ? response.item : entry)),
+      );
+      setInputs((prev) => ({ ...prev, [itemKey]: "" }));
+      setSaveNotice({
+        title: "Opening count saved",
+        body: `Saved opening count for ${response.item.name}: ${formatQuantityLabel(
           response.item.currentQuantity,
           response.item.unit,
         )}.`,
-      );
+      });
     } catch (err) {
       if (err instanceof ApiError && err.code === "OPENING_STOCK_ALREADY_SET") {
         const existingItem = isInventoryItemView(err.details?.item) ? err.details.item : null;
         if (existingItem) {
-          setItems((prev) => prev.map((entry) => (entry.shape === shape ? existingItem : entry)));
+          loadTrackerRef.current.next();
+          setItems((prev) =>
+            prev.map((entry) => (getItemKey(entry) === itemKey ? existingItem : entry)),
+          );
         } else {
-          void loadItems({ preserveNotice: true });
+          void loadItems({ preserveNotice: true, force: true });
         }
-        setInputs((prev) => ({ ...prev, [shape]: "" }));
-        setFieldErrors((prev) => ({ ...prev, [shape]: undefined }));
+        setInputs((prev) => ({ ...prev, [itemKey]: "" }));
+        setFieldErrors((prev) => ({ ...prev, [itemKey]: undefined }));
         setConflictNotices((prev) => ({
           ...prev,
-          [shape]: formatAlreadySetNotice(item.name, parsed.quantity, item.unit, existingItem, err.message),
+          [itemKey]: formatAlreadySetNotice(item.name, parsed.quantity, item.unit, existingItem, err.message),
         }));
       } else {
         setFieldErrors((prev) => ({
           ...prev,
-          [shape]: err instanceof ApiError ? err.message : "Could not save opening count. Please try again.",
+          [itemKey]: err instanceof ApiError ? err.message : "Could not save opening count. Please try again.",
         }));
       }
     } finally {
-      setSubmittingShape(null);
+      submittingRef.current = false;
+      setSubmittingKey(null);
     }
   }
 
+  const loadPhase = getInventoryLoadPhase({ hasLoaded, loading, loadError });
+  const isRefreshError = loadPhase === "refresh-error";
   const canInitialize = permissions?.canInitializeOpeningStock ?? false;
+  const canCreateProduct = permissions?.canCreateProduct ?? false;
   const hasUninitialized = items.some((item) => item.status === "NOT_SET");
+  const hasOtherItems = items.some((item) => getInventoryItemGroup(item, posSections) === "OTHER");
+  const summary = getInventorySummaryCounts(items);
+  const filteredItems = filterInventoryItems(items, activeFilter, posSections);
+  const groupedSections = groupInventoryItems(items, activeFilter, posSections);
+
+  const merchandiseSectionsForFilter = useMemo(
+    () =>
+      [...posSections]
+        .filter((s) => s.code !== "CONTAINERS")
+        .sort((a, b) => {
+          if (a.sortOrder !== b.sortOrder) return a.sortOrder - b.sortOrder;
+          return a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+        }),
+    [posSections],
+  );
+
+  const reconcileParsedCount = reconcileItem
+    ? parsePhysicalCountInput(reconcileCountInput, reconcileItem.unit)
+    : null;
+  const reconcilePreview =
+    reconcileItem &&
+    reconcileItem.currentQuantity !== null &&
+    reconcileParsedCount?.ok
+      ? computeReconciliationPreview(reconcileItem.currentQuantity, reconcileParsedCount.quantity)
+      : null;
+
+  const refreshLabel =
+    loadPhase === "initial-loading" ? "Loading…" : hasLoaded && loading ? "Refreshing…" : "Refresh";
 
   return (
     <AppShell activeKey="inventory" sectionName="Inventory" pageLabel="Inventory" modulesData={modulesData}>
-      <section className="page-header page-header--split">
-        <div>
-          <p className="eyebrow">INVENTORY</p>
-          <h1>Container Opening Stock</h1>
-          <p className="page-subtitle">
-            Round and Slim merchandise containers in whole containers. Counts carry across business days.
-          </p>
-        </div>
-        <div className="page-header__actions">
-          <button
-            type="button"
-            className="button button--ghost"
-            onClick={() => void loadItems()}
-            disabled={loading || submittingShape !== null}
-          >
-            {loading ? "Refreshing…" : "Refresh"}
-          </button>
-        </div>
-      </section>
+      <div className="inventory-top">
+        <section className="page-header page-header--split">
+          <div>
+            <h1>Inventory</h1>
+            <p className="page-subtitle">Manage your supplies, merchandise pricing, and stock levels</p>
+          </div>
+          <div className="page-header__actions">
+            {canCreateProduct && (
+              <button
+                type="button"
+                className="button button--primary"
+                onClick={openAddProductModal}
+                disabled={loading || submittingKey !== null}
+              >
+                + Add Product
+              </button>
+            )}
+            <button
+              type="button"
+              className="button button--ghost"
+              onClick={() => void loadItems()}
+              disabled={loading || submittingKey !== null}
+            >
+              {refreshLabel}
+            </button>
+          </div>
+        </section>
 
-      {permissions && !canInitialize && (
-        <div className="callout callout--info" role="status">
-          <p className="callout__title">View-only access</p>
-          <p className="callout__body">
-            Both Owner and Cashier can view Round and Slim stock counts. Only the Owner can record the initial
-            physical count for each container shape.
-          </p>
-        </div>
-      )}
+        {hasLoaded && (
+          <div className="inventory-toolbar">
+            <div className="inventory-filters" role="group" aria-label="Inventory category filters">
+              <button
+                type="button"
+                className={`inventory-filter-pill${activeFilter === "ALL" ? " inventory-filter-pill--active" : ""}`}
+                aria-pressed={activeFilter === "ALL"}
+                onClick={() => setActiveFilter("ALL")}
+              >
+                All items
+              </button>
+              <button
+                type="button"
+                className={`inventory-filter-pill${activeFilter === "CONTAINER" ? " inventory-filter-pill--active" : ""}`}
+                aria-pressed={activeFilter === "CONTAINER"}
+                onClick={() => setActiveFilter("CONTAINER")}
+              >
+                Containers
+              </button>
+              {merchandiseSectionsForFilter.map((section) => (
+                <button
+                  key={section.code}
+                  type="button"
+                  className={`inventory-filter-pill${activeFilter === section.code ? " inventory-filter-pill--active" : ""}`}
+                  aria-pressed={activeFilter === section.code}
+                  onClick={() => setActiveFilter(section.code)}
+                >
+                  {section.name}
+                </button>
+              ))}
+              {hasOtherItems && (
+                <button
+                  type="button"
+                  className={`inventory-filter-pill${activeFilter === "OTHER" ? " inventory-filter-pill--active" : ""}`}
+                  aria-pressed={activeFilter === "OTHER"}
+                  onClick={() => setActiveFilter("OTHER")}
+                >
+                  Other Products
+                </button>
+              )}
+            </div>
 
-      {permissions && canInitialize && hasUninitialized && (
-        <div className="callout callout--info">
-          <p className="callout__title">Record actual opening counts once per shape</p>
-          <p className="callout__body">
-            Count station-owned Round and Slim containers separately. Enter 0 when none are in stock. Once saved, the
-            opening count cannot be overwritten.
-          </p>
-        </div>
-      )}
+            <div
+              className="inventory-status-legend"
+              aria-label={isRefreshError ? "Last loaded stock status summary" : "Stock status summary"}
+            >
+              <span className="inventory-status-pill inventory-status-pill--unset">{summary.notSet} Not Set</span>
+              <span className="inventory-status-pill inventory-status-pill--out">{summary.noStock} No Stock</span>
+              <span className="inventory-status-pill inventory-status-pill--in">{summary.inStock} In Stock</span>
+            </div>
+          </div>
+        )}
+      </div>
 
       {saveNotice && (
         <div className="callout callout--success" role="status">
-          <p className="callout__title">Opening count saved</p>
-          <p className="callout__body">{saveNotice}</p>
+          <p className="callout__title">{saveNotice.title}</p>
+          <p className="callout__body">{saveNotice.body}</p>
         </div>
       )}
 
       {loadError && (
-        <div className="alert alert--error" role="alert">
-          <span>{loadError}</span>{" "}
-          <button type="button" className="button button--ghost button--sm" onClick={() => void loadItems()}>
+        <div className="alert alert--error inventory-load-alert" role="alert">
+          <div className="inventory-load-alert__copy">
+            <strong>{loadError}</strong>
+            <span className="inventory-load-alert__detail">
+              {hasLoaded
+                ? "Showing the last loaded stock values below. Retry to fetch current counts."
+                : "Stock totals and inventory items will appear once Inventory loads."}
+            </span>
+          </div>
+          <button
+            type="button"
+            className="button button--ghost button--sm"
+            onClick={() => void loadItems()}
+            disabled={loading || submittingKey !== null}
+          >
             Retry
           </button>
         </div>
       )}
 
-      {loading && items.length === 0 ? (
-        <div className="card">
-          <p className="muted" role="status">
-            Loading container stock…
-          </p>
-        </div>
-      ) : (
-        <section className="inventory-grid" aria-label="Container stock items">
-          {items.map((item) => {
-            const isNotSet = item.status === "NOT_SET" || item.currentQuantity === null;
-            const isZero = !isNotSet && item.currentQuantity === 0;
-            const formError = fieldErrors[item.shape];
-            const conflictNotice = conflictNotices[item.shape];
-            const isSubmitting = submittingShape === item.shape;
-            const inputId = `opening-count-${item.shape.toLowerCase()}`;
-            const hintId = `${inputId}-hint`;
+      {loadPhase === "initial-loading" && (
+        <section className="inventory-state-card" role="status" aria-live="polite">
+          <p className="inventory-state-card__title">Loading inventory stock…</p>
+          <p className="muted-sm">Fetching containers, merchandise products, and opening counts.</p>
+        </section>
+      )}
 
-            return (
-              <article key={item.code} className="card inventory-card" aria-labelledby={`heading-${item.code}`}>
-                <div className="inventory-card__header">
-                  <div>
-                    <h2 id={`heading-${item.code}`}>{item.name}</h2>
-                    <p className="muted-sm">Unit: whole {item.unit}</p>
-                  </div>
-                  <span className={`pill ${isNotSet ? "pill--warning" : "pill--completed"}`}>
-                    {isNotSet ? "Not Set" : "Initialized"}
+      {hasLoaded && (
+        <section
+          className={`inventory-board${isRefreshError ? " inventory-board--stale" : ""}`}
+          aria-label="Inventory stock board"
+          aria-busy={loading}
+        >
+          {isRefreshError && (
+            <div className="inventory-stale-banner" role="status">
+              <strong>Last loaded values</strong>
+              <span>Refresh failed — counts shown below may be out of date until Inventory refreshes.</span>
+            </div>
+          )}
+
+          {filteredItems.length === 0 ? (
+            <div className="inventory-empty-group">
+              <p className="muted-sm">No inventory products in this category yet.</p>
+              <button
+                type="button"
+                className="button button--ghost button--sm"
+                onClick={() => setActiveFilter("ALL")}
+              >
+                Show all items
+              </button>
+            </div>
+          ) : (
+            groupedSections.map((group) => (
+              <div key={group.key} className="inventory-group">
+                <div className="inventory-group__header">
+                  <h2>{group.title}</h2>
+                  <span className="inventory-group__meta">
+                    {group.metaPrefix} · {group.items.length} {group.items.length === 1 ? "item" : "items"}
                   </span>
                 </div>
 
-                <div className={`inventory-balance ${isNotSet ? "inventory-balance--unset" : ""}`}>
-                  <span className="inventory-balance__label">Current balance</span>
-                  {isNotSet ? (
-                    <>
-                      <strong className="inventory-balance__value inventory-balance__value--unset">Not Set</strong>
-                      <span className="muted-sm">No opening physical count has been recorded yet.</span>
-                    </>
-                  ) : (
-                    <>
-                      <div className="inventory-balance__row">
-                        <strong className="inventory-balance__value">{item.currentQuantity}</strong>
-                        <span className="inventory-balance__unit">
-                          {item.currentQuantity === 1 ? "container" : item.unit}
-                        </span>
-                      </div>
-                      <span className="muted-sm">
-                        {isZero
-                          ? "Explicit zero confirmed by Owner."
-                          : "Starting physical count recorded for this shape."}
-                      </span>
-                    </>
-                  )}
+                <div className="inventory-item-grid">
+                  {group.items.map((item) => {
+                    const itemKey = getItemKey(item);
+                    const statusMeta = getStockStatusMeta(item);
+                    const isNotSet = statusMeta.tone === "unset";
+                    const isZero = statusMeta.tone === "out";
+                    const isContainer = item.category === "CONTAINER";
+                    const isMerchandise = item.category === "MERCHANDISE";
+                    const formError = fieldErrors[itemKey];
+                    const conflictNotice = conflictNotices[itemKey];
+                    const actionError = cardActionError[itemKey];
+                    const isSubmitting = submittingKey === itemKey;
+                    const isToggling = togglingItemKey === itemKey;
+                    const isPickingSection = Boolean(item.id && sectionPickerItemId === item.id);
+                    const inputId = `opening-count-${itemKey.toLowerCase()}`;
+                    const hintId = `${inputId}-hint`;
+                    const subtitle = item.shape
+                      ? getContainerSubtitle(item.shape)
+                      : item.description ?? `Standalone merchandise (${item.unit})`;
+
+                    return (
+                      <article key={itemKey} className="inventory-item-card" aria-labelledby={`heading-${itemKey}`}>
+                        <div className="inventory-item-card__head">
+                          <div className="inventory-item-card__title-row">
+                            <h3 id={`heading-${itemKey}`}>{item.name}</h3>
+                            {isMerchandise && item.unitPriceCentavos != null && (
+                              <span className="inventory-item-card__price">
+                                {formatPesoCentavos(item.unitPriceCentavos)}
+                              </span>
+                            )}
+                          </div>
+                          <p className="inventory-item-card__subtitle">{subtitle}</p>
+                          {isContainer && item.shape && (
+                            <p className="inventory-item-card__packages">
+                              {getContainerPackageSummary(item.shape)}
+                            </p>
+                          )}
+                          {isMerchandise && item.posSection && (
+                            <p className="inventory-item-card__section-tag">
+                              POS section: {getPosSectionLabel(item.posSection, posSections)}
+                            </p>
+                          )}
+                        </div>
+
+                        <div className="inventory-item-card__pos-row">
+                          <span
+                            className={`inventory-pos-badge ${
+                              item.showInPos ? "inventory-pos-badge--shown" : "inventory-pos-badge--hidden"
+                            }`}
+                          >
+                            {item.showInPos ? "Shown in POS" : "Hidden from POS"}
+                          </span>
+
+                          {canCreateProduct && (
+                            <div className="inventory-item-card__actions">
+                              {isContainer && item.shape && (
+                                <button
+                                  type="button"
+                                  className="button button--ghost button--sm"
+                                  disabled={isToggling || submittingKey !== null}
+                                  onClick={() =>
+                                    void handleToggleContainerVisibility(item.shape!, !item.showInPos)
+                                  }
+                                >
+                                  {isToggling
+                                    ? "Updating…"
+                                    : item.showInPos
+                                      ? "Hide from POS"
+                                      : "Show in POS"}
+                                </button>
+                              )}
+
+                              {isMerchandise && item.id && (
+                                <>
+                                  <button
+                                    type="button"
+                                    className="button button--ghost button--sm"
+                                    disabled={isToggling || submittingKey !== null}
+                                    onClick={() => void handleToggleShowInPos(item, !item.showInPos)}
+                                  >
+                                    {isToggling
+                                      ? "Updating…"
+                                      : item.showInPos
+                                        ? "Hide from POS"
+                                        : "Show in POS"}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="button button--ghost button--sm"
+                                    disabled={isToggling || submittingKey !== null}
+                                    onClick={() => openEditProductModal(item)}
+                                  >
+                                    Edit
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="button button--ghost button--sm"
+                                    disabled={isToggling || submittingKey !== null}
+                                    onClick={() => openArchiveModal(item)}
+                                  >
+                                    Archive
+                                  </button>
+                                </>
+                              )}
+                            </div>
+                          )}
+                        </div>
+
+                        {isPickingSection && item.id && (
+                          <div className="inventory-section-picker">
+                            <PosSectionPicker
+                              label="Choose POS section"
+                              ariaLabel={`POS section for ${item.name}`}
+                              value={sectionPickerValue}
+                              onChange={setSectionPickerValue}
+                              sections={posSections}
+                              disabled={isToggling}
+                              onSectionCreated={handleSectionCreated}
+                            />
+                            <div className="inventory-section-picker__actions">
+                              <button
+                                type="button"
+                                className="button button--primary button--sm"
+                                disabled={isToggling || !sectionPickerValue}
+                                onClick={() => void handleToggleShowInPos(item, true, sectionPickerValue)}
+                              >
+                                Confirm Show in POS
+                              </button>
+                              <button
+                                type="button"
+                                className="button button--ghost button--sm"
+                                disabled={isToggling}
+                                onClick={() => setSectionPickerItemId(null)}
+                              >
+                                Cancel
+                              </button>
+                            </div>
+                          </div>
+                        )}
+
+                        {actionError && (
+                          <div className="alert alert--error inventory-card-alert" role="alert">
+                            {actionError}
+                          </div>
+                        )}
+
+                        <div className="inventory-item-card__metric-row">
+                          <strong
+                            className={`inventory-item-card__qty${isNotSet ? " inventory-item-card__qty--unset" : ""}`}
+                          >
+                            {isNotSet ? "Not Set" : formatQuantityLabel(item.currentQuantity, item.unit)}
+                          </strong>
+                          <span className={`inventory-status-pill inventory-status-pill--${statusMeta.tone}`}>
+                            {statusMeta.label}
+                          </span>
+                        </div>
+
+                        {conflictNotice && (
+                          <div className="alert alert--error inventory-card-alert" role="alert">
+                            {conflictNotice}
+                          </div>
+                        )}
+
+                        <div className="inventory-item-card__body">
+                          {!isNotSet && item.openingStock ? (
+                            <>
+                              <dl className="detail-list inventory-detail-list">
+                                <div className="detail-list__row">
+                                  <dt>Opening count</dt>
+                                  <dd>{formatQuantityLabel(item.openingStock.quantity, item.openingStock.unit)}</dd>
+                                </div>
+                                <div className="detail-list__row">
+                                  <dt>Recorded by</dt>
+                                  <dd>{item.openingStock.recordedBy}</dd>
+                                </div>
+                                <div className="detail-list__row">
+                                  <dt>Recorded at</dt>
+                                  <dd>{formatRecordedAtManila(item.openingStock.recordedAt)}</dd>
+                                </div>
+                                {item.latestReconciliation && (
+                                  <div className="detail-list__row">
+                                    <dt>Last physical count</dt>
+                                    <dd>
+                                      {formatQuantityLabel(
+                                        item.latestReconciliation.physicalCount,
+                                        item.latestReconciliation.unit,
+                                      )}{" "}
+                                      ({formatSignedDelta(
+                                        item.latestReconciliation.quantityDelta,
+                                        item.latestReconciliation.unit,
+                                      )}
+                                      ) · {item.latestReconciliation.recordedBy}
+                                    </dd>
+                                  </div>
+                                )}
+                              </dl>
+                              {item.latestReconciliation && (
+                                <p className="inventory-card-footnote">
+                                  Last count reason: {item.latestReconciliation.reason} (
+                                  {formatRecordedAtManila(item.latestReconciliation.recordedAt)})
+                                </p>
+                              )}
+                              <p className="inventory-card-footnote">
+                                {isZero
+                                  ? "Explicit zero confirmed · Opening count is preserved."
+                                  : "Opening count is preserved and cannot be overwritten."}
+                              </p>
+                              {canInitialize && (
+                                <div className="inventory-card-reconcile-row">
+                                  <button
+                                    type="button"
+                                    className="button button--ghost button--sm"
+                                    disabled={loading || submittingKey !== null}
+                                    onClick={() => openReconcileModal(item)}
+                                  >
+                                    Correct stock
+                                  </button>
+                                </div>
+                              )}
+                            </>
+                          ) : canInitialize ? (
+                            <form
+                              className="inventory-form"
+                              onSubmit={(event) => void handleOpeningSubmit(event, item)}
+                              noValidate
+                            >
+                              {formError && (
+                                <div className="alert alert--error inventory-card-alert" role="alert">
+                                  {formError}
+                                </div>
+                              )}
+
+                              <label className="field" htmlFor={inputId}>
+                                <span>Opening count ({item.unit}) *</span>
+                                <input
+                                  id={inputId}
+                                  ref={(el) => {
+                                    inputRefs.current[itemKey] = el;
+                                  }}
+                                  name={`openingQuantity-${itemKey}`}
+                                  type="text"
+                                  inputMode="numeric"
+                                  pattern="[0-9]*"
+                                  autoComplete="off"
+                                  placeholder="0"
+                                  value={inputs[itemKey] ?? ""}
+                                  aria-describedby={hintId}
+                                  disabled={loading || submittingKey !== null}
+                                  onChange={(e) => {
+                                    const value = e.target.value;
+                                    setInputs((prev) => ({ ...prev, [itemKey]: value }));
+                                    setFieldErrors((prev) => ({ ...prev, [itemKey]: undefined }));
+                                  }}
+                                />
+                                <small id={hintId}>Enter actual physical count (0 if none).</small>
+                              </label>
+
+                              <button
+                                type="submit"
+                                className="button button--primary button--block"
+                                disabled={loading || submittingKey !== null}
+                              >
+                                {getOpeningSubmitLabel(item, isSubmitting)}
+                              </button>
+                            </form>
+                          ) : (
+                            <p className="inventory-readonly-note">Waiting for Owner to record the opening count.</p>
+                          )}
+                        </div>
+                      </article>
+                    );
+                  })}
+                </div>
+              </div>
+            ))
+          )}
+
+          {permissions && !canInitialize && (
+            <div className="inventory-board-note" role="status">
+              <span className="inventory-board-note__title">View-only access</span>
+              <span>
+                Both Owner and Cashier can view stock counts and POS catalog status. Only the Owner can add or edit
+                merchandise products, manage POS visibility, archive products, record initial opening counts, or
+                reconcile physical stock counts.
+              </span>
+            </div>
+          )}
+
+          {permissions && canInitialize && hasUninitialized && (
+            <div className="inventory-board-note">
+              <span className="inventory-board-note__title">Record actual opening counts once per item</span>
+              <span>
+                Count each item separately in its confirmed stock unit. Enter 0 when none are in stock. Items stay Not
+                Set until their opening count is recorded.
+              </span>
+            </div>
+          )}
+        </section>
+      )}
+
+      {addProductOpen && canCreateProduct && (
+        <div className="modal-backdrop" role="presentation">
+          <div
+            className="modal modal--wide"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="add-product-title"
+          >
+            <div className="detail-card__header">
+              <div>
+                <h2 id="add-product-title">Add Product</h2>
+                <p className="muted-sm">
+                  Create standalone merchandise in Inventory and choose whether to show it in POS.
+                </p>
+              </div>
+            </div>
+
+            <form className="subview" onSubmit={(event) => void handleCreateProduct(event)} noValidate>
+              <label className="field">
+                <span>Product name *</span>
+                <input
+                  ref={addNameInputRef}
+                  type="text"
+                  maxLength={80}
+                  placeholder="e.g. Push-Type Faucet"
+                  disabled={creatingProduct}
+                  value={productName}
+                  onChange={(e) => {
+                    setProductName(e.target.value);
+                    setAddProductError(null);
+                  }}
+                />
+              </label>
+
+              <label className="field">
+                <span>Short description (optional)</span>
+                <input
+                  type="text"
+                  maxLength={160}
+                  placeholder="e.g. Press to dispense water"
+                  disabled={creatingProduct}
+                  value={productDescription}
+                  onChange={(e) => {
+                    setProductDescription(e.target.value);
+                    setAddProductError(null);
+                  }}
+                />
+                <small>Shown on the POS product card when entered.</small>
+              </label>
+
+              <div className="field-row">
+                <label className="field">
+                  <span>Stock unit *</span>
+                  <input
+                    type="text"
+                    maxLength={30}
+                    placeholder="e.g. pcs"
+                    disabled={creatingProduct}
+                    value={productUnit}
+                    onChange={(e) => {
+                      setProductUnit(e.target.value);
+                      setAddProductError(null);
+                    }}
+                  />
+                </label>
+
+                <label className="field">
+                  <span>Selling price (₱) *</span>
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    placeholder="e.g. 40.00"
+                    disabled={creatingProduct}
+                    value={productPriceInput}
+                    onChange={(e) => {
+                      setProductPriceInput(e.target.value);
+                      setAddProductError(null);
+                    }}
+                  />
+                </label>
+              </div>
+
+              <label className="checkbox-field">
+                <input
+                  type="checkbox"
+                  checked={productUnitConfirmed}
+                  disabled={creatingProduct}
+                  onChange={(e) => {
+                    setProductUnitConfirmed(e.target.checked);
+                    setAddProductError(null);
+                  }}
+                />
+                <span>Confirm stock recording unit ({productUnit.trim() || "unit"}) *</span>
+              </label>
+
+              <div className="inventory-pos-visibility-box">
+                <label className="checkbox-field">
+                  <input
+                    type="checkbox"
+                    checked={productShowInPos}
+                    disabled={creatingProduct}
+                    onChange={(e) => {
+                      setProductShowInPos(e.target.checked);
+                      setAddProductError(null);
+                    }}
+                  />
+                  <span>Show in POS</span>
+                </label>
+
+                <PosSectionPicker
+                  label={`POS section ${productShowInPos ? "*" : "(optional while hidden)"}`}
+                  ariaLabel="POS section"
+                  value={productPosSection}
+                  onChange={(nextCode) => {
+                    setProductPosSection(nextCode);
+                    setAddProductError(null);
+                  }}
+                  sections={posSections}
+                  allowBlank
+                  disabled={creatingProduct}
+                  helperText="Controls which POS group displays this card when Show in POS is enabled. Opening physical stock is recorded separately after saving."
+                  onSectionCreated={handleSectionCreated}
+                />
+              </div>
+
+              {addProductError && (
+                <div className="alert alert--error" role="alert">
+                  {addProductError}
+                </div>
+              )}
+
+              <div className="modal__actions">
+                <button
+                  type="button"
+                  className="button button--ghost"
+                  disabled={creatingProduct}
+                  onClick={() => setAddProductOpen(false)}
+                >
+                  Cancel
+                </button>
+                <button type="submit" className="button button--primary" disabled={creatingProduct}>
+                  {creatingProduct ? "Saving product…" : "Save Product"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {editProductItem && canCreateProduct && (
+        <div className="modal-backdrop" role="presentation">
+          <div
+            className="modal modal--wide"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="edit-product-title"
+          >
+            <div className="detail-card__header">
+              <div>
+                <h2 id="edit-product-title">Edit Product</h2>
+                <p className="muted-sm">
+                  Update details for <strong>{editProductItem.name}</strong>. Future POS sales use the updated details
+                  while saved sales keep their original snapshots.
+                </p>
+              </div>
+            </div>
+
+            <form className="subview" onSubmit={(event) => void handleSaveProductEdit(event)} noValidate>
+              <label className="field">
+                <span>Product name *</span>
+                <input
+                  ref={editNameInputRef}
+                  type="text"
+                  maxLength={80}
+                  disabled={savingEdit}
+                  value={editName}
+                  onChange={(e) => {
+                    setEditName(e.target.value);
+                    setEditError(null);
+                  }}
+                />
+              </label>
+
+              <label className="field">
+                <span>Short description (optional)</span>
+                <input
+                  type="text"
+                  maxLength={160}
+                  disabled={savingEdit}
+                  value={editDescription}
+                  onChange={(e) => {
+                    setEditDescription(e.target.value);
+                    setEditError(null);
+                  }}
+                />
+              </label>
+
+              <div className="field-row">
+                <div className="field">
+                  <span>Confirmed stock unit</span>
+                  <div className="inventory-readonly-note">
+                    <strong>{editProductItem.unit}</strong> (unit cannot be changed after setup)
+                  </div>
                 </div>
 
-                {conflictNotice && (
-                  <div className="alert alert--error" role="alert">
-                    {conflictNotice}
-                  </div>
-                )}
+                <label className="field">
+                  <span>Selling price (₱) *</span>
+                  <input
+                    type="text"
+                    inputMode="decimal"
+                    disabled={savingEdit}
+                    value={editPriceInput}
+                    onChange={(e) => {
+                      setEditPriceInput(e.target.value);
+                      setEditError(null);
+                    }}
+                  />
+                </label>
+              </div>
 
-                {!isNotSet && item.openingStock ? (
-                  <>
-                    <dl className="detail-list">
-                      <div className="detail-list__row">
-                        <dt>Opening count</dt>
-                        <dd>{formatQuantityLabel(item.openingStock.quantity, item.openingStock.unit)}</dd>
-                      </div>
-                      <div className="detail-list__row">
-                        <dt>Recorded by</dt>
-                        <dd>{item.openingStock.recordedBy}</dd>
-                      </div>
-                      <div className="detail-list__row">
-                        <dt>Recorded at</dt>
-                        <dd>{formatRecordedAtManila(item.openingStock.recordedAt)}</dd>
-                      </div>
-                    </dl>
-                    <p className="muted-sm">Opening count is preserved once recorded and cannot be overwritten.</p>
-                  </>
-                ) : canInitialize ? (
-                  <form className="inventory-form" onSubmit={(event) => void handleOpeningSubmit(event, item)} noValidate>
-                    {formError && (
-                      <div className="alert alert--error" role="alert">
-                        {formError}
-                      </div>
-                    )}
+              <div className="inventory-pos-visibility-box">
+                <label className="checkbox-field">
+                  <input
+                    type="checkbox"
+                    checked={editShowInPos}
+                    disabled={savingEdit}
+                    onChange={(e) => {
+                      setEditShowInPos(e.target.checked);
+                      setEditError(null);
+                    }}
+                  />
+                  <span>Show in POS</span>
+                </label>
 
-                    <label className="field" htmlFor={inputId}>
-                      <span>Opening count ({item.unit}) *</span>
-                      <input
-                        id={inputId}
-                        ref={(el) => {
-                          inputRefs.current[item.shape] = el;
-                        }}
-                        name={`openingQuantity-${item.shape}`}
-                        type="text"
-                        inputMode="numeric"
-                        pattern="[0-9]*"
-                        autoComplete="off"
-                        placeholder="0"
-                        value={inputs[item.shape]}
-                        aria-describedby={hintId}
-                        disabled={submittingShape !== null}
-                        onChange={(e) => {
-                          const value = e.target.value;
-                          setInputs((prev) => ({ ...prev, [item.shape]: value }));
-                          setFieldErrors((prev) => ({ ...prev, [item.shape]: undefined }));
-                        }}
-                      />
-                      <small id={hintId}>Enter the actual physical count. Enter 0 if none are in stock.</small>
-                    </label>
+                <PosSectionPicker
+                  label={`POS section ${editShowInPos ? "*" : "(optional while hidden)"}`}
+                  ariaLabel="Edit POS section"
+                  value={editPosSection}
+                  onChange={(nextCode) => {
+                    setEditPosSection(nextCode);
+                    setEditError(null);
+                  }}
+                  sections={posSections}
+                  allowBlank
+                  disabled={savingEdit}
+                  onSectionCreated={handleSectionCreated}
+                />
+              </div>
 
-                    <button
-                      type="submit"
-                      className="button button--primary button--block"
-                      disabled={submittingShape !== null}
-                    >
-                      {isSubmitting ? "Saving opening count…" : `Save ${item.name} Opening Count`}
-                    </button>
-                  </form>
-                ) : (
-                  <p className="inventory-readonly-note">
-                    Waiting for the Owner to record the initial physical count for {item.name}.
-                  </p>
-                )}
-              </article>
-            );
-          })}
-        </section>
+              {editError && (
+                <div className="alert alert--error" role="alert">
+                  {editError}
+                </div>
+              )}
+
+              <div className="modal__actions">
+                <button
+                  type="button"
+                  className="button button--ghost"
+                  disabled={savingEdit}
+                  onClick={() => setEditProductItem(null)}
+                >
+                  Cancel
+                </button>
+                <button type="submit" className="button button--primary" disabled={savingEdit}>
+                  {savingEdit ? "Saving changes…" : "Save Changes"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {archiveItem && canCreateProduct && (
+        <div className="modal-backdrop" role="presentation">
+          <div
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="archive-product-title"
+          >
+            <h2 id="archive-product-title">Archive {archiveItem.name}?</h2>
+            <p className="muted-sm">
+              Archiving removes <strong>{archiveItem.name}</strong> from active Inventory and blocks new POS sales.
+              Its current balance ({formatQuantityLabel(archiveItem.currentQuantity, archiveItem.unit)}), opening
+              count, stock movements, past sales, and any already-started checkout recovery stay intact.
+            </p>
+
+            {archiveError && (
+              <div className="alert alert--error" role="alert">
+                {archiveError}
+              </div>
+            )}
+
+            <div className="modal__actions">
+              <button
+                type="button"
+                className="button button--ghost"
+                disabled={archiving}
+                onClick={() => setArchiveItem(null)}
+              >
+                Cancel
+              </button>
+              <button
+                type="button"
+                className="button button--primary"
+                disabled={archiving}
+                onClick={() => void handleConfirmArchive()}
+              >
+                {archiving ? "Archiving…" : "Confirm Archive"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {reconcileItem && canInitialize && reconcileItem.currentQuantity !== null && (
+        <div className="modal-backdrop" role="presentation">
+          <div
+            className="modal modal--wide"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="reconcile-stock-title"
+          >
+            <div className="detail-card__header">
+              <div>
+                <h2 id="reconcile-stock-title">Correct stock · {reconcileItem.name}</h2>
+                <p className="muted-sm">
+                  Physical-count reconciliation (INV-009). Pause sales or movements for this item while counting.
+                  Original opening count remains preserved in history.
+                </p>
+              </div>
+            </div>
+
+            <dl className="detail-list">
+              <div className="detail-list__row">
+                <dt>Current recorded balance</dt>
+                <dd>
+                  <strong>{formatQuantityLabel(reconcileItem.currentQuantity, reconcileItem.unit)}</strong>
+                </dd>
+              </div>
+              {reconcileItem.openingStock && (
+                <div className="detail-list__row">
+                  <dt>Original opening count</dt>
+                  <dd>
+                    {formatQuantityLabel(
+                      reconcileItem.openingStock.quantity,
+                      reconcileItem.openingStock.unit,
+                    )}{" "}
+                    · {reconcileItem.openingStock.recordedBy} (
+                    {formatRecordedAtManila(reconcileItem.openingStock.recordedAt)})
+                  </dd>
+                </div>
+              )}
+            </dl>
+
+            {reconcileStaleNotice && (
+              <div className="callout callout--warning" role="alert">
+                <p className="callout__title">Stock changed during counting — recount required</p>
+                <p className="callout__body">{reconcileStaleNotice}</p>
+              </div>
+            )}
+
+            <form className="subview" onSubmit={(event) => void handleConfirmReconciliation(event)} noValidate>
+              <label className="field">
+                <span>Actual physical count ({reconcileItem.unit}) *</span>
+                <input
+                  ref={reconcileCountInputRef}
+                  type="text"
+                  inputMode="numeric"
+                  pattern="[0-9]*"
+                  autoComplete="off"
+                  placeholder="0"
+                  disabled={reconciling}
+                  value={reconcileCountInput}
+                  onChange={(e) => {
+                    setReconcileCountInput(e.target.value);
+                    setReconcileError(null);
+                    setReconcileRequestKey(generateClientKey());
+                  }}
+                />
+                <small>Count usable station-owned stock (0 or more).</small>
+              </label>
+
+              <label className="field">
+                <span>Factual reason *</span>
+                <input
+                  type="text"
+                  maxLength={240}
+                  placeholder="e.g. Physical shelf recount — initial miscount"
+                  disabled={reconciling}
+                  value={reconcileReasonInput}
+                  onChange={(e) => {
+                    setReconcileReasonInput(e.target.value);
+                    setReconcileError(null);
+                    setReconcileRequestKey(generateClientKey());
+                  }}
+                />
+              </label>
+
+              {reconcilePreview && (
+                <div className="inventory-reconcile-preview" role="status">
+                  <dl className="detail-list inventory-detail-list">
+                    <div className="detail-list__row">
+                      <dt>Recorded before</dt>
+                      <dd>{formatQuantityLabel(reconcilePreview.before, reconcileItem.unit)}</dd>
+                    </div>
+                    <div className="detail-list__row">
+                      <dt>Physical count</dt>
+                      <dd>{formatQuantityLabel(reconcilePreview.physicalCount, reconcileItem.unit)}</dd>
+                    </div>
+                    <div className="detail-list__row">
+                      <dt>Calculated difference</dt>
+                      <dd>
+                        <strong>{formatSignedDelta(reconcilePreview.delta, reconcileItem.unit)}</strong>
+                      </dd>
+                    </div>
+                    <div className="detail-list__row">
+                      <dt>Resulting balance</dt>
+                      <dd>
+                        <strong>{formatQuantityLabel(reconcilePreview.after, reconcileItem.unit)}</strong>
+                      </dd>
+                    </div>
+                  </dl>
+                </div>
+              )}
+
+              {reconcileError && (
+                <div className="alert alert--error" role="alert">
+                  {reconcileError}
+                </div>
+              )}
+
+              <div className="modal__actions">
+                <button
+                  type="button"
+                  className="button button--ghost"
+                  disabled={reconciling}
+                  onClick={() => setReconcileItem(null)}
+                >
+                  Cancel
+                </button>
+                <button type="submit" className="button button--primary" disabled={reconciling}>
+                  {reconciling
+                    ? "Saving…"
+                    : reconcilePreview?.delta === 0
+                      ? "Confirm Verification"
+                      : "Confirm Stock Correction"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
       )}
     </AppShell>
   );

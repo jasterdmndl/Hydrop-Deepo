@@ -15,21 +15,29 @@ import {
   clearUnpaidCartIfMatchesReference,
   computeCashSummary,
   type ConfirmSaleResponse,
+  type ContainerPackageCode,
   currentManilaIso,
   type DaySummaryView,
   type EndDayResponse,
   evaluateEndDayGuard,
   formatCentavos,
+  formatIncludedGripoLabel,
   formatLiters,
   formatManilaTimestamp,
+  type IncludedGripoType,
   isPendingRecoveryStorageKey,
+  isPriorDayMerchandiseOnly,
+  isPriorDaySettleableComposition,
   loadPendingRecoveries,
   loadUnpaidCart,
   notifyPosStateChanged,
   parseLitersInput,
   parsePesoInputToCentavos,
   type PendingCheckoutRecovery,
+  type PosContainerPackageItem,
   type PosDayResponse,
+  type PosMerchandiseItem,
+  type PosSectionInfo,
   type PrepareCheckoutResponse,
   type PriorDaySettlementView,
   type QuoteLineItem,
@@ -67,33 +75,143 @@ function generateKey(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
+const DEFAULT_MERCHANDISE_SECTIONS: readonly PosSectionInfo[] = [
+  {
+    code: "TAKIP_ACCESSORIES",
+    name: "Takip Types / Accessories",
+    isBuiltIn: true,
+    sortOrder: 20,
+  },
+  {
+    code: "CHANGE_OF_GRIPO",
+    name: "Change of Gripo",
+    isBuiltIn: true,
+    sortOrder: 30,
+  },
+];
+
+function sectionSubtitleFor(code: string): string {
+  switch (code) {
+    case "CONTAINERS":
+      return "Choose the container type.";
+    case "TAKIP_ACCESSORIES":
+      return "Choose caps, dividers, or accessories.";
+    case "CHANGE_OF_GRIPO":
+      return "Choose the type of gripo.";
+    default:
+      return "Choose merchandise items.";
+  }
+}
+
 function defaultLineId(waterType: WaterType): string {
   return `std-${waterType}`;
 }
 
+function merchLineId(productId: string): string {
+  return `merch-${productId}`;
+}
+
+const INCLUDED_GRIPO_OPTIONS: readonly { value: IncludedGripoType; label: string }[] = [
+  { value: "PUSH_TYPE", label: "Push-Type gripo" },
+  { value: "TWIST_TYPE", label: "Twist-Type gripo" },
+];
+
+function containerPkgKey(packageCode: ContainerPackageCode, includedGripo: IncludedGripoType): string {
+  return `${packageCode}:${includedGripo}`;
+}
+
+function containerPkgLineId(
+  packageCode: ContainerPackageCode,
+  includedGripo: IncludedGripoType | null,
+): string {
+  return `pkg-${packageCode}-${includedGripo ?? "UNSPECIFIED"}`;
+}
+
+function formatCartCountPill(containers: number, merchandiseQty: number): string {
+  const parts: string[] = [];
+  if (containers > 0 || merchandiseQty === 0) {
+    parts.push(`${containers} container${containers === 1 ? "" : "s"}`);
+  }
+  if (merchandiseQty > 0) {
+    parts.push(`${merchandiseQty} item${merchandiseQty === 1 ? "" : "s"}`);
+  }
+  return parts.join(" · ");
+}
+
+function formatSavedSaleHandover(sale: SaleView): string {
+  const merchQty = sale.items
+    .filter((item) => item.kind === "MERCHANDISE" || item.kind === "CONTAINER_PACKAGE")
+    .reduce((sum, item) => sum + item.quantity, 0);
+  if (sale.totalContainers > 0 && merchQty > 0) {
+    return `refill ${sale.totalContainers} container${sale.totalContainers === 1 ? "" : "s"} (${formatLiters(
+      sale.totalVolumeLiters,
+    )}) and hand over ${merchQty} merchandise item${merchQty === 1 ? "" : "s"}.`;
+  }
+  if (sale.totalContainers === 0 && merchQty > 0) {
+    return `hand over ${merchQty} merchandise item${merchQty === 1 ? "" : "s"}.`;
+  }
+  return `refill ${sale.totalContainers} container${sale.totalContainers === 1 ? "" : "s"} (${formatLiters(
+    sale.totalVolumeLiters,
+  )}), and hand over.`;
+}
+
 function quoteItemsToDraftLines(items: QuoteLineItem[]): CartDraftLine[] {
-  return items.map((item) =>
-    item.kind === "STANDARD"
-      ? {
-        id: defaultLineId(item.waterType),
+  return items.map((item) => {
+    if (item.kind === "STANDARD") {
+      const waterType = item.waterType ?? "PURIFIED";
+      return {
+        id: defaultLineId(waterType),
         kind: "STANDARD",
-        waterType: item.waterType,
+        waterType,
         displayName: item.displayLabel,
         unitVolumeMl: item.unitVolumeMl,
         unitVolumeLiters: item.unitVolumeLiters,
         unitPriceCentavos: item.unitPriceCentavos,
         quantity: item.quantity,
-      }
-      : {
-        id: `custom-${item.lineIndex}-${item.waterType}-${item.unitVolumeMl}-${item.unitPriceCentavos}`,
+      };
+    }
+    if (item.kind === "CUSTOM") {
+      const waterType = item.waterType ?? "PURIFIED";
+      return {
+        id: `custom-${item.lineIndex}-${waterType}-${item.unitVolumeMl}-${item.unitPriceCentavos}`,
         kind: "CUSTOM",
-        waterType: item.waterType,
+        waterType,
         displayName: item.displayLabel,
         unitVolumeLiters: item.unitVolumeLiters,
         unitPriceCentavos: item.unitPriceCentavos,
         quantity: item.quantity,
-      },
-  );
+      };
+    }
+    if (item.kind === "CONTAINER_PACKAGE") {
+      const packageCode = (item.catalogCode ?? "ROUND_EMPTY") as ContainerPackageCode;
+      const includedGripo: IncludedGripoType | null = item.includedGripo ?? null;
+      return {
+        id: containerPkgLineId(packageCode, includedGripo),
+        kind: "CONTAINER_PACKAGE",
+        packageCode,
+        includedGripo,
+        productId: item.productId ?? `pkg-${item.lineIndex}`,
+        displayName: item.displayLabel,
+        unitVolumeMl: item.unitVolumeMl,
+        unitVolumeLiters: item.unitVolumeLiters,
+        unitPriceCentavos: item.unitPriceCentavos,
+        stockUnit: item.stockUnit ?? "containers",
+        quantity: item.quantity,
+      };
+    }
+    const productId = item.productId ?? `line-${item.lineIndex}`;
+    return {
+      id: merchLineId(productId),
+      kind: "MERCHANDISE",
+      productId,
+      displayName: item.displayLabel,
+      description: null,
+      stockUnit: item.stockUnit ?? "pcs",
+      posSection: item.posSection ?? "TAKIP_ACCESSORIES",
+      unitPriceCentavos: item.unitPriceCentavos,
+      quantity: item.quantity,
+    };
+  });
 }
 
 export function PosPage() {
@@ -101,6 +219,9 @@ export function PosPage() {
   const { data: modulesData } = useModulesData();
 
   const [catalog, setCatalog] = useState<CatalogRefill[]>([]);
+  const [merchandise, setMerchandise] = useState<PosMerchandiseItem[]>([]);
+  const [containerPackages, setContainerPackages] = useState<PosContainerPackageItem[]>([]);
+  const [posSections, setPosSections] = useState<PosSectionInfo[]>([]);
   const [dayStatus, setDayStatus] = useState<PosDayResponse | null>(null);
   const [loading, setLoading] = useState(true);
   const [pageError, setPageError] = useState<string | null>(null);
@@ -237,11 +358,21 @@ export function PosPage() {
     setPageError(null);
     try {
       const [catRes, dayRes] = await Promise.all([
-        api<{ items: CatalogRefill[] }>("/api/pos/catalog", { background: true }),
+        api<{
+          items: CatalogRefill[];
+          merchandise?: PosMerchandiseItem[];
+          containerPackages?: PosContainerPackageItem[];
+          posSections?: PosSectionInfo[];
+        }>("/api/pos/catalog", {
+          background: true,
+        }),
         api<PosDayResponse>("/api/pos/day", { background: true }),
       ]);
       if (!loadTrackerRef.current.isCurrent(requestId)) return;
       setCatalog(catRes.items);
+      setMerchandise(catRes.merchandise ?? []);
+      setContainerPackages(catRes.containerPackages ?? []);
+      setPosSections(catRes.posSections ?? []);
       applyServerDayStatus(dayRes);
     } catch (err) {
       if (!loadTrackerRef.current.isCurrent(requestId)) return;
@@ -351,15 +482,24 @@ export function PosPage() {
   const cartTotals = useMemo(() => {
     let totalCentavos = 0;
     let totalContainers = 0;
+    let totalMerchandiseQty = 0;
     let totalVolumeLiters = 0;
     for (const line of lines) {
       totalCentavos += line.unitPriceCentavos * line.quantity;
-      totalContainers += line.quantity;
-      totalVolumeLiters += line.unitVolumeLiters * line.quantity;
+      if (line.kind === "MERCHANDISE") {
+        totalMerchandiseQty += line.quantity;
+      } else if (line.kind === "CONTAINER_PACKAGE") {
+        totalMerchandiseQty += line.quantity;
+        totalVolumeLiters += line.unitVolumeLiters * line.quantity;
+      } else {
+        totalContainers += line.quantity;
+        totalVolumeLiters += line.unitVolumeLiters * line.quantity;
+      }
     }
     return {
       totalCentavos,
       totalContainers,
+      totalMerchandiseQty,
       totalVolumeLiters: Number(totalVolumeLiters.toFixed(2)),
     };
   }, [lines]);
@@ -373,6 +513,69 @@ export function PosPage() {
     }
     return map;
   }, [lines]);
+
+  const merchandiseQtyById = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const line of lines) {
+      if (line.kind === "MERCHANDISE") {
+        map.set(line.productId, line.quantity);
+      }
+    }
+    return map;
+  }, [lines]);
+
+  const containerPkgQtyByKey = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const line of lines) {
+      if (line.kind === "CONTAINER_PACKAGE" && line.includedGripo) {
+        map.set(containerPkgKey(line.packageCode, line.includedGripo), line.quantity);
+      }
+    }
+    return map;
+  }, [lines]);
+
+  const selectedContainerQtyByProductId = useMemo(() => {
+    const map = new Map<string, number>();
+    for (const line of lines) {
+      if (line.kind === "CONTAINER_PACKAGE") {
+        map.set(line.productId, (map.get(line.productId) ?? 0) + line.quantity);
+      }
+    }
+    return map;
+  }, [lines]);
+
+  const merchandiseSections = useMemo(() => {
+    const orderedSections = (posSections.length > 0 ? posSections : DEFAULT_MERCHANDISE_SECTIONS)
+      .filter((s) => s.code !== "CONTAINERS")
+      .slice()
+      .sort((a, b) => {
+        if (a.sortOrder !== b.sortOrder) return a.sortOrder - b.sortOrder;
+        return a.name.toLowerCase().localeCompare(b.name.toLowerCase());
+      });
+
+    const knownCodes = new Set(orderedSections.map((s) => s.code));
+    const groups = orderedSections
+      .map((meta) => ({
+        section: meta.code,
+        title: meta.name,
+        subtitle: sectionSubtitleFor(meta.code),
+        items: merchandise.filter((item) => item.posSection === meta.code),
+      }))
+      .filter((group) => group.items.length > 0);
+
+    const extraCodes = Array.from(
+      new Set(merchandise.map((item) => item.posSection).filter((code) => !knownCodes.has(code))),
+    ).sort();
+    for (const code of extraCodes) {
+      groups.push({
+        section: code,
+        title: code,
+        subtitle: sectionSubtitleFor(code),
+        items: merchandise.filter((item) => item.posSection === code),
+      });
+    }
+    return groups;
+  }, [merchandise, posSections]);
 
   const customLines = useMemo(() => lines.filter((line) => line.kind === "CUSTOM"), [lines]);
 
@@ -476,6 +679,124 @@ export function PosPage() {
           unitVolumeMl: item.unitVolumeMl,
           unitVolumeLiters: item.unitVolumeLiters,
           unitPriceCentavos: item.unitPriceCentavos,
+          quantity: clamped,
+        },
+      ];
+    });
+    return true;
+  }
+
+  function setMerchandiseQuantity(item: PosMerchandiseItem, nextQty: number): boolean {
+    const maxAllowed =
+      item.availableQuantity !== null ? Math.min(MAX_LINE_QTY, item.availableQuantity) : 0;
+    const clamped = Math.max(0, Math.min(maxAllowed, Math.trunc(nextQty)));
+    const id = merchLineId(item.id);
+    const existingIdx = lines.findIndex((l) => l.id === id);
+
+    if (clamped > 0 && existingIdx === -1 && lines.length >= MAX_LINES) {
+      setSaleError(`Maximum ${MAX_LINES} lines per sale.`);
+      return false;
+    }
+
+    setSaleError(null);
+    setLastSavedSale(null);
+    setLastSettledPriorDay(null);
+    setLastAlreadySavedPriorDay(null);
+    setLines((prev) => {
+      const idx = prev.findIndex((l) => l.id === id);
+      if (clamped === 0) {
+        return idx === -1 ? prev : prev.filter((l) => l.id !== id);
+      }
+      if (idx !== -1) {
+        return prev.map((l) =>
+          l.id === id
+            ? {
+                ...l,
+                displayName: item.name,
+                unitPriceCentavos: item.unitPriceCentavos,
+                quantity: clamped,
+              }
+            : l,
+        );
+      }
+      if (prev.length >= MAX_LINES) {
+        return prev;
+      }
+      return [
+        ...prev,
+        {
+          id,
+          kind: "MERCHANDISE",
+          productId: item.id,
+          displayName: item.name,
+          description: item.description,
+          stockUnit: item.unit,
+          posSection: item.posSection,
+          unitPriceCentavos: item.unitPriceCentavos,
+          quantity: clamped,
+        },
+      ];
+    });
+    return true;
+  }
+
+  function setContainerPackageQuantity(
+    pkg: PosContainerPackageItem,
+    includedGripo: IncludedGripoType,
+    nextQty: number,
+  ): boolean {
+    const currentQty = containerPkgQtyByKey.get(containerPkgKey(pkg.packageCode, includedGripo)) ?? 0;
+    const otherQty = Math.max(0, (selectedContainerQtyByProductId.get(pkg.productId) ?? 0) - currentQty);
+    const remainingAvailable =
+      pkg.availableQuantity !== null ? Math.max(0, pkg.availableQuantity - otherQty) : 0;
+    const maxAllowed = Math.min(MAX_LINE_QTY, currentQty + remainingAvailable);
+    const clamped = Math.max(0, Math.min(maxAllowed, Math.trunc(nextQty)));
+    const id = containerPkgLineId(pkg.packageCode, includedGripo);
+    const displayName = `${pkg.name} · ${formatIncludedGripoLabel(includedGripo)}`;
+    const existingIdx = lines.findIndex((l) => l.id === id);
+
+    if (clamped > 0 && existingIdx === -1 && lines.length >= MAX_LINES) {
+      setSaleError(`Maximum ${MAX_LINES} lines per sale.`);
+      return false;
+    }
+
+    setSaleError(null);
+    setLastSavedSale(null);
+    setLastSettledPriorDay(null);
+    setLastAlreadySavedPriorDay(null);
+    setLines((prev) => {
+      const idx = prev.findIndex((l) => l.id === id);
+      if (clamped === 0) {
+        return idx === -1 ? prev : prev.filter((l) => l.id !== id);
+      }
+      if (idx !== -1) {
+        return prev.map((l) =>
+          l.id === id
+            ? {
+                ...l,
+                displayName,
+                unitPriceCentavos: pkg.unitPriceCentavos,
+                quantity: clamped,
+              }
+            : l,
+        );
+      }
+      if (prev.length >= MAX_LINES) {
+        return prev;
+      }
+      return [
+        ...prev,
+        {
+          id,
+          kind: "CONTAINER_PACKAGE",
+          packageCode: pkg.packageCode,
+          includedGripo,
+          productId: pkg.productId,
+          displayName,
+          unitVolumeMl: pkg.unitVolumeMl,
+          unitVolumeLiters: pkg.unitVolumeLiters,
+          unitPriceCentavos: pkg.unitPriceCentavos,
+          stockUnit: pkg.unit,
           quantity: clamped,
         },
       ];
@@ -825,12 +1146,20 @@ export function PosPage() {
   const parsedCashCentavos = parsePesoInputToCentavos(cashInput);
   const reviewTotalCentavos = preparedCheckout?.totalCentavos ?? cartTotals.totalCentavos;
   const cashSummary = computeCashSummary(reviewTotalCentavos, parsedCashCentavos);
+  const draftHasMissingGripo =
+    preparedCheckout?.status === "DRAFT" &&
+    preparedCheckout.items.some(
+      (item) => item.kind === "CONTAINER_PACKAGE" && !item.includedGripo,
+    );
 
   async function handleBackToSelection() {
     if (!preparedCheckout) {
       setStep("select");
       return;
     }
+    const hadMissingGripo =
+      draftHasMissingGripo ||
+      lines.some((line) => line.kind === "CONTAINER_PACKAGE" && !line.includedGripo);
     setCancellingDraft(true);
     setSaleError(null);
     try {
@@ -838,6 +1167,11 @@ export function PosPage() {
         method: "POST",
         body: { reason: "Returned to refill selection" },
       });
+      if (hadMissingGripo) {
+        setLines((prev) =>
+          prev.filter((line) => line.kind !== "CONTAINER_PACKAGE" || line.includedGripo !== null),
+        );
+      }
       setPreparedCheckout(null);
       setPrepareKey(null);
       setPrepareSignature(null);
@@ -845,6 +1179,11 @@ export function PosPage() {
       setConfirmNoCashChecked(false);
       setStep("select");
       await loadPosState();
+      if (hadMissingGripo) {
+        setSaleError(
+          "Select Push-Type or Twist-Type gripo for each container package before continuing to payment.",
+        );
+      }
     } catch (err) {
       setSaleError(
         err instanceof ApiError
@@ -1447,13 +1786,17 @@ export function PosPage() {
               {lastSettledPriorDay && (
                 <div className="callout callout--success" role="status">
                   <p className="callout__title">
-                    Prior-day refill {lastSettledPriorDay.checkoutReference} settled
+                    {isPriorDayMerchandiseOnly(lastSettledPriorDay.items)
+                      ? `Prior-day merchandise ${lastSettledPriorDay.checkoutReference} settled`
+                      : `Prior-day refill ${lastSettledPriorDay.checkoutReference} settled`}
                   </p>
                   <p className="callout__body">
                     Net amount kept {formatCentavos(lastSettledPriorDay.netAmountKeptCentavos)} · Original payment
                     date {lastSettledPriorDay.originalBusinessDate} · Settlement date (Manila){" "}
-                    {lastSettledPriorDay.settlementDate}. No further payment collected; recorded separately from
-                    today&apos;s refill sales.
+                    {lastSettledPriorDay.settlementDate}. No further payment collected; recorded separately from{" "}
+                    {isPriorDayMerchandiseOnly(lastSettledPriorDay.items)
+                      ? "today's sales."
+                      : "today's refill sales."}
                   </p>
                   <div className="callout__actions">
                     <button
@@ -1540,6 +1883,7 @@ export function PosPage() {
                       const canSettleHere =
                         user.role === "OWNER" &&
                         isPriorDay &&
+                        isPriorDaySettleableComposition(c.items) &&
                         (c.status === "REVIEW_REQUIRED" || c.status === "PAYMENT_PENDING");
                       return (
                         <div key={c.reference} className="pos-unresolved-row">
@@ -1595,7 +1939,7 @@ export function PosPage() {
                           {formatCentavos(c.totalCentavos)} ({c.createdBy}, original date {c.businessDate}) —{" "}
                           {c.resolutionReason ?? "Prior-day payment pending Owner review"}
                         </span>
-                        {user.role === "OWNER" && (
+                        {user.role === "OWNER" && isPriorDaySettleableComposition(c.items) && (
                           <span className="callout__actions">
                             <button
                               type="button"
@@ -1776,6 +2120,245 @@ export function PosPage() {
                         </div>
                       )}
                     </article>
+
+                    {containerPackages.length > 0 && (
+                      <article className="card pos-selection-card" aria-label="Containers">
+                        <div className="detail-card__header">
+                          <div>
+                            <h2>Containers</h2>
+                            <p className="muted-sm">
+                              Choose new Round or Slim packages. Empty and filled options share each shape&apos;s balance.
+                            </p>
+                          </div>
+                        </div>
+
+                        <div className="refill-grid">
+                          {containerPackages.map((pkg) => {
+                            const pushQty =
+                              containerPkgQtyByKey.get(containerPkgKey(pkg.packageCode, "PUSH_TYPE")) ?? 0;
+                            const twistQty =
+                              containerPkgQtyByKey.get(containerPkgKey(pkg.packageCode, "TWIST_TYPE")) ?? 0;
+                            const isSelected = pushQty + twistQty > 0;
+                            const totalShapeSelected = selectedContainerQtyByProductId.get(pkg.productId) ?? 0;
+                            const shapeRemaining =
+                              pkg.availableQuantity === null
+                                ? 0
+                                : Math.max(0, pkg.availableQuantity - totalShapeSelected);
+                            const isInStock = pkg.stockStatus === "IN_STOCK" && (pkg.availableQuantity ?? 0) > 0;
+                            const stockLabel =
+                              pkg.stockStatus === "NOT_SET"
+                                ? "Opening stock not set"
+                                : (pkg.availableQuantity ?? 0) === 0
+                                  ? "Out of stock"
+                                  : totalShapeSelected > 0
+                                    ? `${shapeRemaining} of ${pkg.availableQuantity} ${pkg.unit} left`
+                                    : `${pkg.availableQuantity} ${pkg.unit} available`;
+
+                            return (
+                              <div
+                                key={pkg.packageCode}
+                                className={`refill-card ${isSelected ? "refill-card--selected" : ""}`}
+                              >
+                                <div className="refill-card__info">
+                                  <h3>{pkg.name}</h3>
+                                  <p className="muted-sm">{pkg.description}</p>
+                                  <p
+                                    className={`pos-stock-note ${
+                                      pkg.stockStatus === "NOT_SET"
+                                        ? "pos-stock-note--warn"
+                                        : (pkg.availableQuantity ?? 0) === 0 || shapeRemaining === 0
+                                          ? "pos-stock-note--out"
+                                          : ""
+                                    }`}
+                                  >
+                                    {stockLabel}
+                                  </p>
+                                </div>
+
+                                <div className="refill-card__footer">
+                                  <div className="refill-card__price-row">
+                                    <span className="refill-card__price">
+                                      <strong>{formatCentavos(pkg.unitPriceCentavos)}</strong>
+                                    </span>
+                                    <span className="muted-sm">Same price for either gripo</span>
+                                  </div>
+
+                                  <div className="pos-gripo-rows">
+                                    {INCLUDED_GRIPO_OPTIONS.map((gripo) => {
+                                      const fieldId = containerPkgLineId(pkg.packageCode, gripo.value);
+                                      const qty =
+                                        containerPkgQtyByKey.get(
+                                          containerPkgKey(pkg.packageCode, gripo.value),
+                                        ) ?? 0;
+                                      const edit = qtyEdits[fieldId];
+                                      const visibleError = getVisibleQuantityError(edit);
+                                      const errorId = `qty-error-${fieldId}`;
+                                      const otherQty = Math.max(0, totalShapeSelected - qty);
+                                      const remainingAvailable =
+                                        pkg.availableQuantity === null
+                                          ? 0
+                                          : Math.max(0, pkg.availableQuantity - otherQty);
+                                      const maxStep = isInStock
+                                        ? Math.min(MAX_LINE_QTY, qty + remainingAvailable)
+                                        : MAX_LINE_QTY;
+                                      const labelWithGripo = `${pkg.name} (${gripo.label})`;
+
+                                      return (
+                                        <div key={gripo.value} className="pos-gripo-row-wrap">
+                                          <div className="pos-gripo-row">
+                                            <span className="pos-gripo-row__label">{gripo.label}</span>
+                                            <QuantityStepper
+                                              value={qty}
+                                              edit={edit}
+                                              onEditChange={(nextEdit) => setFieldQtyEdit(fieldId, nextEdit)}
+                                              onCommitValidValue={(nextQty) =>
+                                                setContainerPackageQuantity(pkg, gripo.value, nextQty)
+                                              }
+                                              onStep={(delta) => {
+                                                clearFieldQtyEdit(fieldId);
+                                                setContainerPackageQuantity(pkg, gripo.value, qty + delta);
+                                              }}
+                                              groupLabel={`${labelWithGripo} quantity controls`}
+                                              inputLabel={`${labelWithGripo} quantity`}
+                                              decreaseLabel={`Decrease ${labelWithGripo}`}
+                                              increaseLabel={`Increase ${labelWithGripo}`}
+                                              disabled={
+                                                !dayStatus?.canSell ||
+                                                preparingCheckout ||
+                                                (!isInStock && qty === 0)
+                                              }
+                                              decreaseDisabled={
+                                                !dayStatus?.canSell || preparingCheckout || qty === 0
+                                              }
+                                              increaseDisabled={
+                                                !dayStatus?.canSell ||
+                                                preparingCheckout ||
+                                                !isInStock ||
+                                                remainingAvailable <= 0 ||
+                                                qty >= maxStep
+                                              }
+                                              allowRestingZero
+                                              max={maxStep}
+                                              errorId={errorId}
+                                              inputRef={(el) => {
+                                                if (el) qtyInputRefs.current.set(fieldId, el);
+                                                else qtyInputRefs.current.delete(fieldId);
+                                              }}
+                                            />
+                                          </div>
+                                          {visibleError && (
+                                            <p id={errorId} className="qty-stepper__error" role="alert">
+                                              {visibleError}
+                                            </p>
+                                          )}
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </article>
+                    )}
+
+                    {merchandiseSections.map((group) => (
+                      <article
+                        key={group.section}
+                        className="card pos-selection-card"
+                        aria-label={group.title}
+                      >
+                        <div className="detail-card__header">
+                          <div>
+                            <h2>{group.title}</h2>
+                            <p className="muted-sm">{group.subtitle}</p>
+                          </div>
+                        </div>
+
+                        <div className="refill-grid">
+                          {group.items.map((item) => {
+                            const fieldId = merchLineId(item.id);
+                            const qty = merchandiseQtyById.get(item.id) ?? 0;
+                            const isSelected = qty > 0;
+                            const edit = qtyEdits[fieldId];
+                            const visibleError = getVisibleQuantityError(edit);
+                            const errorId = `qty-error-${fieldId}`;
+                            const available = item.availableQuantity ?? 0;
+                            const isInStock = item.stockStatus === "IN_STOCK" && available > 0;
+                            const maxStep = isInStock ? Math.min(MAX_LINE_QTY, available) : MAX_LINE_QTY;
+                            const stockLabel =
+                              item.stockStatus === "NOT_SET"
+                                ? "Opening stock not set"
+                                : item.stockStatus === "OUT_OF_STOCK" || available === 0
+                                  ? "Out of stock"
+                                  : `${available} ${item.unit} available`;
+
+                            return (
+                              <div
+                                key={item.id}
+                                className={`refill-card ${isSelected ? "refill-card--selected" : ""}`}
+                              >
+                                <div className="refill-card__info">
+                                  <h3>{item.name}</h3>
+                                  {item.description && <p className="muted-sm">{item.description}</p>}
+                                  <p
+                                    className={`pos-stock-note ${
+                                      item.stockStatus === "NOT_SET"
+                                        ? "pos-stock-note--warn"
+                                        : item.stockStatus === "OUT_OF_STOCK" || available === 0
+                                          ? "pos-stock-note--out"
+                                          : ""
+                                    }`}
+                                  >
+                                    {stockLabel}
+                                  </p>
+                                </div>
+
+                                <div className="refill-card__footer">
+                                  <div className="refill-card__bottom">
+                                    <span className="refill-card__price">
+                                      <strong>{formatCentavos(item.unitPriceCentavos)}</strong>
+                                    </span>
+                                    <QuantityStepper
+                                      value={qty}
+                                      edit={edit}
+                                      onEditChange={(nextEdit) => setFieldQtyEdit(fieldId, nextEdit)}
+                                      onCommitValidValue={(nextQty) => setMerchandiseQuantity(item, nextQty)}
+                                      onStep={(delta) => {
+                                        clearFieldQtyEdit(fieldId);
+                                        setMerchandiseQuantity(item, qty + delta);
+                                      }}
+                                      groupLabel={`${item.name} quantity controls`}
+                                      inputLabel={`${item.name} quantity`}
+                                      decreaseLabel={`Decrease ${item.name}`}
+                                      increaseLabel={`Increase ${item.name}`}
+                                      disabled={!dayStatus?.canSell || preparingCheckout || (!isInStock && qty === 0)}
+                                      decreaseDisabled={!dayStatus?.canSell || preparingCheckout || qty === 0}
+                                      increaseDisabled={
+                                        !dayStatus?.canSell || preparingCheckout || !isInStock || qty >= maxStep
+                                      }
+                                      allowRestingZero
+                                      max={maxStep}
+                                      errorId={errorId}
+                                      inputRef={(el) => {
+                                        if (el) qtyInputRefs.current.set(fieldId, el);
+                                        else qtyInputRefs.current.delete(fieldId);
+                                      }}
+                                    />
+                                  </div>
+                                  {visibleError && (
+                                    <p id={errorId} className="qty-stepper__error" role="alert">
+                                      {visibleError}
+                                    </p>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </article>
+                    ))}
                   </div>
 
                   <aside className="side-stack">
@@ -1785,9 +2368,8 @@ export function PosPage() {
                         <p className="callout__body">
                           {formatCentavos(lastSavedSale.cashReceivedCentavos)} received for{" "}
                           {formatCentavos(lastSavedSale.totalCentavos)} total. Return{" "}
-                          <strong>{formatCentavos(lastSavedSale.changeCentavos)}</strong> change, refill{" "}
-                          {lastSavedSale.totalContainers} container{lastSavedSale.totalContainers === 1 ? "" : "s"} (
-                          {formatLiters(lastSavedSale.totalVolumeLiters)}), and hand over.
+                          <strong>{formatCentavos(lastSavedSale.changeCentavos)}</strong> change,{" "}
+                          {formatSavedSaleHandover(lastSavedSale)}
                         </p>
                         <div className="callout__actions">
                           <button
@@ -1812,12 +2394,12 @@ export function PosPage() {
                       <div className="detail-card__header">
                         <h2>Current sale</h2>
                         <span className="pill pill--scheduled">
-                          {cartTotals.totalContainers} container{cartTotals.totalContainers === 1 ? "" : "s"}
+                          {formatCartCountPill(cartTotals.totalContainers, cartTotals.totalMerchandiseQty)}
                         </span>
                       </div>
 
                       {lines.length === 0 ? (
-                        <p className="muted">No services selected. Choose a refill to start the sale.</p>
+                        <p className="muted">No items selected. Choose a refill or product to start the sale.</p>
                       ) : (
                         <ul className="pos-summary-lines">
                           {lines.map((line) => (
@@ -1825,8 +2407,12 @@ export function PosPage() {
                               <div className="pos-summary-line__meta">
                                 <strong>{line.displayName}</strong>
                                 <span className="muted-sm">
-                                  {line.quantity} × {formatCentavos(line.unitPriceCentavos)} ·{" "}
-                                  {formatLiters(line.unitVolumeLiters * line.quantity)}
+                                  {line.quantity} × {formatCentavos(line.unitPriceCentavos)}
+                                  {line.kind === "STANDARD" ||
+                                  line.kind === "CUSTOM" ||
+                                  (line.kind === "CONTAINER_PACKAGE" && line.unitVolumeLiters > 0)
+                                    ? ` · ${formatLiters(line.unitVolumeLiters * line.quantity)}`
+                                    : ""}
                                 </span>
                               </div>
                               <span className="pos-summary-line__amount">
@@ -1914,13 +2500,23 @@ export function PosPage() {
                           </div>
                         </div>
 
-                        <div className="callout callout--info">
-                          <p className="callout__title">Verify the order before taking cash</p>
-                          <p className="callout__body">
-                            Check the refills and total with the customer first. Click Start cash payment before
-                            accepting cash.
-                          </p>
-                        </div>
+                        {draftHasMissingGripo ? (
+                          <div className="callout callout--warning">
+                            <p className="callout__title">Faucet choice required before payment</p>
+                            <p className="callout__body">
+                              This unpaid draft was created before Push-Type / Twist-Type gripo selection was
+                              required. Return to selection to choose the faucet type for each container package.
+                            </p>
+                          </div>
+                        ) : (
+                          <div className="callout callout--info">
+                            <p className="callout__title">Verify the order before taking cash</p>
+                            <p className="callout__body">
+                              Check the refills and total with the customer first. Click Start cash payment before
+                              accepting cash.
+                            </p>
+                          </div>
+                        )}
 
                         {saleError && (
                           <div className="alert alert--error" role="alert">
@@ -1931,8 +2527,8 @@ export function PosPage() {
                         <div className="pos-summary-actions">
                           <button
                             type="button"
-                            className="button button--primary button--block"
-                            disabled={startingPayment || cancellingDraft}
+                            className={`button ${draftHasMissingGripo ? "button--ghost" : "button--primary"} button--block`}
+                            disabled={startingPayment || cancellingDraft || draftHasMissingGripo}
                             onClick={() => void handleBeginPayment()}
                           >
                             {startingPayment
@@ -1941,11 +2537,17 @@ export function PosPage() {
                           </button>
                           <button
                             type="button"
-                            className="button button--ghost button--block"
+                            className={`button ${draftHasMissingGripo ? "button--primary" : "button--ghost"} button--block`}
                             disabled={startingPayment || cancellingDraft}
                             onClick={() => void handleBackToSelection()}
                           >
-                            {cancellingDraft ? "Returning to refills…" : "Back to refill selection"}
+                            {draftHasMissingGripo
+                              ? cancellingDraft
+                                ? "Returning to selection…"
+                                : "Return to select faucet type"
+                              : cancellingDraft
+                                ? "Returning to refills…"
+                                : "Back to refill selection"}
                           </button>
                         </div>
                       </article>
@@ -2094,8 +2696,16 @@ export function PosPage() {
                       <div className="detail-card__header">
                         <h2>Current sale</h2>
                         <span className="pill pill--scheduled">
-                          {preparedCheckout?.totalContainers ?? cartTotals.totalContainers} container
-                          {(preparedCheckout?.totalContainers ?? cartTotals.totalContainers) === 1 ? "" : "s"}
+                          {formatCartCountPill(
+                            preparedCheckout?.totalContainers ?? cartTotals.totalContainers,
+                            (preparedCheckout?.items ?? [])
+                              .filter(
+                                (item) =>
+                                  item.kind === "MERCHANDISE" || item.kind === "CONTAINER_PACKAGE",
+                              )
+                              .reduce((sum, item) => sum + item.quantity, 0) ||
+                              (preparedCheckout ? 0 : cartTotals.totalMerchandiseQty),
+                          )}
                         </span>
                       </div>
 
@@ -2105,8 +2715,12 @@ export function PosPage() {
                             <div className="pos-summary-line__meta">
                               <strong>{item.displayLabel}</strong>
                               <span className="muted-sm">
-                                {item.quantity} × {formatCentavos(item.unitPriceCentavos)} ·{" "}
-                                {formatLiters(item.lineVolumeLiters)}
+                                {item.quantity} × {formatCentavos(item.unitPriceCentavos)}
+                                {item.kind === "STANDARD" ||
+                                item.kind === "CUSTOM" ||
+                                (item.kind === "CONTAINER_PACKAGE" && item.lineVolumeLiters > 0)
+                                  ? ` · ${formatLiters(item.lineVolumeLiters)}`
+                                  : ""}
                               </span>
                             </div>
                             <span className="pos-summary-line__amount">{formatCentavos(item.lineTotalCentavos)}</span>
@@ -2392,6 +3006,7 @@ export function PosPage() {
                       Boolean(
                         serverMatch &&
                         serverMatch.businessDate < dayStatus.todayDate &&
+                        isPriorDaySettleableComposition(serverMatch.items) &&
                         (serverMatch.status === "REVIEW_REQUIRED" ||
                           serverMatch.status === "PAYMENT_PENDING"),
                       );

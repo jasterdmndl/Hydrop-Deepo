@@ -12,7 +12,7 @@ export class ApiError extends Error {
 }
 
 export interface RequestOptions {
-  method?: "GET" | "POST";
+  method?: "GET" | "POST" | "PATCH";
   body?: unknown;
   /** Automatic refreshes must not count as active use (AUTH-003). */
   background?: boolean;

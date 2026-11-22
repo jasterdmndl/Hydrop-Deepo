@@ -122,8 +122,16 @@ describe("shared sign-in and module entry", () => {
 
       const ownerInvAccess = await request(ctx.app).get("/api/inventory/access").set("Cookie", owner.cookie);
       const cashierInvAccess = await request(ctx.app).get("/api/inventory/access").set("Cookie", cashier.cookie);
-      expect(ownerInvAccess.body).toEqual({ canView: true, canInitializeOpeningStock: true });
-      expect(cashierInvAccess.body).toEqual({ canView: true, canInitializeOpeningStock: false });
+      expect(ownerInvAccess.body).toEqual({
+        canView: true,
+        canInitializeOpeningStock: true,
+        canCreateProduct: true,
+      });
+      expect(cashierInvAccess.body).toEqual({
+        canView: true,
+        canInitializeOpeningStock: false,
+        canCreateProduct: false,
+      });
     });
 
     it("rejects module requests without a session", async () => {

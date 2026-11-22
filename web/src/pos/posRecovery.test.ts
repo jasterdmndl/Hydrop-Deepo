@@ -19,6 +19,7 @@ import {
   resolveRecoveryPresentation,
   savePendingRecovery,
   saveUnpaidCart,
+  toCartItemInputs,
   type CartDraftLine,
   type CheckoutLookupView,
   type CheckoutView,
@@ -889,5 +890,250 @@ describe("account-scoped unpaid cart and workstation recovery storage", () => {
     expect(
       resolveRecoveryPresentation(cachedCashierFalse, "owner1", "OWNER").canSettlePriorDay,
     ).toBe(true);
+  });
+
+  it("maps merchandise cart lines cleanly and excludes merchandise checkouts from prior-day refill settlement", () => {
+    const merchDraft: CartDraftLine[] = [
+      {
+        id: "merch-faucet-1",
+        kind: "MERCHANDISE",
+        productId: "11111111-1111-4111-8111-111111111111",
+        displayName: "Push-Type Faucet",
+        description: "Press to dispense water",
+        stockUnit: "pcs",
+        posSection: "CHANGE_OF_GRIPO",
+        unitPriceCentavos: 4000,
+        quantity: 2,
+      },
+    ];
+    expect(toCartItemInputs(merchDraft)).toEqual([
+      {
+        kind: "MERCHANDISE",
+        productId: "11111111-1111-4111-8111-111111111111",
+        quantity: 2,
+      },
+    ]);
+
+    const merchCheckout = makeLookup({
+      recoveryState: "REVIEW_REQUIRED",
+      reason: "BUSINESS_DATE_CROSSED",
+      canRetry: false,
+      canSettlePriorDay: false,
+      checkout: {
+        ...makeLookup({}).checkout,
+        reference: "HD-1109-099",
+        businessDate: "2026-11-09",
+        status: "REVIEW_REQUIRED",
+        totalCentavos: 8000,
+        totalContainers: 0,
+        totalVolumeMl: 0,
+        totalVolumeLiters: 0,
+        items: [
+          {
+            lineIndex: 0,
+            kind: "MERCHANDISE",
+            catalogCode: null,
+            waterType: null,
+            productId: "11111111-1111-4111-8111-111111111111",
+            stockUnit: "pcs",
+            posSection: "CHANGE_OF_GRIPO",
+            displayLabel: "Push-Type Faucet",
+            unitVolumeMl: 0,
+            unitVolumeLiters: 0,
+            unitPriceCentavos: 4000,
+            quantity: 2,
+            lineTotalCentavos: 8000,
+            lineVolumeMl: 0,
+            lineVolumeLiters: 0,
+          },
+        ],
+      },
+    });
+    const merchPending = makePendingRecord({
+      reference: "HD-1109-099",
+      items: toCartItemInputs(merchDraft),
+      quoteItems: merchCheckout.checkout.items,
+      totalCentavos: 8000,
+      totalContainers: 0,
+      totalVolumeMl: 0,
+      totalVolumeLiters: 0,
+      lastLookup: merchCheckout,
+    });
+
+    expect(
+      resolveRecoveryPresentation(merchPending, "owner1", "OWNER", "2026-11-10").canSettlePriorDay,
+    ).toBe(true);
+    expect(
+      resolveRecoveryPresentation(merchPending, "cashier1", "CASHIER", "2026-11-10").canSettlePriorDay,
+    ).toBe(false);
+  });
+
+  it("maps container package cart lines cleanly with included gripo choices and excludes container package checkouts from prior-day refill settlement", () => {
+    const pkgDraft: CartDraftLine[] = [
+      {
+        id: "pkg-ROUND_EMPTY-PUSH_TYPE",
+        kind: "CONTAINER_PACKAGE",
+        packageCode: "ROUND_EMPTY",
+        includedGripo: "PUSH_TYPE",
+        productId: "22222222-2222-4222-8222-222222222222",
+        displayName: "Empty Round Container · Push-Type gripo",
+        unitVolumeMl: 0,
+        unitVolumeLiters: 0,
+        unitPriceCentavos: 17500,
+        stockUnit: "containers",
+        quantity: 1,
+      },
+      {
+        id: "pkg-ROUND_EMPTY-TWIST_TYPE",
+        kind: "CONTAINER_PACKAGE",
+        packageCode: "ROUND_EMPTY",
+        includedGripo: "TWIST_TYPE",
+        productId: "22222222-2222-4222-8222-222222222222",
+        displayName: "Empty Round Container · Twist-Type gripo",
+        unitVolumeMl: 0,
+        unitVolumeLiters: 0,
+        unitPriceCentavos: 17500,
+        stockUnit: "containers",
+        quantity: 1,
+      },
+    ];
+    expect(toCartItemInputs(pkgDraft)).toEqual([
+      {
+        kind: "CONTAINER_PACKAGE",
+        packageCode: "ROUND_EMPTY",
+        includedGripo: "PUSH_TYPE",
+        quantity: 1,
+      },
+      {
+        kind: "CONTAINER_PACKAGE",
+        packageCode: "ROUND_EMPTY",
+        includedGripo: "TWIST_TYPE",
+        quantity: 1,
+      },
+    ]);
+
+    const pkgCheckout = makeLookup({
+      recoveryState: "REVIEW_REQUIRED",
+      reason: "BUSINESS_DATE_CROSSED",
+      canRetry: false,
+      canSettlePriorDay: false,
+      checkout: {
+        ...makeLookup({}).checkout,
+        reference: "HD-1109-100",
+        businessDate: "2026-11-09",
+        status: "REVIEW_REQUIRED",
+        totalCentavos: 35000,
+        totalContainers: 0,
+        totalVolumeMl: 0,
+        totalVolumeLiters: 0,
+        items: [
+          {
+            lineIndex: 0,
+            kind: "CONTAINER_PACKAGE",
+            catalogCode: "ROUND_EMPTY",
+            waterType: null,
+            productId: "22222222-2222-4222-8222-222222222222",
+            stockUnit: "containers",
+            posSection: "CONTAINERS",
+            includedGripo: "PUSH_TYPE",
+            displayLabel: "Empty Round Container · Push-Type gripo",
+            unitVolumeMl: 0,
+            unitVolumeLiters: 0,
+            unitPriceCentavos: 17500,
+            quantity: 1,
+            lineTotalCentavos: 17500,
+            lineVolumeMl: 0,
+            lineVolumeLiters: 0,
+          },
+          {
+            lineIndex: 1,
+            kind: "CONTAINER_PACKAGE",
+            catalogCode: "ROUND_EMPTY",
+            waterType: null,
+            productId: "22222222-2222-4222-8222-222222222222",
+            stockUnit: "containers",
+            posSection: "CONTAINERS",
+            includedGripo: "TWIST_TYPE",
+            displayLabel: "Empty Round Container · Twist-Type gripo",
+            unitVolumeMl: 0,
+            unitVolumeLiters: 0,
+            unitPriceCentavos: 17500,
+            quantity: 1,
+            lineTotalCentavos: 17500,
+            lineVolumeMl: 0,
+            lineVolumeLiters: 0,
+          },
+        ],
+      },
+    });
+    const pkgPending = makePendingRecord({
+      reference: "HD-1109-100",
+      items: toCartItemInputs(pkgDraft),
+      quoteItems: pkgCheckout.checkout.items,
+      totalCentavos: 35000,
+      totalContainers: 0,
+      totalVolumeMl: 0,
+      totalVolumeLiters: 0,
+      lastLookup: pkgCheckout,
+    });
+
+    expect(
+      resolveRecoveryPresentation(pkgPending, "owner1", "OWNER", "2026-11-10").canSettlePriorDay,
+    ).toBe(true);
+    expect(
+      resolveRecoveryPresentation(pkgPending, "cashier1", "CASHIER", "2026-11-10").canSettlePriorDay,
+    ).toBe(false);
+
+    // Mixed customer-owned refill + merchandise remains blocked pending a separate approval
+    const mixedCheckout = makeLookup({
+      recoveryState: "REVIEW_REQUIRED",
+      reason: "BUSINESS_DATE_CROSSED",
+      canRetry: false,
+      canSettlePriorDay: false,
+      checkout: {
+        ...makeLookup({}).checkout,
+        reference: "HD-1109-101",
+        status: "REVIEW_REQUIRED",
+        businessDate: "2026-11-09",
+        totalCentavos: 37500,
+        totalContainers: 1,
+        totalVolumeMl: 25000,
+        totalVolumeLiters: 25,
+        items: [
+          {
+            lineIndex: 0,
+            kind: "STANDARD",
+            catalogCode: "PURIFIED_25L",
+            waterType: "PURIFIED",
+            displayLabel: "Purified Water 25 L",
+            unitVolumeMl: 25000,
+            unitVolumeLiters: 25,
+            unitPriceCentavos: 2500,
+            quantity: 1,
+            lineTotalCentavos: 2500,
+            lineVolumeMl: 25000,
+            lineVolumeLiters: 25,
+          },
+          ...pkgCheckout.checkout.items,
+        ],
+      },
+    });
+    const mixedPending = makePendingRecord({
+      reference: "HD-1109-101",
+      items: [
+        { kind: "STANDARD", waterType: "PURIFIED", quantity: 1 },
+        ...toCartItemInputs(pkgDraft),
+      ],
+      quoteItems: mixedCheckout.checkout.items,
+      totalCentavos: 37500,
+      totalContainers: 1,
+      totalVolumeMl: 25000,
+      totalVolumeLiters: 25,
+      lastLookup: mixedCheckout,
+    });
+
+    expect(
+      resolveRecoveryPresentation(mixedPending, "owner1", "OWNER", "2026-11-10").canSettlePriorDay,
+    ).toBe(false);
   });
 });

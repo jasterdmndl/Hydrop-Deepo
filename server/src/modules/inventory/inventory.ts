@@ -1,25 +1,45 @@
 import type { Role } from "../auth/policy.js";
 
 /**
- * Inventory domain rules and validation for Round and Slim container
- * opening stock (DEC-065, INV-003, INV-005).
+ * Inventory domain rules and validation for Round/Slim containers,
+ * Owner-created merchandise products, reusable POS sections, archiving,
+ * and INV-009 physical-count reconciliation (DEC-065, DEC-068–070, DEC-073, DEC-074).
  */
 export type ContainerShape = "ROUND" | "SLIM";
+export type InventoryCategory = "CONTAINER" | "MERCHANDISE";
+export type PosSection = string;
 
 export const CONTAINER_SHAPES: readonly ContainerShape[] = ["ROUND", "SLIM"] as const;
+export const BUILT_IN_POS_SECTIONS = {
+  CONTAINERS: "CONTAINERS",
+  TAKIP_ACCESSORIES: "TAKIP_ACCESSORIES",
+  CHANGE_OF_GRIPO: "CHANGE_OF_GRIPO",
+} as const;
 
 export const MAX_OPENING_QUANTITY = 1_000_000;
+export const MAX_UNIT_PRICE_CENTAVOS = 10_000_000;
+export const MAX_PRODUCT_NAME_LENGTH = 80;
+export const MAX_PRODUCT_DESCRIPTION_LENGTH = 160;
+export const MAX_STOCK_UNIT_LENGTH = 30;
+export const MAX_POS_SECTION_NAME_LENGTH = 60;
+export const MAX_POS_SECTION_CODE_LENGTH = 64;
+export const MAX_RECONCILIATION_REASON_LENGTH = 240;
+
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 export interface InventoryPermissions {
   canView: boolean;
-  /** Only the Owner can record the initial physical count per shape (INV-005). */
+  /** Only the Owner can record the initial physical count per item (INV-005). */
   canInitializeOpeningStock: boolean;
+  /** Only the Owner can manage Inventory products, POS visibility, sections, archiving, and stock corrections. */
+  canCreateProduct: boolean;
 }
 
 export function inventoryPermissions(role: Role): InventoryPermissions {
   return {
     canView: true,
     canInitializeOpeningStock: role === "OWNER",
+    canCreateProduct: role === "OWNER",
   };
 }
 
@@ -32,15 +52,48 @@ export interface OpeningStockRecord {
   recordedAt: string;
 }
 
-export interface InventoryItemView {
+export interface PosSectionView {
   code: string;
   name: string;
-  category: "CONTAINER";
-  shape: ContainerShape;
+  isBuiltIn: boolean;
+  sortOrder: number;
+  createdBy: string | null;
+  createdAt: string;
+}
+
+export interface StockReconciliationView {
+  id: string;
+  itemId: string;
+  balanceBefore: number;
+  physicalCount: number;
+  quantityDelta: number;
+  balanceAfter: number;
   unit: string;
+  reason: string;
+  recordedBy: string;
+  recordedAt: string;
+}
+
+export interface InventoryItemView {
+  id: string;
+  code: string;
+  name: string;
+  category: InventoryCategory;
+  shape: ContainerShape | null;
+  description: string | null;
+  unit: string;
+  unitPriceCentavos: number | null;
+  showInPos: boolean;
+  posSection: PosSection | null;
   status: OpeningStockStatus;
   currentQuantity: number | null;
+  stockRevision: number;
   openingStock: OpeningStockRecord | null;
+  latestReconciliation: StockReconciliationView | null;
+  archivedAt: string | null;
+  archivedBy: string | null;
+  createdBy: string | null;
+  createdAt: string;
 }
 
 export function parseContainerShape(raw: unknown): ContainerShape | null {
@@ -52,11 +105,89 @@ export function parseContainerShape(raw: unknown): ContainerShape | null {
   return null;
 }
 
+export function isUuid(raw: unknown): raw is string {
+  return typeof raw === "string" && UUID_REGEX.test(raw.trim());
+}
+
 export function parseOpeningQuantity(raw: unknown): number | null {
   if (typeof raw !== "number") return null;
   if (!Number.isInteger(raw)) return null;
   if (raw < 0 || raw > MAX_OPENING_QUANTITY) return null;
   return raw;
+}
+
+export function parsePhysicalCount(raw: unknown): number | null {
+  return parseOpeningQuantity(raw);
+}
+
+export function parseProductName(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim().replace(/\s+/g, " ");
+  if (!trimmed || trimmed.length > MAX_PRODUCT_NAME_LENGTH) return null;
+  return trimmed;
+}
+
+export function parseProductDescription(
+  raw: unknown,
+): { ok: true; value: string | null } | { ok: false } {
+  if (raw === undefined || raw === null) {
+    return { ok: true, value: null };
+  }
+  if (typeof raw !== "string") {
+    return { ok: false };
+  }
+  const trimmed = raw.trim().replace(/\s+/g, " ");
+  if (!trimmed) {
+    return { ok: true, value: null };
+  }
+  if (trimmed.length > MAX_PRODUCT_DESCRIPTION_LENGTH) {
+    return { ok: false };
+  }
+  return { ok: true, value: trimmed };
+}
+
+export function parseStockUnit(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim().replace(/\s+/g, " ");
+  if (!trimmed || trimmed.length > MAX_STOCK_UNIT_LENGTH) return null;
+  return trimmed;
+}
+
+export function parseUnitPriceCentavos(raw: unknown): number | null {
+  if (typeof raw !== "number") return null;
+  if (!Number.isInteger(raw)) return null;
+  if (raw < 1 || raw > MAX_UNIT_PRICE_CENTAVOS) return null;
+  return raw;
+}
+
+export function parsePosSectionName(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim().replace(/\s+/g, " ");
+  if (!trimmed || trimmed.length > MAX_POS_SECTION_NAME_LENGTH) return null;
+  return trimmed;
+}
+
+export function parsePosSectionCode(
+  raw: unknown,
+): { ok: true; value: string | null } | { ok: false } {
+  if (raw === undefined || raw === null || raw === "") {
+    return { ok: true, value: null };
+  }
+  if (typeof raw !== "string") {
+    return { ok: false };
+  }
+  const trimmed = raw.trim().toUpperCase();
+  if (!trimmed || trimmed.length > MAX_POS_SECTION_CODE_LENGTH) {
+    return { ok: false };
+  }
+  return { ok: true, value: trimmed };
+}
+
+export function parseReconciliationReason(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim().replace(/\s+/g, " ");
+  if (!trimmed || trimmed.length > MAX_RECONCILIATION_REASON_LENGTH) return null;
+  return trimmed;
 }
 
 // Asia/Manila is fixed UTC+08:00 with no daylight saving transitions.
