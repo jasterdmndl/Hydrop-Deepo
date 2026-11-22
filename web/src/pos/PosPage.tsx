@@ -12,6 +12,7 @@ import {
   type CheckoutLookupView,
   type CheckoutView,
   clearUnpaidCart,
+  clearUnpaidCartIfMatchesReference,
   computeCashSummary,
   type ConfirmSaleResponse,
   currentManilaIso,
@@ -30,6 +31,7 @@ import {
   type PendingCheckoutRecovery,
   type PosDayResponse,
   type PrepareCheckoutResponse,
+  type PriorDaySettlementView,
   type QuoteLineItem,
   removePendingRecovery,
   savePendingRecovery,
@@ -50,6 +52,7 @@ import {
   revealInvalidQuantityEdits,
 } from "./quantityInput";
 import { QuantityStepper } from "./QuantityStepper";
+import { PriorDaySettlementModal } from "./PriorDaySettlementModal";
 import { SaleHistory } from "./SaleHistory";
 
 type PosTab = "sale" | "history";
@@ -72,24 +75,24 @@ function quoteItemsToDraftLines(items: QuoteLineItem[]): CartDraftLine[] {
   return items.map((item) =>
     item.kind === "STANDARD"
       ? {
-          id: defaultLineId(item.waterType),
-          kind: "STANDARD",
-          waterType: item.waterType,
-          displayName: item.displayLabel,
-          unitVolumeMl: item.unitVolumeMl,
-          unitVolumeLiters: item.unitVolumeLiters,
-          unitPriceCentavos: item.unitPriceCentavos,
-          quantity: item.quantity,
-        }
+        id: defaultLineId(item.waterType),
+        kind: "STANDARD",
+        waterType: item.waterType,
+        displayName: item.displayLabel,
+        unitVolumeMl: item.unitVolumeMl,
+        unitVolumeLiters: item.unitVolumeLiters,
+        unitPriceCentavos: item.unitPriceCentavos,
+        quantity: item.quantity,
+      }
       : {
-          id: `custom-${item.lineIndex}-${item.waterType}-${item.unitVolumeMl}-${item.unitPriceCentavos}`,
-          kind: "CUSTOM",
-          waterType: item.waterType,
-          displayName: item.displayLabel,
-          unitVolumeLiters: item.unitVolumeLiters,
-          unitPriceCentavos: item.unitPriceCentavos,
-          quantity: item.quantity,
-        },
+        id: `custom-${item.lineIndex}-${item.waterType}-${item.unitVolumeMl}-${item.unitPriceCentavos}`,
+        kind: "CUSTOM",
+        waterType: item.waterType,
+        displayName: item.displayLabel,
+        unitVolumeLiters: item.unitVolumeLiters,
+        unitPriceCentavos: item.unitPriceCentavos,
+        quantity: item.quantity,
+      },
   );
 }
 
@@ -125,8 +128,15 @@ export function PosPage() {
 
   const [lastSavedSale, setLastSavedSale] = useState<SaleView | null>(null);
   const [lastClosedSummary, setLastClosedSummary] = useState<DaySummaryView | null>(null);
+  const [lastSettledPriorDay, setLastSettledPriorDay] = useState<PriorDaySettlementView | null>(null);
+  const [lastAlreadySavedPriorDay, setLastAlreadySavedPriorDay] = useState<SaleView | null>(null);
   const [historyFocusRef, setHistoryFocusRef] = useState<string | null>(null);
+  const [historySettlementFocusRef, setHistorySettlementFocusRef] = useState<string | null>(null);
   const [historyRefreshSignal, setHistoryRefreshSignal] = useState(0);
+  const [settlementTarget, setSettlementTarget] = useState<{
+    checkout: CheckoutView;
+    localCashReceivedCentavos?: number | null;
+  } | null>(null);
 
   const [startingDay, setStartingDay] = useState(false);
   const [startRequestKey, setStartRequestKey] = useState<string | null>(null);
@@ -153,7 +163,8 @@ export function PosPage() {
   const [endingDay, setEndingDay] = useState(false);
   const [endDayError, setEndDayError] = useState<string | null>(null);
 
-  const hydratedRef = useRef(false);
+  const [cartHydratedUser, setCartHydratedUser] = useState<string | null>(null);
+  const isCartHydrated = cartHydratedUser === user.username;
   const loadTrackerRef = useRef(createRequestTracker());
   const preparedCheckoutRef = useRef<CheckoutView | null>(null);
   preparedCheckoutRef.current = preparedCheckout;
@@ -199,8 +210,8 @@ export function PosPage() {
       const matched =
         dayRes.state === "OPEN" && currentPrepared.businessDate === dayRes.todayDate
           ? (dayRes.unresolvedCheckouts.find(
-              (c) => c.reference === currentPrepared.reference && c.status === "PAYMENT_PENDING",
-            ) ?? dayRes.unpaidDrafts.find((d) => d.reference === currentPrepared.reference))
+            (c) => c.reference === currentPrepared.reference && c.status === "PAYMENT_PENDING",
+          ) ?? dayRes.unpaidDrafts.find((d) => d.reference === currentPrepared.reference))
           : undefined;
 
       if (!matched) {
@@ -250,26 +261,15 @@ export function PosPage() {
         ? prev
         : (recoveries[0]?.reference ?? null),
     );
-    if (recoveries.length === 0) {
-      const savedCart = loadUnpaidCart(user.username);
-      if (savedCart) {
-        setLines(savedCart.lines);
-        setPreparedCheckout(savedCart.preparedCheckout);
-        setPrepareKey(savedCart.prepareKey);
-        setPrepareSignature(savedCart.prepareSignature);
-        setStep(savedCart.preparedCheckout ? "review" : "select");
-      } else {
-        setLines([]);
-        setPreparedCheckout(null);
-        setPrepareKey(null);
-        setPrepareSignature(null);
-        setStep("select");
-      }
-    }
+    setLines([]);
+    setPreparedCheckout(null);
+    setPrepareKey(null);
+    setPrepareSignature(null);
+    setStep("select");
     setConfirmNoCashChecked(false);
     clearAllQtyEdits();
     setCustomQtyEdit(null);
-    hydratedRef.current = true;
+    setCartHydratedUser(null);
     void loadPosState();
   }, [user.username, loadPosState, clearAllQtyEdits]);
 
@@ -287,9 +287,29 @@ export function PosPage() {
     return () => window.removeEventListener("storage", onStorage);
   }, []);
 
+  // Hydrate the signed-in account's saved unpaid cart before persistence writes resume.
+  useEffect(() => {
+    if (isCartHydrated || showRecoveryScreen || activeConfirming !== null) return;
+    const savedCart = loadUnpaidCart(user.username);
+    if (savedCart) {
+      setLines(Array.isArray(savedCart.lines) ? savedCart.lines : []);
+      setPreparedCheckout(savedCart.preparedCheckout ?? null);
+      setPrepareKey(savedCart.prepareKey ?? null);
+      setPrepareSignature(savedCart.prepareSignature ?? null);
+      setStep(savedCart.preparedCheckout ? "review" : "select");
+    } else {
+      setLines([]);
+      setPreparedCheckout(null);
+      setPrepareKey(null);
+      setPrepareSignature(null);
+      setStep("select");
+    }
+    setCartHydratedUser(user.username);
+  }, [user.username, isCartHydrated, showRecoveryScreen, activeConfirming]);
+
   // Persist unpaid cart only for the signed-in account while not on recovery/confirming.
   useEffect(() => {
-    if (!hydratedRef.current || activeConfirming !== null || showRecoveryScreen) return;
+    if (!isCartHydrated || activeConfirming !== null || showRecoveryScreen) return;
     if (lines.length === 0 && !preparedCheckout) {
       clearUnpaidCart(user.username);
       return;
@@ -305,6 +325,7 @@ export function PosPage() {
   }, [
     user.username,
     dayStatus?.todayDate,
+    isCartHydrated,
     lines,
     preparedCheckout,
     prepareKey,
@@ -388,6 +409,14 @@ export function PosPage() {
     [dayStatus?.unresolvedCheckouts, localRecoveryRefSet],
   );
 
+  const serverOnlyClosedPriorDayReview = useMemo(
+    () =>
+      (dayStatus?.priorDayReviewCheckouts ?? []).filter(
+        (c) => !localRecoveryRefSet.has(c.reference.trim().toUpperCase()),
+      ),
+    [dayStatus?.priorDayReviewCheckouts, localRecoveryRefSet],
+  );
+
   function setFieldQtyEdit(fieldId: string, nextEdit: QuantityEditState | null) {
     if (!nextEdit?.showError) {
       setSaleError(null);
@@ -424,6 +453,8 @@ export function PosPage() {
 
     setSaleError(null);
     setLastSavedSale(null);
+    setLastSettledPriorDay(null);
+    setLastAlreadySavedPriorDay(null);
     setLines((prev) => {
       const idx = prev.findIndex((l) => l.id === id);
       if (clamped === 0) {
@@ -456,6 +487,8 @@ export function PosPage() {
     const clamped = Math.max(1, Math.min(MAX_LINE_QTY, Math.trunc(nextQty)));
     setSaleError(null);
     setLastSavedSale(null);
+    setLastSettledPriorDay(null);
+    setLastAlreadySavedPriorDay(null);
     setLines((prev) =>
       prev.map((line) => (line.id === id ? { ...line, quantity: clamped } : line)),
     );
@@ -465,6 +498,8 @@ export function PosPage() {
     clearFieldQtyEdit(id);
     setSaleError(null);
     setLastSavedSale(null);
+    setLastSettledPriorDay(null);
+    setLastAlreadySavedPriorDay(null);
     setLines((prev) =>
       prev
         .map((line) =>
@@ -577,6 +612,8 @@ export function PosPage() {
       clearFieldQtyEdit(existingMatch.id);
     }
     setLastSavedSale(null);
+    setLastSettledPriorDay(null);
+    setLastAlreadySavedPriorDay(null);
     setSaleError(null);
     closeCustomizeModal();
   }
@@ -677,6 +714,9 @@ export function PosPage() {
     setPreparingCheckout(true);
     setSaleError(null);
     setLastSavedSale(null);
+    setLastSettledPriorDay(null);
+    setLastAlreadySavedPriorDay(null);
+    setLastSettledPriorDay(null);
 
     const signature = cartLinesSignature(lines);
     const keyToUse = prepareSignature === signature && prepareKey ? prepareKey : generateKey();
@@ -741,16 +781,16 @@ export function PosPage() {
       setDayStatus((prev) =>
         prev
           ? {
-              ...prev,
-              unpaidDrafts: prev.unpaidDrafts.filter((d) => d.reference !== res.checkout.reference),
-              unresolvedCheckouts: prev.unresolvedCheckouts.some(
-                (c) => c.reference === res.checkout.reference,
+            ...prev,
+            unpaidDrafts: prev.unpaidDrafts.filter((d) => d.reference !== res.checkout.reference),
+            unresolvedCheckouts: prev.unresolvedCheckouts.some(
+              (c) => c.reference === res.checkout.reference,
+            )
+              ? prev.unresolvedCheckouts.map((c) =>
+                c.reference === res.checkout.reference ? res.checkout : c,
               )
-                ? prev.unresolvedCheckouts.map((c) =>
-                    c.reference === res.checkout.reference ? res.checkout : c,
-                  )
-                : [...prev.unresolvedCheckouts, res.checkout],
-            }
+              : [...prev.unresolvedCheckouts, res.checkout],
+          }
           : prev,
       );
       setPreparedCheckout(res.checkout);
@@ -777,6 +817,8 @@ export function PosPage() {
     setConfirmNoCashChecked(false);
     setSaleError(null);
     setLastSavedSale(null);
+    setLastSettledPriorDay(null);
+    setLastAlreadySavedPriorDay(null);
     setStep("review");
   }
 
@@ -1038,19 +1080,11 @@ export function PosPage() {
       notifyPosStateChanged("sale-saved");
       activeConfirmingRef.current = null;
       setActiveConfirming(null);
-      clearUnpaidCart(user.username);
+      clearMatchingPreparedCheckout(target.reference);
       const remaining = loadPendingRecoveries();
       setPendingRecoveries(remaining);
       setSelectedRecoveryRef(remaining[0]?.reference ?? null);
-      setLines([]);
-      clearAllQtyEdits();
-      setPreparedCheckout(null);
-      setPrepareKey(null);
-      setPrepareSignature(null);
-      setCashInput("");
-      setConfirmNoCashChecked(false);
       setLastSavedSale(confirmed.sale);
-      setStep("select");
       setHistoryRefreshSignal((n) => n + 1);
       await loadPosState();
     } catch (err) {
@@ -1075,14 +1109,13 @@ export function PosPage() {
     }
   }
 
-  function handleContinueSavedSale(reference: string, sale: SaleView) {
-    removePendingRecovery(reference);
-    notifyPosStateChanged("sale-saved");
+  function clearMatchingPreparedCheckout(targetReference: string) {
+    const normalizedTarget = targetReference.trim().toUpperCase();
+    clearUnpaidCartIfMatchesReference(user.username, normalizedTarget);
+    if (preparedCheckoutRef.current?.reference.trim().toUpperCase() !== normalizedTarget) {
+      return;
+    }
     clearUnpaidCart(user.username);
-    const remaining = loadPendingRecoveries();
-    setPendingRecoveries(remaining);
-    setSelectedRecoveryRef(remaining[0]?.reference ?? null);
-    setRecoveryError(null);
     setLines([]);
     clearAllQtyEdits();
     setPreparedCheckout(null);
@@ -1090,8 +1123,105 @@ export function PosPage() {
     setPrepareSignature(null);
     setCashInput("");
     setConfirmNoCashChecked(false);
-    setLastSavedSale(sale);
     setStep("select");
+  }
+
+  function handleContinueSavedSale(reference: string, sale: SaleView) {
+    removePendingRecovery(reference);
+    notifyPosStateChanged("sale-saved");
+    clearMatchingPreparedCheckout(reference);
+    const remaining = loadPendingRecoveries();
+    setPendingRecoveries(remaining);
+    setSelectedRecoveryRef(remaining[0]?.reference ?? null);
+    setRecoveryError(null);
+    setLastSavedSale(sale);
+    setLastSettledPriorDay(null);
+    setLastAlreadySavedPriorDay(null);
+    setSettlementTarget(null);
+    setHistoryRefreshSignal((n) => n + 1);
+    void loadPosState();
+  }
+
+  function handlePriorDayAlreadySaved(reference: string, sale: SaleView) {
+    removePendingRecovery(reference);
+    notifyPosStateChanged("sale-saved");
+    clearMatchingPreparedCheckout(reference);
+    const remaining = loadPendingRecoveries();
+    setPendingRecoveries(remaining);
+    setSelectedRecoveryRef(remaining[0]?.reference ?? null);
+    setSettlementTarget(null);
+    setRecoveryError(null);
+    setLastSavedSale(null);
+    setLastSettledPriorDay(null);
+    setLastAlreadySavedPriorDay(sale);
+    setHistoryRefreshSignal((n) => n + 1);
+    void loadPosState();
+  }
+
+  function openPriorDaySettleForCheckout(
+    checkout: CheckoutView,
+    localCashReceivedCentavos?: number | null,
+  ) {
+    setEndDayOpen(false);
+    setDayActionError(null);
+    setRecoveryError(null);
+    setLastAlreadySavedPriorDay(null);
+    setSettlementTarget({
+      checkout,
+      localCashReceivedCentavos: localCashReceivedCentavos ?? null,
+    });
+  }
+
+  function handleOpenPriorDaySettleFromRecovery(record: PendingCheckoutRecovery) {
+    const checkout: CheckoutView = record.lastLookup?.checkout ?? {
+      reference: record.reference,
+      businessDate: record.businessDate,
+      status: "REVIEW_REQUIRED",
+      createdBy: record.initiatedBy,
+      createdAt: record.attemptedAt,
+      updatedAt: record.attemptedAt,
+      totalCentavos: record.totalCentavos,
+      totalContainers: record.totalContainers,
+      totalVolumeMl: record.totalVolumeMl,
+      totalVolumeLiters: record.totalVolumeLiters,
+      cashReceivedCentavos: record.cashReceivedCentavos,
+      changeCentavos: record.changeCentavos,
+      paymentStartedAt: record.attemptedAt,
+      paymentRecordedAt: record.attemptedAt,
+      resolutionReason: "BUSINESS_DATE_CROSSED",
+      items: record.quoteItems,
+    };
+    openPriorDaySettleForCheckout(checkout, record.cashReceivedCentavos);
+  }
+
+  async function handlePriorDaySettled(settlement: PriorDaySettlementView) {
+    removePendingRecovery(settlement.checkoutReference);
+    notifyPosStateChanged("prior-day-settled");
+    clearMatchingPreparedCheckout(settlement.checkoutReference);
+    const remaining = loadPendingRecoveries();
+    setPendingRecoveries(remaining);
+    setSelectedRecoveryRef(remaining[0]?.reference ?? null);
+    setSettlementTarget(null);
+    setRecoveryError(null);
+    setLastSavedSale(null);
+    setLastAlreadySavedPriorDay(null);
+    setLastSettledPriorDay(settlement);
+    setHistoryRefreshSignal((n) => n + 1);
+    await loadPosState();
+  }
+
+  function handleContinueSettledSale(reference: string, settlement: PriorDaySettlementView) {
+    removePendingRecovery(reference);
+    notifyPosStateChanged("prior-day-settled");
+    clearMatchingPreparedCheckout(reference);
+    const remaining = loadPendingRecoveries();
+    setPendingRecoveries(remaining);
+    setSelectedRecoveryRef(remaining[0]?.reference ?? null);
+    setSettlementTarget(null);
+    setRecoveryError(null);
+    setLastSavedSale(null);
+    setLastAlreadySavedPriorDay(null);
+    setLastSettledPriorDay(settlement);
     setHistoryRefreshSignal((n) => n + 1);
     void loadPosState();
   }
@@ -1195,6 +1325,7 @@ export function PosPage() {
         <SaleHistory
           todayDate={dayStatus?.todayDate ?? currentManilaIso().slice(0, 10)}
           initialReference={historyFocusRef}
+          initialSettlementRef={historySettlementFocusRef}
           refreshSignal={historyRefreshSignal}
         />
       ) : loading && !dayStatus ? (
@@ -1205,17 +1336,15 @@ export function PosPage() {
         <section className="subview" aria-label="Cash refill checkout">
           <ol className="pos-stepper" aria-label="Checkout progress">
             <li
-              className={`pos-step ${activeStepperNumber === 1 ? "pos-step--active" : ""} ${
-                activeStepperNumber > 1 ? "pos-step--done" : ""
-              }`}
+              className={`pos-step ${activeStepperNumber === 1 ? "pos-step--active" : ""} ${activeStepperNumber > 1 ? "pos-step--done" : ""
+                }`}
             >
               <span className="pos-step__num">1</span>
               <span>Select refills</span>
             </li>
             <li
-              className={`pos-step ${activeStepperNumber === 2 ? "pos-step--active" : ""} ${
-                activeStepperNumber > 2 ? "pos-step--done" : ""
-              }`}
+              className={`pos-step ${activeStepperNumber === 2 ? "pos-step--active" : ""} ${activeStepperNumber > 2 ? "pos-step--done" : ""
+                }`}
             >
               <span className="pos-step__num">2</span>
               <span>Review &amp; receive cash</span>
@@ -1238,10 +1367,23 @@ export function PosPage() {
                   </p>
                 </div>
               )}
+              {lastAlreadySavedPriorDay && (
+                <div className="callout callout--success" role="status">
+                  <p className="callout__title">
+                    Original sale {lastAlreadySavedPriorDay.reference} was already saved
+                  </p>
+                  <p className="callout__body">
+                    Already delivered — do not refill or hand over again, and collect no further payment.
+                    Remaining pending transaction(s) on this workstation still require verification below.
+                  </p>
+                </div>
+              )}
               <CheckoutRecovery
                 record={activeRecovery}
                 allRecoveries={pendingRecoveries}
                 currentUsername={user.username}
+                currentUserRole={user.role}
+                todayDate={dayStatus?.todayDate}
                 checking={checkingStatus}
                 retrying={retryingRecovery}
                 errorMessage={recoveryError}
@@ -1252,6 +1394,8 @@ export function PosPage() {
                 onCheckStatus={() => void handleCheckRecoveryStatus()}
                 onRetry={() => void handleRetryRecovery()}
                 onContinueSaved={handleContinueSavedSale}
+                onOpenPriorDaySettle={handleOpenPriorDaySettleFromRecovery}
+                onContinueSettled={handleContinueSettledSale}
               />
             </>
           ) : (
@@ -1268,11 +1412,69 @@ export function PosPage() {
                 </div>
               )}
 
+              {lastAlreadySavedPriorDay && (
+                <div className="callout callout--success" role="status">
+                  <p className="callout__title">
+                    Original sale {lastAlreadySavedPriorDay.reference} was already saved
+                  </p>
+                  <p className="callout__body">
+                    Already delivered — do not refill or hand over again, and collect no further payment. No
+                    duplicate settlement was created; original receipt from{" "}
+                    {lastAlreadySavedPriorDay.businessDate} for{" "}
+                    {formatCentavos(lastAlreadySavedPriorDay.totalCentavos)} (
+                    {formatCentavos(lastAlreadySavedPriorDay.cashReceivedCentavos)} received,{" "}
+                    {formatCentavos(lastAlreadySavedPriorDay.changeCentavos)} change,{" "}
+                    {lastAlreadySavedPriorDay.totalContainers} container
+                    {lastAlreadySavedPriorDay.totalContainers === 1 ? "" : "s"} ·{" "}
+                    {formatLiters(lastAlreadySavedPriorDay.totalVolumeLiters)}).
+                  </p>
+                  <div className="callout__actions">
+                    <button
+                      type="button"
+                      className="button button--ghost button--sm"
+                      onClick={() => {
+                        setHistorySettlementFocusRef(null);
+                        setHistoryFocusRef(lastAlreadySavedPriorDay.reference);
+                        setTab("history");
+                      }}
+                    >
+                      View original receipt in History
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              {lastSettledPriorDay && (
+                <div className="callout callout--success" role="status">
+                  <p className="callout__title">
+                    Prior-day refill {lastSettledPriorDay.checkoutReference} settled
+                  </p>
+                  <p className="callout__body">
+                    Net amount kept {formatCentavos(lastSettledPriorDay.netAmountKeptCentavos)} · Original payment
+                    date {lastSettledPriorDay.originalBusinessDate} · Settlement date (Manila){" "}
+                    {lastSettledPriorDay.settlementDate}. No further payment collected; recorded separately from
+                    today&apos;s refill sales.
+                  </p>
+                  <div className="callout__actions">
+                    <button
+                      type="button"
+                      className="button button--ghost button--sm"
+                      onClick={() => {
+                        setHistoryFocusRef(null);
+                        setHistorySettlementFocusRef(lastSettledPriorDay.checkoutReference);
+                        setTab("history");
+                      }}
+                    >
+                      View in History
+                    </button>
+                  </div>
+                </div>
+              )}
+
               {dayStatus && dayStatus.state !== "OPEN" && (
                 <div
-                  className={`callout ${
-                    dayStatus.state === "PREVIOUS_DAY_OPEN" ? "callout--warning" : "callout--info"
-                  }`}
+                  className={`callout ${dayStatus.state === "PREVIOUS_DAY_OPEN" ? "callout--warning" : "callout--info"
+                    }`}
                   role="status"
                 >
                   <p className="callout__title">
@@ -1325,38 +1527,88 @@ export function PosPage() {
               {step === "select" && serverOnlyUnresolved.length > 0 && (
                 <div className="callout callout--warning" role="status">
                   <p className="callout__title">Cash-protected checkout(s) awaiting completion or review</p>
-                  <p className="callout__body">
+                  <div className="callout__body">
                     {serverOnlyUnresolved.map((c) => {
                       const canResumeHere =
                         c.status === "PAYMENT_PENDING" &&
                         c.createdBy.toLowerCase() === user.username.toLowerCase() &&
                         dayStatus?.state === "OPEN" &&
                         c.businessDate === dayStatus.todayDate;
+                      const isPriorDay = Boolean(
+                        dayStatus?.todayDate && c.businessDate < dayStatus.todayDate,
+                      );
+                      const canSettleHere =
+                        user.role === "OWNER" &&
+                        isPriorDay &&
+                        (c.status === "REVIEW_REQUIRED" || c.status === "PAYMENT_PENDING");
                       return (
-                        <span key={c.reference} style={{ display: "block", marginTop: "6px" }}>
-                          <strong className="mono-ref">{c.reference}</strong> ·{" "}
-                          {formatCentavos(c.totalCentavos)} ({c.createdBy}) —{" "}
-                          {c.status === "PAYMENT_PENDING"
-                            ? canResumeHere
-                              ? "Cash payment started"
-                              : "Started by another operator or from a previous day"
-                            : c.resolutionReason ?? "Owner review required"}
-                          {canResumeHere && (
-                            <>
-                              {" "}
-                              <button
-                                type="button"
-                                className="button button--ghost button--sm"
-                                onClick={() => handleResumeServerPending(c)}
-                              >
-                                Resume cash payment
-                              </button>
-                            </>
+                        <div key={c.reference} className="pos-unresolved-row">
+                          <span>
+                            <strong className="mono-ref">{c.reference}</strong> ·{" "}
+                            {formatCentavos(c.totalCentavos)} ({c.createdBy}, original date{" "}
+                            {c.businessDate}) —{" "}
+                            {c.status === "PAYMENT_PENDING"
+                              ? canResumeHere
+                                ? "Cash payment started"
+                                : isPriorDay
+                                  ? "Prior-day payment pending Owner review"
+                                  : "Started by another operator"
+                              : c.resolutionReason ?? "Owner review required"}
+                          </span>
+                          {(canResumeHere || canSettleHere) && (
+                            <span className="callout__actions">
+                              {canResumeHere && (
+                                <button
+                                  type="button"
+                                  className="button button--ghost button--sm"
+                                  onClick={() => handleResumeServerPending(c)}
+                                >
+                                  Resume cash payment
+                                </button>
+                              )}
+                              {canSettleHere && (
+                                <button
+                                  type="button"
+                                  className="button button--primary button--sm"
+                                  onClick={() => openPriorDaySettleForCheckout(c)}
+                                >
+                                  Review prior-day checkout
+                                </button>
+                              )}
+                            </span>
                           )}
-                        </span>
+                        </div>
                       );
                     })}
-                  </p>
+                  </div>
+                </div>
+              )}
+
+              {step === "select" && serverOnlyClosedPriorDayReview.length > 0 && (
+                <div className="callout callout--warning" role="status">
+                  <p className="callout__title">Closed prior-day checkout(s) awaiting Owner review</p>
+                  <div className="callout__body">
+                    {serverOnlyClosedPriorDayReview.map((c) => (
+                      <div key={c.reference} className="pos-unresolved-row">
+                        <span>
+                          <strong className="mono-ref">{c.reference}</strong> ·{" "}
+                          {formatCentavos(c.totalCentavos)} ({c.createdBy}, original date {c.businessDate}) —{" "}
+                          {c.resolutionReason ?? "Prior-day payment pending Owner review"}
+                        </span>
+                        {user.role === "OWNER" && (
+                          <span className="callout__actions">
+                            <button
+                              type="button"
+                              className="button button--primary button--sm"
+                              onClick={() => openPriorDaySettleForCheckout(c)}
+                            >
+                              Review prior-day checkout
+                            </button>
+                          </span>
+                        )}
+                      </div>
+                    ))}
+                  </div>
                 </div>
               )}
 
@@ -1545,6 +1797,7 @@ export function PosPage() {
                               if (hasInvalidLineEdits) event.preventDefault();
                             }}
                             onClick={() => {
+                              setHistorySettlementFocusRef(null);
                               setHistoryFocusRef(lastSavedSale.reference);
                               setTab("history");
                             }}
@@ -2027,10 +2280,10 @@ export function PosPage() {
                 <p className="callout__body">
                   {parsedCustomLiters !== null && parsedCustomPriceCentavos !== null
                     ? `${customQty} × ${formatLiters(parsedCustomLiters)} at ${formatCentavos(
-                        parsedCustomPriceCentavos,
-                      )} = ${formatCentavos(parsedCustomPriceCentavos * customQty)} (${formatLiters(
-                        Number((parsedCustomLiters * customQty).toFixed(2)),
-                      )})`
+                      parsedCustomPriceCentavos,
+                    )} = ${formatCentavos(parsedCustomPriceCentavos * customQty)} (${formatLiters(
+                      Number((parsedCustomLiters * customQty).toFixed(2)),
+                    )})`
                     : "Cashier consults Owner for the custom price, then enters liters and price per container."}
                 </p>
               </div>
@@ -2126,11 +2379,47 @@ export function PosPage() {
                 <p className="callout__title">Unresolved checkouts block End Day</p>
                 <p className="callout__body">Resolve pending or review-required transactions before closing this day:</p>
                 <ul className="conflict-list">
-                  {endDayGuard.blockingEntries.map((entry) => (
-                    <li key={entry.reference}>
-                      <span className="mono-ref">{entry.reference}</span> — {entry.label}
-                    </li>
-                  ))}
+                  {endDayGuard.blockingEntries.map((entry) => {
+                    const serverMatch = dayStatus.unresolvedCheckouts.find(
+                      (c) => c.reference === entry.reference,
+                    );
+                    const localMatch = pendingRecoveries.find(
+                      (r) => r.reference === entry.reference,
+                    );
+                    const canSettleBlocking =
+                      user.role === "OWNER" &&
+                      entry.source !== "local-confirming" &&
+                      Boolean(
+                        serverMatch &&
+                        serverMatch.businessDate < dayStatus.todayDate &&
+                        (serverMatch.status === "REVIEW_REQUIRED" ||
+                          serverMatch.status === "PAYMENT_PENDING"),
+                      );
+                    return (
+                      <li key={entry.reference} className="conflict-list__item">
+                        <span>
+                          <span className="mono-ref">{entry.reference}</span> — {entry.label}
+                          {serverMatch
+                            ? ` (${serverMatch.businessDate} · ${formatCentavos(serverMatch.totalCentavos)})`
+                            : ""}
+                        </span>
+                        {canSettleBlocking && serverMatch && (
+                          <button
+                            type="button"
+                            className="button button--primary button--sm"
+                            onClick={() =>
+                              openPriorDaySettleForCheckout(
+                                serverMatch,
+                                localMatch?.cashReceivedCentavos,
+                              )
+                            }
+                          >
+                            Review &amp; settle
+                          </button>
+                        )}
+                      </li>
+                    );
+                  })}
                 </ul>
               </div>
             )}
@@ -2183,6 +2472,17 @@ export function PosPage() {
             </div>
           </div>
         </div>
+      )}
+
+      {settlementTarget && dayStatus && (
+        <PriorDaySettlementModal
+          checkout={settlementTarget.checkout}
+          todayDate={dayStatus.todayDate}
+          localCashReceivedCentavos={settlementTarget.localCashReceivedCentavos}
+          onClose={() => setSettlementTarget(null)}
+          onSettled={(settlement) => void handlePriorDaySettled(settlement)}
+          onAlreadySaved={(reference, sale) => handlePriorDayAlreadySaved(reference, sale)}
+        />
       )}
     </AppShell>
   );

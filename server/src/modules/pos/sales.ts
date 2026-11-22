@@ -14,9 +14,15 @@ export type CheckoutStatus =
   | "PAYMENT_PENDING"
   | "SAVED"
   | "REVIEW_REQUIRED"
+  | "SETTLED_PRIOR_DAY"
   | "CANCELLED_DRAFT";
 export type SaleStatus = "ACTIVE" | "VOIDED";
-export type RecoveryState = "SAVED" | "SAFE_TO_RETRY" | "UNRESOLVED" | "REVIEW_REQUIRED";
+export type RecoveryState =
+  | "SAVED"
+  | "SAFE_TO_RETRY"
+  | "UNRESOLVED"
+  | "REVIEW_REQUIRED"
+  | "SETTLED_PRIOR_DAY";
 
 export const MAX_ITEMS_PER_SALE = 50;
 export const MAX_QUANTITY_PER_LINE = 500;
@@ -150,14 +156,38 @@ export interface SaleView {
   actionHistory: SaleActionView[];
 }
 
+export interface PriorDaySettlementView {
+  checkoutReference: string;
+  originalBusinessDate: string;
+  settlementDate: string;
+  outcome: "PAID_AND_DELIVERED";
+  netAmountKeptCentavos: number;
+  cashReceivedCentavos: number | null;
+  changeCentavos: number | null;
+  totalContainers: number;
+  totalVolumeMl: number;
+  totalVolumeLiters: number;
+  items: QuoteLineItem[];
+  originalActor: string;
+  originalPaymentStartedAt: string | null;
+  originalPaymentRecordedAt: string | null;
+  paymentKeptConfirmed: true;
+  refillDeliveredConfirmed: true;
+  settledBy: string;
+  settledAt: string;
+  note: string | null;
+}
+
 export interface CheckoutLookupView {
   recoveryState: RecoveryState;
   reason: string | null;
   canRetry: boolean;
+  canSettlePriorDay: boolean;
   ownedByCurrentUser: boolean;
   checkedAt: string;
   checkout: CheckoutView;
   sale: SaleView | null;
+  settlement: PriorDaySettlementView | null;
 }
 
 // Asia/Manila is fixed UTC+08:00 with no daylight saving transitions.
@@ -499,22 +529,45 @@ export function deriveCheckoutLookup(input: {
   checkoutOwnerUserId: string;
   dayClosedAt: string | null;
   sale: SaleView | null;
+  settlement: PriorDaySettlementView | null;
   todayDate: string;
   currentUserId: string;
+  currentUserRole: "OWNER" | "CASHIER";
   checkedAt: string;
   inFlightEntry?: InFlightEntry;
 }): CheckoutLookupView {
   const ownedByCurrentUser = input.checkoutOwnerUserId === input.currentUserId;
+  const canSettlePriorDay =
+    input.currentUserRole === "OWNER" &&
+    !input.inFlightEntry &&
+    input.checkout.businessDate < input.todayDate &&
+    (input.checkout.status === "REVIEW_REQUIRED" || input.checkout.status === "PAYMENT_PENDING");
 
   if (input.checkout.status === "SAVED" && input.sale) {
     return {
       recoveryState: "SAVED",
       reason: null,
       canRetry: false,
+      canSettlePriorDay: false,
       ownedByCurrentUser,
       checkedAt: input.checkedAt,
       checkout: input.checkout,
       sale: input.sale,
+      settlement: null,
+    };
+  }
+
+  if (input.checkout.status === "SETTLED_PRIOR_DAY" && input.settlement) {
+    return {
+      recoveryState: "SETTLED_PRIOR_DAY",
+      reason: "SETTLED_PRIOR_DAY_PAID_AND_DELIVERED",
+      canRetry: false,
+      canSettlePriorDay: false,
+      ownedByCurrentUser,
+      checkedAt: input.checkedAt,
+      checkout: input.checkout,
+      sale: null,
+      settlement: input.settlement,
     };
   }
 
@@ -523,10 +576,12 @@ export function deriveCheckoutLookup(input: {
       recoveryState: "UNRESOLVED",
       reason: "SAVE_IN_PROGRESS",
       canRetry: false,
+      canSettlePriorDay: false,
       ownedByCurrentUser,
       checkedAt: input.checkedAt,
       checkout: input.inFlightEntry.checkoutView,
       sale: null,
+      settlement: null,
     };
   }
 
@@ -535,10 +590,12 @@ export function deriveCheckoutLookup(input: {
       recoveryState: "REVIEW_REQUIRED",
       reason: input.checkout.resolutionReason ?? "REVIEW_REQUIRED",
       canRetry: false,
+      canSettlePriorDay,
       ownedByCurrentUser,
       checkedAt: input.checkedAt,
       checkout: input.checkout,
       sale: null,
+      settlement: null,
     };
   }
 
@@ -547,10 +604,12 @@ export function deriveCheckoutLookup(input: {
       recoveryState: "REVIEW_REQUIRED",
       reason: input.checkout.resolutionReason ?? "CHECKOUT_CANCELLED",
       canRetry: false,
+      canSettlePriorDay: false,
       ownedByCurrentUser,
       checkedAt: input.checkedAt,
       checkout: input.checkout,
       sale: null,
+      settlement: null,
     };
   }
 
@@ -559,10 +618,12 @@ export function deriveCheckoutLookup(input: {
       recoveryState: "REVIEW_REQUIRED",
       reason: "DAY_CLOSED",
       canRetry: false,
+      canSettlePriorDay,
       ownedByCurrentUser,
       checkedAt: input.checkedAt,
       checkout: input.checkout,
       sale: null,
+      settlement: null,
     };
   }
 
@@ -571,10 +632,12 @@ export function deriveCheckoutLookup(input: {
       recoveryState: "REVIEW_REQUIRED",
       reason: "BUSINESS_DATE_CROSSED",
       canRetry: false,
+      canSettlePriorDay,
       ownedByCurrentUser,
       checkedAt: input.checkedAt,
       checkout: input.checkout,
       sale: null,
+      settlement: null,
     };
   }
 
@@ -583,10 +646,12 @@ export function deriveCheckoutLookup(input: {
       recoveryState: "UNRESOLVED",
       reason: "OWNED_BY_OTHER_ACCOUNT",
       canRetry: false,
+      canSettlePriorDay: false,
       ownedByCurrentUser,
       checkedAt: input.checkedAt,
       checkout: input.checkout,
       sale: null,
+      settlement: null,
     };
   }
 
@@ -594,9 +659,11 @@ export function deriveCheckoutLookup(input: {
     recoveryState: "SAFE_TO_RETRY",
     reason: "NOT_SAVED",
     canRetry: true,
+    canSettlePriorDay: false,
     ownedByCurrentUser,
     checkedAt: input.checkedAt,
     checkout: input.checkout,
     sale: null,
+    settlement: null,
   };
 }

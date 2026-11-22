@@ -8,9 +8,15 @@ export type CheckoutStatus =
   | "PAYMENT_PENDING"
   | "SAVED"
   | "REVIEW_REQUIRED"
+  | "SETTLED_PRIOR_DAY"
   | "CANCELLED_DRAFT";
 export type SaleStatus = "ACTIVE" | "VOIDED";
-export type RecoveryState = "SAVED" | "SAFE_TO_RETRY" | "UNRESOLVED" | "REVIEW_REQUIRED";
+export type RecoveryState =
+  | "SAVED"
+  | "SAFE_TO_RETRY"
+  | "UNRESOLVED"
+  | "REVIEW_REQUIRED"
+  | "SETTLED_PRIOR_DAY";
 
 export interface CatalogRefill {
   code: string;
@@ -23,17 +29,17 @@ export interface CatalogRefill {
 
 export type CartItemInput =
   | {
-      kind: "STANDARD";
-      waterType: WaterType;
-      quantity: number;
-    }
+    kind: "STANDARD";
+    waterType: WaterType;
+    quantity: number;
+  }
   | {
-      kind: "CUSTOM";
-      waterType: WaterType;
-      unitVolumeLiters: number;
-      unitPriceCentavos: number;
-      quantity: number;
-    };
+    kind: "CUSTOM";
+    waterType: WaterType;
+    unitVolumeLiters: number;
+    unitPriceCentavos: number;
+    quantity: number;
+  };
 
 export interface QuoteLineItem {
   lineIndex: number;
@@ -101,6 +107,7 @@ export interface PosDayResponse {
   day: DayView | null;
   unresolvedCheckouts: CheckoutView[];
   unpaidDrafts: CheckoutView[];
+  priorDayReviewCheckouts?: CheckoutView[];
   replayed?: boolean;
 }
 
@@ -128,14 +135,46 @@ export interface SaleView {
   actionHistory: SaleActionView[];
 }
 
+export interface PriorDaySettlementView {
+  checkoutReference: string;
+  originalBusinessDate: string;
+  settlementDate: string;
+  outcome: "PAID_AND_DELIVERED";
+  netAmountKeptCentavos: number;
+  cashReceivedCentavos: number | null;
+  changeCentavos: number | null;
+  totalContainers: number;
+  totalVolumeMl: number;
+  totalVolumeLiters: number;
+  items: QuoteLineItem[];
+  originalActor: string;
+  originalPaymentStartedAt?: string | null;
+  originalPaymentRecordedAt: string | null;
+  paymentKeptConfirmed: true;
+  refillDeliveredConfirmed: true;
+  settledBy: string;
+  settledAt: string;
+  note: string | null;
+}
+
 export interface CheckoutLookupView {
   recoveryState: RecoveryState;
   reason: string | null;
   canRetry: boolean;
+  canSettlePriorDay?: boolean;
   ownedByCurrentUser: boolean;
   checkedAt: string;
   checkout: CheckoutView;
   sale: SaleView | null;
+  settlement?: PriorDaySettlementView | null;
+}
+
+export interface SettlePriorDayResponse {
+  outcome: "SETTLED" | "ALREADY_SAVED";
+  replayed: boolean;
+  settlement: PriorDaySettlementView | null;
+  sale: SaleView | null;
+  checkout: CheckoutView;
 }
 
 export interface PrepareCheckoutResponse {
@@ -167,28 +206,29 @@ export interface SalesListResponse {
   status: "ACTIVE" | "VOIDED" | "ALL";
   query: string;
   sales: SaleView[];
+  priorDaySettlements?: PriorDaySettlementView[];
 }
 
 export type CartDraftLine =
   | {
-      id: string;
-      kind: "STANDARD";
-      waterType: WaterType;
-      displayName: string;
-      unitVolumeMl: number;
-      unitVolumeLiters: number;
-      unitPriceCentavos: number;
-      quantity: number;
-    }
+    id: string;
+    kind: "STANDARD";
+    waterType: WaterType;
+    displayName: string;
+    unitVolumeMl: number;
+    unitVolumeLiters: number;
+    unitPriceCentavos: number;
+    quantity: number;
+  }
   | {
-      id: string;
-      kind: "CUSTOM";
-      waterType: WaterType;
-      displayName: string;
-      unitVolumeLiters: number;
-      unitPriceCentavos: number;
-      quantity: number;
-    };
+    id: string;
+    kind: "CUSTOM";
+    waterType: WaterType;
+    displayName: string;
+    unitVolumeLiters: number;
+    unitPriceCentavos: number;
+    quantity: number;
+  };
 
 export interface UnpaidCartSnapshot {
   ownerUsername: string;
@@ -216,7 +256,12 @@ export interface PendingCheckoutRecovery {
   lastError: string | null;
 }
 
-export type RecoveryScreen = "UNKNOWN" | "SAVED" | "SAFE_TO_RETRY" | "REVIEW_REQUIRED";
+export type RecoveryScreen =
+  | "UNKNOWN"
+  | "SAVED"
+  | "SAFE_TO_RETRY"
+  | "REVIEW_REQUIRED"
+  | "SETTLED_PRIOR_DAY";
 export type RecoveryTone = "warning" | "success" | "danger" | "neutral";
 
 export interface RecoveryPresentation {
@@ -225,6 +270,8 @@ export interface RecoveryPresentation {
   canCheckStatus: boolean;
   canRetry: boolean;
   canContinueSaved: boolean;
+  canContinueSettled: boolean;
+  canSettlePriorDay: boolean;
   blocksNewSale: boolean;
   statusPillLabel: string;
   statusPillTone: RecoveryTone;
@@ -243,6 +290,7 @@ export interface RecoveryPresentation {
   };
   checkedAt: string | null;
   sale: SaleView | null;
+  settlement: PriorDaySettlementView | null;
 }
 
 export interface StorageLike {
@@ -375,12 +423,12 @@ export function toCartItemInputs(lines: CartDraftLine[]): CartItemInput[] {
     line.kind === "STANDARD"
       ? { kind: "STANDARD", waterType: line.waterType, quantity: line.quantity }
       : {
-          kind: "CUSTOM",
-          waterType: line.waterType,
-          unitVolumeLiters: line.unitVolumeLiters,
-          unitPriceCentavos: line.unitPriceCentavos,
-          quantity: line.quantity,
-        },
+        kind: "CUSTOM",
+        waterType: line.waterType,
+        unitVolumeLiters: line.unitVolumeLiters,
+        unitPriceCentavos: line.unitPriceCentavos,
+        quantity: line.quantity,
+      },
   );
 }
 
@@ -578,9 +626,26 @@ export function clearUnpaidCart(
   }
 }
 
+export function clearUnpaidCartIfMatchesReference(
+  username: string,
+  targetReference: string,
+  storage: StorageLike | null = browserStorage("session"),
+): boolean {
+  const normalizedTarget = targetReference.trim().toUpperCase();
+  if (!normalizedTarget) return false;
+  const saved = loadUnpaidCart(username, storage);
+  if (saved?.preparedCheckout?.reference.trim().toUpperCase() !== normalizedTarget) {
+    return false;
+  }
+  clearUnpaidCart(username, storage);
+  return true;
+}
+
 export function resolveRecoveryPresentation(
   record: PendingCheckoutRecovery,
   currentUsername: string,
+  currentUserRole: "OWNER" | "CASHIER" = "CASHIER",
+  todayDate?: string,
 ): RecoveryPresentation {
   const isDifferentAccount =
     record.initiatedBy.trim().toLowerCase() !== currentUsername.trim().toLowerCase();
@@ -603,6 +668,8 @@ export function resolveRecoveryPresentation(
       canCheckStatus: false,
       canRetry: false,
       canContinueSaved: true,
+      canContinueSettled: false,
+      canSettlePriorDay: false,
       blocksNewSale: true,
       statusPillLabel: "Saved · verified",
       statusPillTone: "success",
@@ -623,6 +690,42 @@ export function resolveRecoveryPresentation(
       },
       checkedAt: lookup.checkedAt,
       sale,
+      settlement: null,
+    };
+  }
+
+  if (lookup && lookup.recoveryState === "SETTLED_PRIOR_DAY" && lookup.settlement) {
+    const settlement = lookup.settlement;
+    const cashReceived = settlement.cashReceivedCentavos ?? localCash;
+    const change =
+      settlement.changeCentavos ?? cashReceived - settlement.netAmountKeptCentavos;
+    return {
+      screen: "SETTLED_PRIOR_DAY",
+      isDifferentAccount,
+      canCheckStatus: false,
+      canRetry: false,
+      canContinueSaved: false,
+      canContinueSettled: true,
+      canSettlePriorDay: false,
+      blocksNewSale: true,
+      statusPillLabel: "Settled · prior day",
+      statusPillTone: "success",
+      headline: "Prior-day refill settled",
+      subline: `Settlement recorded on ${settlement.settlementDate} · checked at ${formatManilaTimeOnly(lookup.checkedAt)}.`,
+      calloutTitle: "No further payment collected",
+      calloutBody: `Confirmed paid and delivered from ${settlement.originalBusinessDate}. Recorded separately from today's refill sales.`,
+      calloutTone: "success",
+      amounts: {
+        totalCentavos: settlement.netAmountKeptCentavos,
+        cashReceivedCentavos: cashReceived,
+        changeCentavos: change,
+        totalContainers: settlement.totalContainers,
+        totalVolumeLiters: settlement.totalVolumeLiters,
+        items: settlement.items,
+      },
+      checkedAt: lookup.checkedAt,
+      sale: null,
+      settlement,
     };
   }
 
@@ -632,6 +735,16 @@ export function resolveRecoveryPresentation(
     const change = lookup.checkout.changeCentavos ?? cashReceived - serverTotal;
     const isDateCrossed = lookup.reason === "BUSINESS_DATE_CROSSED";
     const isDayClosed = lookup.reason === "DAY_CLOSED";
+    const isPriorDay = todayDate
+      ? lookup.checkout.businessDate < todayDate
+      : lookup.reason === "BUSINESS_DATE_CROSSED" ||
+      (lookup.checkedAt.length >= 10 &&
+        lookup.checkout.businessDate < lookup.checkedAt.slice(0, 10));
+    const canSettlePriorDay =
+      currentUserRole === "OWNER" &&
+      isPriorDay &&
+      (lookup.checkout.status === "REVIEW_REQUIRED" ||
+        lookup.checkout.status === "PAYMENT_PENDING");
 
     return {
       screen: "REVIEW_REQUIRED",
@@ -639,6 +752,8 @@ export function resolveRecoveryPresentation(
       canCheckStatus: true,
       canRetry: false,
       canContinueSaved: false,
+      canContinueSettled: false,
+      canSettlePriorDay,
       blocksNewSale: true,
       statusPillLabel: "Review required",
       statusPillTone: "danger",
@@ -663,6 +778,7 @@ export function resolveRecoveryPresentation(
       },
       checkedAt: lookup.checkedAt,
       sale: null,
+      settlement: null,
     };
   }
 
@@ -674,6 +790,8 @@ export function resolveRecoveryPresentation(
       canCheckStatus: true,
       canRetry: true,
       canContinueSaved: false,
+      canContinueSettled: false,
+      canSettlePriorDay: false,
       blocksNewSale: true,
       statusPillLabel: "Not saved · verified",
       statusPillTone: "neutral",
@@ -693,6 +811,7 @@ export function resolveRecoveryPresentation(
       },
       checkedAt: lookup.checkedAt,
       sale: null,
+      settlement: null,
     };
   }
 
@@ -700,15 +819,15 @@ export function resolveRecoveryPresentation(
   const serverCheckout = lookup?.checkout;
   const resolvedAmounts = serverCheckout
     ? {
-        totalCentavos: serverCheckout.totalCentavos,
-        cashReceivedCentavos: serverCheckout.cashReceivedCentavos ?? localCash,
-        changeCentavos:
-          serverCheckout.changeCentavos ??
-          (serverCheckout.cashReceivedCentavos ?? localCash) - serverCheckout.totalCentavos,
-        totalContainers: serverCheckout.totalContainers,
-        totalVolumeLiters: serverCheckout.totalVolumeLiters,
-        items: serverCheckout.items,
-      }
+      totalCentavos: serverCheckout.totalCentavos,
+      cashReceivedCentavos: serverCheckout.cashReceivedCentavos ?? localCash,
+      changeCentavos:
+        serverCheckout.changeCentavos ??
+        (serverCheckout.cashReceivedCentavos ?? localCash) - serverCheckout.totalCentavos,
+      totalContainers: serverCheckout.totalContainers,
+      totalVolumeLiters: serverCheckout.totalVolumeLiters,
+      items: serverCheckout.items,
+    }
     : localAmounts;
 
   return {
@@ -717,6 +836,8 @@ export function resolveRecoveryPresentation(
     canCheckStatus: true,
     canRetry: false,
     canContinueSaved: false,
+    canContinueSettled: false,
+    canSettlePriorDay: false,
     blocksNewSale: true,
     statusPillLabel: isDifferentAccount
       ? "Pending · other account"
@@ -740,6 +861,7 @@ export function resolveRecoveryPresentation(
     amounts: resolvedAmounts,
     checkedAt: lookup?.checkedAt ?? null,
     sale: null,
+    settlement: null,
   };
 }
 
