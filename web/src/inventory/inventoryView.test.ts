@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  formatAlreadySetNotice,
   formatQuantityLabel,
   formatRecordedAtManila,
+  type InventoryItemView,
   MAX_OPENING_QUANTITY,
   parseOpeningQuantityInput,
 } from "./inventoryView";
@@ -41,5 +43,71 @@ describe("inventoryView helpers", () => {
     expect(formatRecordedAtManila("2026-11-22T09:05:00+08:00")).toBe("Nov 22, 2026 · 9:05 AM");
     expect(formatRecordedAtManila("2026-11-22T16:30:00.000Z")).toBe("Nov 23, 2026 · 12:30 AM");
     expect(formatRecordedAtManila("not-a-timestamp")).toBe("not-a-timestamp");
+  });
+
+  it("formats conflict notices with rejected quantity, saved balance, and fallback", () => {
+    const slimInitialized: InventoryItemView = {
+      code: "SLIM",
+      name: "Slim Container",
+      category: "CONTAINER",
+      shape: "SLIM",
+      unit: "containers",
+      status: "INITIALIZED",
+      currentQuantity: 14,
+      openingStock: {
+        quantity: 14,
+        unit: "containers",
+        recordedBy: "owner_a",
+        recordedAt: "2026-11-22T14:30:00+08:00",
+      },
+    };
+    expect(
+      formatAlreadySetNotice(
+        "Slim Container",
+        22,
+        "containers",
+        slimInitialized,
+        "Opening stock for Slim Container is already set.",
+      ),
+    ).toBe(
+      "Your entry of 22 containers was not saved. Opening stock for Slim Container is already set to 14 containers (recorded by owner_a).",
+    );
+
+    const roundZero: InventoryItemView = {
+      code: "ROUND",
+      name: "Round Container",
+      category: "CONTAINER",
+      shape: "ROUND",
+      unit: "containers",
+      status: "INITIALIZED",
+      currentQuantity: 0,
+      openingStock: {
+        quantity: 0,
+        unit: "containers",
+        recordedBy: "owner_a",
+        recordedAt: "2026-11-22T14:30:00+08:00",
+      },
+    };
+    expect(
+      formatAlreadySetNotice(
+        "Round Container",
+        1,
+        "containers",
+        roundZero,
+        "Opening stock for Round Container is already set.",
+      ),
+    ).toBe(
+      "Your entry of 1 container was not saved. Opening stock for Round Container is already set to 0 containers (recorded by owner_a).",
+    );
+
+    expect(
+      formatAlreadySetNotice(
+        "Slim Container",
+        22,
+        "containers",
+        null,
+        "Opening stock for Slim Container is already set.",
+      ),
+    ).toBe("Opening stock for Slim Container is already set.");
   });
 });

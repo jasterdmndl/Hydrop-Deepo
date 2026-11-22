@@ -76,3 +76,16 @@ export function formatRecordedAtManila(iso: string): string {
   const hour12 = hour24 % 12 === 0 ? 12 : hour24 % 12;
   return `${month} ${day}, ${year} · ${hour12}:${minute} ${period}`;
 }
+
+export function formatAlreadySetNotice(
+  itemName: string,
+  attemptedQuantity: number,
+  unit: string,
+  existingItem: InventoryItemView | null,
+  fallbackMessage: string,
+): string {
+  if (existingItem?.openingStock) {
+    return `Your entry of ${formatQuantityLabel(attemptedQuantity, unit)} was not saved. Opening stock for ${itemName} is already set to ${formatQuantityLabel(existingItem.openingStock.quantity, existingItem.openingStock.unit)} (recorded by ${existingItem.openingStock.recordedBy}).`;
+  }
+  return fallbackMessage;
+}

@@ -4,6 +4,7 @@ import { createRequestTracker } from "../calendar/calendarView";
 import { AppShell, useModulesData } from "../ChooseModule";
 import {
   type ContainerShape,
+  formatAlreadySetNotice,
   formatQuantityLabel,
   formatRecordedAtManila,
   type InventoryItemsResponse,
@@ -25,6 +26,7 @@ export function InventoryPage() {
 
   const [inputs, setInputs] = useState<Record<ContainerShape, string>>({ ROUND: "", SLIM: "" });
   const [fieldErrors, setFieldErrors] = useState<Partial<Record<ContainerShape, string>>>({});
+  const [conflictNotices, setConflictNotices] = useState<Partial<Record<ContainerShape, string>>>({});
   const [submittingShape, setSubmittingShape] = useState<ContainerShape | null>(null);
   const [saveNotice, setSaveNotice] = useState<string | null>(null);
 
@@ -45,6 +47,7 @@ export function InventoryPage() {
     setLoadError(null);
     if (!options.preserveNotice) {
       setSaveNotice(null);
+      setConflictNotices({});
     }
     try {
       const response = await api<InventoryItemsResponse>("/api/inventory/items");
@@ -79,6 +82,7 @@ export function InventoryPage() {
 
     setSubmittingShape(shape);
     setFieldErrors((prev) => ({ ...prev, [shape]: undefined }));
+    setConflictNotices((prev) => ({ ...prev, [shape]: undefined }));
     setSaveNotice(null);
 
     try {
@@ -99,13 +103,18 @@ export function InventoryPage() {
       );
     } catch (err) {
       if (err instanceof ApiError && err.code === "OPENING_STOCK_ALREADY_SET") {
-        const existingItem = err.details?.item;
-        if (isInventoryItemView(existingItem)) {
+        const existingItem = isInventoryItemView(err.details?.item) ? err.details.item : null;
+        if (existingItem) {
           setItems((prev) => prev.map((entry) => (entry.shape === shape ? existingItem : entry)));
         } else {
           void loadItems({ preserveNotice: true });
         }
-        setFieldErrors((prev) => ({ ...prev, [shape]: err.message }));
+        setInputs((prev) => ({ ...prev, [shape]: "" }));
+        setFieldErrors((prev) => ({ ...prev, [shape]: undefined }));
+        setConflictNotices((prev) => ({
+          ...prev,
+          [shape]: formatAlreadySetNotice(item.name, parsed.quantity, item.unit, existingItem, err.message),
+        }));
       } else {
         setFieldErrors((prev) => ({
           ...prev,
@@ -190,6 +199,7 @@ export function InventoryPage() {
             const isNotSet = item.status === "NOT_SET" || item.currentQuantity === null;
             const isZero = !isNotSet && item.currentQuantity === 0;
             const formError = fieldErrors[item.shape];
+            const conflictNotice = conflictNotices[item.shape];
             const isSubmitting = submittingShape === item.shape;
             const inputId = `opening-count-${item.shape.toLowerCase()}`;
             const hintId = `${inputId}-hint`;
@@ -229,6 +239,12 @@ export function InventoryPage() {
                     </>
                   )}
                 </div>
+
+                {conflictNotice && (
+                  <div className="alert alert--error" role="alert">
+                    {conflictNotice}
+                  </div>
+                )}
 
                 {!isNotSet && item.openingStock ? (
                   <>
