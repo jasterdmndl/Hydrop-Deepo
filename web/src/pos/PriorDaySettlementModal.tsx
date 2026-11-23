@@ -1,5 +1,7 @@
 import { type FormEvent, useEffect, useState } from "react";
 import { api, ApiError } from "../api";
+import { type NoticeEnvelope, wrapNotice } from "../notifications/noticeTiming";
+import { TemporaryNotice } from "../notifications/TemporaryNotice";
 import {
   type CheckoutView,
   formatCentavos,
@@ -31,7 +33,7 @@ export function PriorDaySettlementModal({
   const [refillDeliveredConfirmed, setRefillDeliveredConfirmed] = useState(false);
   const [note, setNote] = useState("");
   const [submitting, setSubmitting] = useState(false);
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<NoticeEnvelope<string> | null>(null);
   const isMerchandiseOnly = isPriorDayMerchandiseOnly(checkout.items);
   const merchQty = checkout.items
     .filter((item) => item.kind === "MERCHANDISE" || item.kind === "CONTAINER_PACKAGE")
@@ -102,9 +104,11 @@ export function PriorDaySettlementModal({
       }
     } catch (err) {
       setError(
-        err instanceof ApiError
-          ? err.message
-          : "Could not record the prior-day settlement. Keep this reference pending and check status.",
+        wrapNotice(
+          err instanceof ApiError
+            ? err.message
+            : "Could not record the prior-day settlement. Keep this reference pending and check status.",
+        ),
       );
     } finally {
       setSubmitting(false);
@@ -268,9 +272,16 @@ export function PriorDaySettlementModal({
           </label>
 
           {error && (
-            <div className="alert alert--error" role="alert">
-              {error}
-            </div>
+            <TemporaryNotice
+              occurrenceId={error.id}
+              duration="brief"
+              className="alert alert--error"
+              role="alert"
+              closeLabel="Close settlement error"
+              onDismiss={() => setError(null)}
+            >
+              {error.data}
+            </TemporaryNotice>
           )}
 
           <div className="modal__actions">

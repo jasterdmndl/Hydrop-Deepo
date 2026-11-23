@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { api, ApiError } from "../api";
 import { useSignedInUser } from "../auth/AuthContext";
 import { AppShell, useModulesData } from "../ChooseModule";
+import { nextNoticeId, type NoticeEnvelope, wrapNotice } from "../notifications/noticeTiming";
+import { TemporaryNotice } from "../notifications/TemporaryNotice";
 import {
   type ActivitiesMonthResponse,
   type ActivityView,
@@ -29,8 +31,8 @@ type CalendarTab = "calendar" | "history";
 type CalendarMode = "overview" | "schedule" | "complete";
 
 type BannerState =
-  | { kind: "scheduled"; activity: ActivityView }
-  | { kind: "completed"; activity: ActivityView }
+  | { id: number; kind: "scheduled"; activity: ActivityView }
+  | { id: number; kind: "completed"; activity: ActivityView }
   | null;
 
 const WEEKDAY_HEADERS = ["SUN", "MON", "TUE", "WED", "THU", "FRI", "SAT"] as const;
@@ -79,7 +81,7 @@ export function CalendarPage() {
   const [completionTarget, setCompletionTarget] = useState<ActivityView | null>(null);
   const [banner, setBanner] = useState<BannerState>(null);
   const [justScheduledRef, setJustScheduledRef] = useState<string | null>(null);
-  const [detailError, setDetailError] = useState<string | null>(null);
+  const [detailError, setDetailError] = useState<NoticeEnvelope<string> | null>(null);
   const loadTrackerRef = useRef(createRequestTracker());
   const detailTrackerRef = useRef(createRequestTracker());
 
@@ -165,7 +167,9 @@ export function CalendarPage() {
       setSelectedDate(detail.scheduledDate);
     } catch (err) {
       if (!detailTrackerRef.current.isCurrent(requestId)) return;
-      setDetailError(err instanceof ApiError ? err.message : "Could not load activity details.");
+      setDetailError(
+        wrapNotice(err instanceof ApiError ? err.message : "Could not load activity details."),
+      );
     }
   }
 
@@ -184,7 +188,9 @@ export function CalendarPage() {
       setCompletionTarget(detail);
       setMode("complete");
     } catch (err) {
-      setDetailError(err instanceof ApiError ? err.message : "Could not open completion form.");
+      setDetailError(
+        wrapNotice(err instanceof ApiError ? err.message : "Could not open completion form."),
+      );
     }
   }
 
@@ -194,7 +200,7 @@ export function CalendarPage() {
     setSelectedDate(saved.scheduledDate);
     setSelectedActivity(saved);
     setJustScheduledRef(saved.reference);
-    setBanner({ kind: "scheduled", activity: saved });
+    setBanner({ id: nextNoticeId(), kind: "scheduled", activity: saved });
     setTab("calendar");
     setMode("overview");
     await loadAll(savedMonth, historyMonth);
@@ -206,7 +212,7 @@ export function CalendarPage() {
     setSelectedActivity(saved);
     setCompletionTarget(null);
     setJustScheduledRef(null);
-    setBanner({ kind: "completed", activity: saved });
+    setBanner({ id: nextNoticeId(), kind: "completed", activity: saved });
     setTab("history");
     setMode("overview");
     await loadAll(calendarMonth, completionMonth);
@@ -300,9 +306,16 @@ export function CalendarPage() {
       )}
 
       {detailError && (
-        <div className="alert alert--error" role="alert">
-          {detailError}
-        </div>
+        <TemporaryNotice
+          occurrenceId={detailError.id}
+          duration="brief"
+          className="alert alert--error"
+          role="alert"
+          closeLabel="Close activity detail error"
+          onDismiss={() => setDetailError(null)}
+        >
+          {detailError.data}
+        </TemporaryNotice>
       )}
 
       {access && !access.canManage && (
@@ -319,7 +332,13 @@ export function CalendarPage() {
             role="tab"
             aria-selected={tab === "calendar"}
             className={`tab ${tab === "calendar" ? "tab--active" : ""}`}
-            onClick={() => setTab("calendar")}
+            onClick={() => {
+              if (tab !== "calendar") {
+                setBanner(null);
+                setDetailError(null);
+                setTab("calendar");
+              }
+            }}
           >
             Calendar
           </button>
@@ -328,7 +347,13 @@ export function CalendarPage() {
             role="tab"
             aria-selected={tab === "history"}
             className={`tab ${tab === "history" ? "tab--active" : ""}`}
-            onClick={() => setTab("history")}
+            onClick={() => {
+              if (tab !== "history") {
+                setBanner(null);
+                setDetailError(null);
+                setTab("history");
+              }
+            }}
           >
             Completion history
           </button>
@@ -503,14 +528,21 @@ export function CalendarPage() {
 
           <aside className="side-stack">
             {banner?.kind === "scheduled" && (
-              <div className="callout callout--success" role="status">
+              <TemporaryNotice
+                occurrenceId={banner.id}
+                duration="brief"
+                className="callout callout--success"
+                role="status"
+                closeLabel="Close scheduled activity notice"
+                onDismiss={() => setBanner(null)}
+              >
                 <p className="callout__title">{banner.activity.name} scheduled</p>
                 <p className="callout__body">
                   Saved for {formatLongDate(banner.activity.scheduledDate)} at{" "}
                   {formatTime12h(banner.activity.scheduledTime)}. You can find it in the calendar and upcoming
                   activities.
                 </p>
-              </div>
+              </TemporaryNotice>
             )}
 
             {banner?.kind !== "scheduled" && firstOverdueReminder && (
@@ -738,7 +770,14 @@ export function CalendarPage() {
 
           <aside className="side-stack">
             {banner?.kind === "completed" && (
-              <div className="callout callout--success" role="status">
+              <TemporaryNotice
+                occurrenceId={banner.id}
+                duration="brief"
+                className="callout callout--success"
+                role="status"
+                closeLabel="Close completion confirmation"
+                onDismiss={() => setBanner(null)}
+              >
                 <p className="callout__title">Completion saved. History retained.</p>
                 <p className="callout__body">
                   {banner.activity.name} was completed on{" "}
@@ -746,7 +785,7 @@ export function CalendarPage() {
                   {banner.activity.completedTime ? formatTime12h(banner.activity.completedTime) : "—"} by{" "}
                   {banner.activity.recordedBy ?? user.username}.
                 </p>
-              </div>
+              </TemporaryNotice>
             )}
 
             {activeHistoryActivity ? (

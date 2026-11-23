@@ -40,7 +40,7 @@ function AppRoutes() {
   }
 
   if (state.status === "signed-out") {
-    return <LoginPage notice={state.notice} />;
+    return <LoginPage notice={state.notice} noticeId={state.noticeId} />;
   }
 
   // Enforce password replacement across all URLs before any module access.

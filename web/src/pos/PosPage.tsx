@@ -3,6 +3,8 @@ import { api, ApiError } from "../api";
 import { useSignedInUser } from "../auth/AuthContext";
 import { createRequestTracker } from "../calendar/calendarView";
 import { AppShell, useModulesData } from "../ChooseModule";
+import { type NoticeEnvelope, wrapNotice } from "../notifications/noticeTiming";
+import { TemporaryNotice } from "../notifications/TemporaryNotice";
 import { CheckoutRecovery } from "./CheckoutRecovery";
 import {
   type BeginPaymentResponse,
@@ -234,7 +236,7 @@ export function PosPage() {
   const [prepareSignature, setPrepareSignature] = useState<string | null>(null);
   const [cashInput, setCashInput] = useState("");
   const [confirmNoCashChecked, setConfirmNoCashChecked] = useState(false);
-  const [saleError, setSaleError] = useState<string | null>(null);
+  const [saleError, setSaleError] = useState<NoticeEnvelope<string> | null>(null);
 
   const [pendingRecoveries, setPendingRecoveries] = useState<PendingCheckoutRecovery[]>(() =>
     loadPendingRecoveries(),
@@ -245,12 +247,14 @@ export function PosPage() {
   const [activeConfirming, setActiveConfirming] = useState<PendingCheckoutRecovery | null>(null);
   const [checkingStatus, setCheckingStatus] = useState(false);
   const [retryingRecovery, setRetryingRecovery] = useState(false);
-  const [recoveryError, setRecoveryError] = useState<string | null>(null);
+  const [recoveryError, setRecoveryError] = useState<NoticeEnvelope<string> | null>(null);
 
-  const [lastSavedSale, setLastSavedSale] = useState<SaleView | null>(null);
-  const [lastClosedSummary, setLastClosedSummary] = useState<DaySummaryView | null>(null);
-  const [lastSettledPriorDay, setLastSettledPriorDay] = useState<PriorDaySettlementView | null>(null);
-  const [lastAlreadySavedPriorDay, setLastAlreadySavedPriorDay] = useState<SaleView | null>(null);
+  const [lastSavedSale, setLastSavedSale] = useState<NoticeEnvelope<SaleView> | null>(null);
+  const [lastClosedSummary, setLastClosedSummary] = useState<NoticeEnvelope<DaySummaryView> | null>(null);
+  const [lastSettledPriorDay, setLastSettledPriorDay] =
+    useState<NoticeEnvelope<PriorDaySettlementView> | null>(null);
+  const [lastAlreadySavedPriorDay, setLastAlreadySavedPriorDay] =
+    useState<NoticeEnvelope<SaleView> | null>(null);
   const [historyFocusRef, setHistoryFocusRef] = useState<string | null>(null);
   const [historySettlementFocusRef, setHistorySettlementFocusRef] = useState<string | null>(null);
   const [historyRefreshSignal, setHistoryRefreshSignal] = useState(0);
@@ -261,7 +265,7 @@ export function PosPage() {
 
   const [startingDay, setStartingDay] = useState(false);
   const [startRequestKey, setStartRequestKey] = useState<string | null>(null);
-  const [dayActionError, setDayActionError] = useState<string | null>(null);
+  const [dayActionError, setDayActionError] = useState<NoticeEnvelope<string> | null>(null);
 
   const [preparingCheckout, setPreparingCheckout] = useState(false);
   const [startingPayment, setStartingPayment] = useState(false);
@@ -282,7 +286,7 @@ export function PosPage() {
   const [endDayClearDrafts, setEndDayClearDrafts] = useState(false);
   const [closeRequestKey, setCloseRequestKey] = useState<string | null>(null);
   const [endingDay, setEndingDay] = useState(false);
-  const [endDayError, setEndDayError] = useState<string | null>(null);
+  const [endDayError, setEndDayError] = useState<NoticeEnvelope<string> | null>(null);
 
   const [cartHydratedUser, setCartHydratedUser] = useState<string | null>(null);
   const isCartHydrated = cartHydratedUser === user.username;
@@ -650,7 +654,7 @@ export function PosPage() {
     const existingIdx = lines.findIndex((l) => l.id === id);
 
     if (clamped > 0 && existingIdx === -1 && lines.length >= MAX_LINES) {
-      setSaleError(`Maximum ${MAX_LINES} lines per sale.`);
+      setSaleError(wrapNotice(`Maximum ${MAX_LINES} lines per sale.`));
       return false;
     }
 
@@ -694,7 +698,7 @@ export function PosPage() {
     const existingIdx = lines.findIndex((l) => l.id === id);
 
     if (clamped > 0 && existingIdx === -1 && lines.length >= MAX_LINES) {
-      setSaleError(`Maximum ${MAX_LINES} lines per sale.`);
+      setSaleError(wrapNotice(`Maximum ${MAX_LINES} lines per sale.`));
       return false;
     }
 
@@ -756,7 +760,7 @@ export function PosPage() {
     const existingIdx = lines.findIndex((l) => l.id === id);
 
     if (clamped > 0 && existingIdx === -1 && lines.length >= MAX_LINES) {
-      setSaleError(`Maximum ${MAX_LINES} lines per sale.`);
+      setSaleError(wrapNotice(`Maximum ${MAX_LINES} lines per sale.`));
       return false;
     }
 
@@ -954,7 +958,9 @@ export function PosPage() {
       setStartRequestKey(null);
       setLastClosedSummary(null);
     } catch (err) {
-      setDayActionError(err instanceof ApiError ? err.message : "Could not start the station day.");
+      setDayActionError(
+        wrapNotice(err instanceof ApiError ? err.message : "Could not start the station day."),
+      );
       void loadPosState();
     } finally {
       setStartingDay(false);
@@ -985,7 +991,9 @@ export function PosPage() {
       activeConfirming: activeConfirmingRef.current,
     });
     if (latestGuard.blocked) {
-      setEndDayError("Resolve or finish in-progress checkout confirmation before closing the day.");
+      setEndDayError(
+        wrapNotice("Resolve or finish in-progress checkout confirmation before closing the day."),
+      );
       return;
     }
 
@@ -1009,13 +1017,15 @@ export function PosPage() {
         clearAllQtyEdits();
         setStep("select");
       }
-      setLastClosedSummary(closed.summary);
+      setLastClosedSummary(wrapNotice(closed.summary));
       setEndDayOpen(false);
       notifyPosStateChanged("day-ended");
       setCloseRequestKey(null);
       await loadPosState();
     } catch (err) {
-      setEndDayError(err instanceof ApiError ? err.message : "Could not close the station day.");
+      setEndDayError(
+        wrapNotice(err instanceof ApiError ? err.message : "Could not close the station day."),
+      );
       await loadPosState();
     } finally {
       setEndingDay(false);
@@ -1028,7 +1038,7 @@ export function PosPage() {
     if (invalidIds.length > 0) {
       qtyInputRefs.current.get(invalidIds[0]!)?.focus();
       setQtyEdits(nextEdits);
-      setSaleError("Fix invalid refill quantities before reviewing checkout.");
+      setSaleError(wrapNotice("Fix invalid refill quantities before reviewing checkout."));
       return;
     }
 
@@ -1079,7 +1089,7 @@ export function PosPage() {
       clearAllQtyEdits();
       setStep("review");
     } catch (err) {
-      setSaleError(err instanceof ApiError ? err.message : "Could not prepare checkout.");
+      setSaleError(wrapNotice(err instanceof ApiError ? err.message : "Could not prepare checkout."));
       await loadPosState();
     } finally {
       setPreparingCheckout(false);
@@ -1119,7 +1129,9 @@ export function PosPage() {
       setConfirmNoCashChecked(false);
     } catch (err) {
       setSaleError(
-        err instanceof ApiError ? err.message : "Could not start cash payment for this checkout.",
+        wrapNotice(
+          err instanceof ApiError ? err.message : "Could not start cash payment for this checkout.",
+        ),
       );
       await loadPosState();
     } finally {
@@ -1181,14 +1193,18 @@ export function PosPage() {
       await loadPosState();
       if (hadMissingGripo) {
         setSaleError(
-          "Select Push-Type or Twist-Type gripo for each container package before continuing to payment.",
+          wrapNotice(
+            "Select Push-Type or Twist-Type gripo for each container package before continuing to payment.",
+          ),
         );
       }
     } catch (err) {
       setSaleError(
-        err instanceof ApiError
-          ? err.message
-          : "Could not cancel draft checkout. Check status or retry.",
+        wrapNotice(
+          err instanceof ApiError
+            ? err.message
+            : "Could not cancel draft checkout. Check status or retry.",
+        ),
       );
       await loadPosState();
     } finally {
@@ -1218,9 +1234,11 @@ export function PosPage() {
       await loadPosState();
     } catch (err) {
       setSaleError(
-        err instanceof ApiError
-          ? err.message
-          : "Could not cancel unpaid checkout. Check status or retry.",
+        wrapNotice(
+          err instanceof ApiError
+            ? err.message
+            : "Could not cancel unpaid checkout. Check status or retry.",
+        ),
       );
       await loadPosState();
     } finally {
@@ -1313,7 +1331,7 @@ export function PosPage() {
       setPrepareSignature(null);
       setCashInput("");
       setConfirmNoCashChecked(false);
-      setLastSavedSale(confirmed.sale);
+      setLastSavedSale(wrapNotice(confirmed.sale));
       setStep("select");
       setHistoryRefreshSignal((n) => n + 1);
       await loadPosState();
@@ -1324,7 +1342,7 @@ export function PosPage() {
       if (err instanceof ApiError && err.code === "INSUFFICIENT_CASH") {
         removePendingRecovery(pendingRecord.reference);
         setPendingRecoveries(loadPendingRecoveries());
-        setSaleError(err.message);
+        setSaleError(wrapNotice(err.message));
         return;
       }
 
@@ -1332,7 +1350,7 @@ export function PosPage() {
         const updated = persistReviewRequiredFromError(pendingRecord, err) ?? pendingRecord;
         setPendingRecoveries(loadPendingRecoveries());
         setSelectedRecoveryRef(updated.reference);
-        setRecoveryError(err.message);
+        setRecoveryError(wrapNotice(err.message));
         setPreparedCheckout(null);
         setLines([]);
         clearAllQtyEdits();
@@ -1352,7 +1370,7 @@ export function PosPage() {
       savePendingRecovery({ ...pendingRecord, lastError: errorMsg });
       setPendingRecoveries(loadPendingRecoveries());
       setSelectedRecoveryRef(pendingRecord.reference);
-      setRecoveryError(errorMsg);
+      setRecoveryError(wrapNotice(errorMsg));
       setPreparedCheckout(null);
       setLines([]);
       clearAllQtyEdits();
@@ -1387,9 +1405,11 @@ export function PosPage() {
       setSelectedRecoveryRef(updated.reference);
     } catch (err) {
       setRecoveryError(
-        err instanceof ApiError
-          ? err.message
-          : "Status check could not reach the server. Keep this reference and check again.",
+        wrapNotice(
+          err instanceof ApiError
+            ? err.message
+            : "Status check could not reach the server. Keep this reference and check again.",
+        ),
       );
     } finally {
       setCheckingStatus(false);
@@ -1423,7 +1443,7 @@ export function PosPage() {
       const remaining = loadPendingRecoveries();
       setPendingRecoveries(remaining);
       setSelectedRecoveryRef(remaining[0]?.reference ?? null);
-      setLastSavedSale(confirmed.sale);
+      setLastSavedSale(wrapNotice(confirmed.sale));
       setHistoryRefreshSignal((n) => n + 1);
       await loadPosState();
     } catch (err) {
@@ -1433,13 +1453,15 @@ export function PosPage() {
         persistReviewRequiredFromError(target, err);
         setPendingRecoveries(loadPendingRecoveries());
         setSelectedRecoveryRef(target.reference);
-        setRecoveryError(err.message);
+        setRecoveryError(wrapNotice(err.message));
         return;
       }
       setRecoveryError(
-        err instanceof ApiError
-          ? err.message
-          : "Retry could not reach the server. Check transaction status before trying again.",
+        wrapNotice(
+          err instanceof ApiError
+            ? err.message
+            : "Retry could not reach the server. Check transaction status before trying again.",
+        ),
       );
     } finally {
       activeConfirmingRef.current = null;
@@ -1473,7 +1495,7 @@ export function PosPage() {
     setPendingRecoveries(remaining);
     setSelectedRecoveryRef(remaining[0]?.reference ?? null);
     setRecoveryError(null);
-    setLastSavedSale(sale);
+    setLastSavedSale(wrapNotice(sale));
     setLastSettledPriorDay(null);
     setLastAlreadySavedPriorDay(null);
     setSettlementTarget(null);
@@ -1492,7 +1514,7 @@ export function PosPage() {
     setRecoveryError(null);
     setLastSavedSale(null);
     setLastSettledPriorDay(null);
-    setLastAlreadySavedPriorDay(sale);
+    setLastAlreadySavedPriorDay(wrapNotice(sale));
     setHistoryRefreshSignal((n) => n + 1);
     void loadPosState();
   }
@@ -1544,7 +1566,7 @@ export function PosPage() {
     setRecoveryError(null);
     setLastSavedSale(null);
     setLastAlreadySavedPriorDay(null);
-    setLastSettledPriorDay(settlement);
+    setLastSettledPriorDay(wrapNotice(settlement));
     setHistoryRefreshSignal((n) => n + 1);
     await loadPosState();
   }
@@ -1560,9 +1582,23 @@ export function PosPage() {
     setRecoveryError(null);
     setLastSavedSale(null);
     setLastAlreadySavedPriorDay(null);
-    setLastSettledPriorDay(settlement);
+    setLastSettledPriorDay(wrapNotice(settlement));
     setHistoryRefreshSignal((n) => n + 1);
     void loadPosState();
+  }
+
+  function switchPosTab(nextTab: PosTab) {
+    if (nextTab === tab) return;
+    if (nextTab === "history") {
+      setLastSavedSale(null);
+      setLastClosedSummary(null);
+      setLastSettledPriorDay(null);
+      setLastAlreadySavedPriorDay(null);
+      setSaleError(null);
+      setDayActionError(null);
+      setRecoveryError(null);
+    }
+    setTab(nextTab);
   }
 
   const activeStepperNumber = showRecoveryScreen ? 3 : step === "review" ? 2 : 1;
@@ -1613,7 +1649,7 @@ export function PosPage() {
             role="tab"
             aria-selected={tab === "sale"}
             className={`tab ${tab === "sale" ? "tab--active" : ""}`}
-            onClick={() => setTab("sale")}
+            onClick={() => switchPosTab("sale")}
           >
             New Sale
           </button>
@@ -1622,7 +1658,7 @@ export function PosPage() {
             role="tab"
             aria-selected={tab === "history"}
             className={`tab ${tab === "history" ? "tab--active" : ""}`}
-            onClick={() => setTab("history")}
+            onClick={() => switchPosTab("history")}
           >
             Transaction History
           </button>
@@ -1655,9 +1691,16 @@ export function PosPage() {
       )}
 
       {dayActionError && (
-        <div className="alert alert--error" role="alert">
-          {dayActionError}
-        </div>
+        <TemporaryNotice
+          occurrenceId={dayActionError.id}
+          duration="brief"
+          className="alert alert--error"
+          role="alert"
+          closeLabel="Close day error"
+          onDismiss={() => setDayActionError(null)}
+        >
+          {dayActionError.data}
+        </TemporaryNotice>
       )}
 
       {tab === "history" ? (
@@ -1697,25 +1740,39 @@ export function PosPage() {
           {showRecoveryScreen && activeRecovery ? (
             <>
               {lastSavedSale && (
-                <div className="callout callout--success" role="status">
-                  <p className="callout__title">Sale {lastSavedSale.reference} saved successfully</p>
+                <TemporaryNotice
+                  occurrenceId={lastSavedSale.id}
+                  duration="detailed"
+                  className="callout callout--success"
+                  role="status"
+                  closeLabel="Close sale confirmation"
+                  onDismiss={() => setLastSavedSale(null)}
+                >
+                  <p className="callout__title">Sale {lastSavedSale.data.reference} saved successfully</p>
                   <p className="callout__body">
-                    {formatCentavos(lastSavedSale.cashReceivedCentavos)} received for{" "}
-                    {formatCentavos(lastSavedSale.totalCentavos)} total. Remaining pending transaction(s) on this
+                    {formatCentavos(lastSavedSale.data.cashReceivedCentavos)} received for{" "}
+                    {formatCentavos(lastSavedSale.data.totalCentavos)} total. Remaining pending transaction(s) on this
                     workstation still require status verification below.
                   </p>
-                </div>
+                </TemporaryNotice>
               )}
               {lastAlreadySavedPriorDay && (
-                <div className="callout callout--success" role="status">
+                <TemporaryNotice
+                  occurrenceId={lastAlreadySavedPriorDay.id}
+                  duration="detailed"
+                  className="callout callout--success"
+                  role="status"
+                  closeLabel="Close prior-day confirmation"
+                  onDismiss={() => setLastAlreadySavedPriorDay(null)}
+                >
                   <p className="callout__title">
-                    Original sale {lastAlreadySavedPriorDay.reference} was already saved
+                    Original sale {lastAlreadySavedPriorDay.data.reference} was already saved
                   </p>
                   <p className="callout__body">
                     Already delivered — do not refill or hand over again, and collect no further payment.
                     Remaining pending transaction(s) on this workstation still require verification below.
                   </p>
-                </div>
+                </TemporaryNotice>
               )}
               <CheckoutRecovery
                 record={activeRecovery}
@@ -1725,7 +1782,8 @@ export function PosPage() {
                 todayDate={dayStatus?.todayDate}
                 checking={checkingStatus}
                 retrying={retryingRecovery}
-                errorMessage={recoveryError}
+                errorNotice={recoveryError}
+                onDismissError={() => setRecoveryError(null)}
                 onSelectReference={(ref) => {
                   setSelectedRecoveryRef(ref);
                   setRecoveryError(null);
@@ -1740,32 +1798,46 @@ export function PosPage() {
           ) : (
             <>
               {lastClosedSummary && dayStatus?.state === "CLOSED" && (
-                <div className="callout callout--success" role="status">
-                  <p className="callout__title">Business day {lastClosedSummary.businessDate} closed</p>
+                <TemporaryNotice
+                  occurrenceId={lastClosedSummary.id}
+                  duration="detailed"
+                  className="callout callout--success"
+                  role="status"
+                  closeLabel="Close day summary"
+                  onDismiss={() => setLastClosedSummary(null)}
+                >
+                  <p className="callout__title">Business day {lastClosedSummary.data.businessDate} closed</p>
                   <p className="callout__body">
-                    Recorded {lastClosedSummary.validTransactionCount} valid transaction
-                    {lastClosedSummary.validTransactionCount === 1 ? "" : "s"} totaling{" "}
-                    {formatCentavos(lastClosedSummary.totalSalesCentavos)} ({formatLiters(lastClosedSummary.totalVolumeLiters)}
-                    ).
+                    Recorded {lastClosedSummary.data.validTransactionCount} valid transaction
+                    {lastClosedSummary.data.validTransactionCount === 1 ? "" : "s"} totaling{" "}
+                    {formatCentavos(lastClosedSummary.data.totalSalesCentavos)} (
+                    {formatLiters(lastClosedSummary.data.totalVolumeLiters)}).
                   </p>
-                </div>
+                </TemporaryNotice>
               )}
 
               {lastAlreadySavedPriorDay && (
-                <div className="callout callout--success" role="status">
+                <TemporaryNotice
+                  occurrenceId={lastAlreadySavedPriorDay.id}
+                  duration="detailed"
+                  className="callout callout--success"
+                  role="status"
+                  closeLabel="Close prior-day confirmation"
+                  onDismiss={() => setLastAlreadySavedPriorDay(null)}
+                >
                   <p className="callout__title">
-                    Original sale {lastAlreadySavedPriorDay.reference} was already saved
+                    Original sale {lastAlreadySavedPriorDay.data.reference} was already saved
                   </p>
                   <p className="callout__body">
                     Already delivered — do not refill or hand over again, and collect no further payment. No
                     duplicate settlement was created; original receipt from{" "}
-                    {lastAlreadySavedPriorDay.businessDate} for{" "}
-                    {formatCentavos(lastAlreadySavedPriorDay.totalCentavos)} (
-                    {formatCentavos(lastAlreadySavedPriorDay.cashReceivedCentavos)} received,{" "}
-                    {formatCentavos(lastAlreadySavedPriorDay.changeCentavos)} change,{" "}
-                    {lastAlreadySavedPriorDay.totalContainers} container
-                    {lastAlreadySavedPriorDay.totalContainers === 1 ? "" : "s"} ·{" "}
-                    {formatLiters(lastAlreadySavedPriorDay.totalVolumeLiters)}).
+                    {lastAlreadySavedPriorDay.data.businessDate} for{" "}
+                    {formatCentavos(lastAlreadySavedPriorDay.data.totalCentavos)} (
+                    {formatCentavos(lastAlreadySavedPriorDay.data.cashReceivedCentavos)} received,{" "}
+                    {formatCentavos(lastAlreadySavedPriorDay.data.changeCentavos)} change,{" "}
+                    {lastAlreadySavedPriorDay.data.totalContainers} container
+                    {lastAlreadySavedPriorDay.data.totalContainers === 1 ? "" : "s"} ·{" "}
+                    {formatLiters(lastAlreadySavedPriorDay.data.totalVolumeLiters)}).
                   </p>
                   <div className="callout__actions">
                     <button
@@ -1773,28 +1845,35 @@ export function PosPage() {
                       className="button button--ghost button--sm"
                       onClick={() => {
                         setHistorySettlementFocusRef(null);
-                        setHistoryFocusRef(lastAlreadySavedPriorDay.reference);
-                        setTab("history");
+                        setHistoryFocusRef(lastAlreadySavedPriorDay.data.reference);
+                        switchPosTab("history");
                       }}
                     >
                       View original receipt in History
                     </button>
                   </div>
-                </div>
+                </TemporaryNotice>
               )}
 
               {lastSettledPriorDay && (
-                <div className="callout callout--success" role="status">
+                <TemporaryNotice
+                  occurrenceId={lastSettledPriorDay.id}
+                  duration="detailed"
+                  className="callout callout--success"
+                  role="status"
+                  closeLabel="Close settlement confirmation"
+                  onDismiss={() => setLastSettledPriorDay(null)}
+                >
                   <p className="callout__title">
-                    {isPriorDayMerchandiseOnly(lastSettledPriorDay.items)
-                      ? `Prior-day merchandise ${lastSettledPriorDay.checkoutReference} settled`
-                      : `Prior-day refill ${lastSettledPriorDay.checkoutReference} settled`}
+                    {isPriorDayMerchandiseOnly(lastSettledPriorDay.data.items)
+                      ? `Prior-day merchandise ${lastSettledPriorDay.data.checkoutReference} settled`
+                      : `Prior-day refill ${lastSettledPriorDay.data.checkoutReference} settled`}
                   </p>
                   <p className="callout__body">
-                    Net amount kept {formatCentavos(lastSettledPriorDay.netAmountKeptCentavos)} · Original payment
-                    date {lastSettledPriorDay.originalBusinessDate} · Settlement date (Manila){" "}
-                    {lastSettledPriorDay.settlementDate}. No further payment collected; recorded separately from{" "}
-                    {isPriorDayMerchandiseOnly(lastSettledPriorDay.items)
+                    Net amount kept {formatCentavos(lastSettledPriorDay.data.netAmountKeptCentavos)} · Original payment
+                    date {lastSettledPriorDay.data.originalBusinessDate} · Settlement date (Manila){" "}
+                    {lastSettledPriorDay.data.settlementDate}. No further payment collected; recorded separately from{" "}
+                    {isPriorDayMerchandiseOnly(lastSettledPriorDay.data.items)
                       ? "today's sales."
                       : "today's refill sales."}
                   </p>
@@ -1804,14 +1883,14 @@ export function PosPage() {
                       className="button button--ghost button--sm"
                       onClick={() => {
                         setHistoryFocusRef(null);
-                        setHistorySettlementFocusRef(lastSettledPriorDay.checkoutReference);
-                        setTab("history");
+                        setHistorySettlementFocusRef(lastSettledPriorDay.data.checkoutReference);
+                        switchPosTab("history");
                       }}
                     >
                       View in History
                     </button>
                   </div>
-                </div>
+                </TemporaryNotice>
               )}
 
               {dayStatus && dayStatus.state !== "OPEN" && (
@@ -1858,7 +1937,7 @@ export function PosPage() {
                       <button
                         type="button"
                         className="button button--ghost button--sm"
-                        onClick={() => setTab("history")}
+                        onClick={() => switchPosTab("history")}
                       >
                         Open Transaction History
                       </button>
@@ -1968,9 +2047,16 @@ export function PosPage() {
                       </div>
 
                       {saleError && (
-                        <div className="alert alert--error" role="alert">
-                          {saleError}
-                        </div>
+                        <TemporaryNotice
+                          occurrenceId={saleError.id}
+                          duration="brief"
+                          className="alert alert--error"
+                          role="alert"
+                          closeLabel="Close sale error"
+                          onDismiss={() => setSaleError(null)}
+                        >
+                          {saleError.data}
+                        </TemporaryNotice>
                       )}
 
                       <div className="refill-grid">
@@ -2363,13 +2449,20 @@ export function PosPage() {
 
                   <aside className="side-stack">
                     {lastSavedSale && (
-                      <div className="callout callout--success" role="status">
-                        <p className="callout__title">Sale {lastSavedSale.reference} saved successfully</p>
+                      <TemporaryNotice
+                        occurrenceId={lastSavedSale.id}
+                        duration="detailed"
+                        className="callout callout--success"
+                        role="status"
+                        closeLabel="Close sale confirmation"
+                        onDismiss={() => setLastSavedSale(null)}
+                      >
+                        <p className="callout__title">Sale {lastSavedSale.data.reference} saved successfully</p>
                         <p className="callout__body">
-                          {formatCentavos(lastSavedSale.cashReceivedCentavos)} received for{" "}
-                          {formatCentavos(lastSavedSale.totalCentavos)} total. Return{" "}
-                          <strong>{formatCentavos(lastSavedSale.changeCentavos)}</strong> change,{" "}
-                          {formatSavedSaleHandover(lastSavedSale)}
+                          {formatCentavos(lastSavedSale.data.cashReceivedCentavos)} received for{" "}
+                          {formatCentavos(lastSavedSale.data.totalCentavos)} total. Return{" "}
+                          <strong>{formatCentavos(lastSavedSale.data.changeCentavos)}</strong> change,{" "}
+                          {formatSavedSaleHandover(lastSavedSale.data)}
                         </p>
                         <div className="callout__actions">
                           <button
@@ -2380,14 +2473,14 @@ export function PosPage() {
                             }}
                             onClick={() => {
                               setHistorySettlementFocusRef(null);
-                              setHistoryFocusRef(lastSavedSale.reference);
-                              setTab("history");
+                              setHistoryFocusRef(lastSavedSale.data.reference);
+                              switchPosTab("history");
                             }}
                           >
                             View in History
                           </button>
                         </div>
-                      </div>
+                      </TemporaryNotice>
                     )}
 
                     <article className="card detail-card" aria-label="Current sale summary">
@@ -2519,9 +2612,16 @@ export function PosPage() {
                         )}
 
                         {saleError && (
-                          <div className="alert alert--error" role="alert">
-                            {saleError}
-                          </div>
+                          <TemporaryNotice
+                            occurrenceId={saleError.id}
+                            duration="brief"
+                            className="alert alert--error"
+                            role="alert"
+                            closeLabel="Close checkout error"
+                            onDismiss={() => setSaleError(null)}
+                          >
+                            {saleError.data}
+                          </TemporaryNotice>
                         )}
 
                         <div className="pos-summary-actions">
@@ -2581,9 +2681,16 @@ export function PosPage() {
                         </div>
 
                         {saleError && (
-                          <div className="alert alert--error" role="alert">
-                            {saleError}
-                          </div>
+                          <TemporaryNotice
+                            occurrenceId={saleError.id}
+                            duration="brief"
+                            className="alert alert--error"
+                            role="alert"
+                            closeLabel="Close checkout error"
+                            onDismiss={() => setSaleError(null)}
+                          >
+                            {saleError.data}
+                          </TemporaryNotice>
                         )}
 
                         <label className="field">
@@ -3062,9 +3169,16 @@ export function PosPage() {
             )}
 
             {endDayError && (
-              <div className="alert alert--error" role="alert">
-                {endDayError}
-              </div>
+              <TemporaryNotice
+                occurrenceId={endDayError.id}
+                duration="brief"
+                className="alert alert--error"
+                role="alert"
+                closeLabel="Close End Day error"
+                onDismiss={() => setEndDayError(null)}
+              >
+                {endDayError.data}
+              </TemporaryNotice>
             )}
 
             <div className="modal__actions">

@@ -3,6 +3,13 @@ import { api, ApiError } from "../api";
 import { createRequestTracker } from "../calendar/calendarView";
 import { AppShell, useModulesData } from "../ChooseModule";
 import {
+  nextNoticeId,
+  type NoticeDuration,
+  type NoticeEnvelope,
+  wrapNotice,
+} from "../notifications/noticeTiming";
+import { TemporaryNotice } from "../notifications/TemporaryNotice";
+import {
   computeReconciliationPreview,
   type ContainerShape,
   DEFAULT_POS_SECTIONS,
@@ -227,9 +234,16 @@ export function InventoryPage() {
 
   const [inputs, setInputs] = useState<Record<string, string>>({});
   const [fieldErrors, setFieldErrors] = useState<Record<string, string | undefined>>({});
-  const [conflictNotices, setConflictNotices] = useState<Record<string, string | undefined>>({});
+  const [conflictNotices, setConflictNotices] = useState<
+    Record<string, NoticeEnvelope<string> | undefined>
+  >({});
   const [submittingKey, setSubmittingKey] = useState<string | null>(null);
-  const [saveNotice, setSaveNotice] = useState<{ title: string; body: string } | null>(null);
+  const [saveNotice, setSaveNotice] = useState<{
+    id: number;
+    duration: NoticeDuration;
+    title: string;
+    body: string;
+  } | null>(null);
 
   const [addProductOpen, setAddProductOpen] = useState(false);
   const [productName, setProductName] = useState("");
@@ -253,7 +267,7 @@ export function InventoryPage() {
 
   const [archiveItem, setArchiveItem] = useState<InventoryItemView | null>(null);
   const [archiving, setArchiving] = useState(false);
-  const [archiveError, setArchiveError] = useState<string | null>(null);
+  const [archiveError, setArchiveError] = useState<NoticeEnvelope<string> | null>(null);
 
   const [reconcileItem, setReconcileItem] = useState<InventoryItemView | null>(null);
   const [reconcileCountInput, setReconcileCountInput] = useState("");
@@ -262,11 +276,14 @@ export function InventoryPage() {
   const [reconciling, setReconciling] = useState(false);
   const [reconcileError, setReconcileError] = useState<string | null>(null);
   const [reconcileStaleNotice, setReconcileStaleNotice] = useState<string | null>(null);
+  const [reconcileNeedsFreshCount, setReconcileNeedsFreshCount] = useState(false);
 
   const [togglingItemKey, setTogglingItemKey] = useState<string | null>(null);
   const [sectionPickerItemId, setSectionPickerItemId] = useState<string | null>(null);
   const [sectionPickerValue, setSectionPickerValue] = useState<string>("CHANGE_OF_GRIPO");
-  const [cardActionError, setCardActionError] = useState<Record<string, string | undefined>>({});
+  const [cardActionError, setCardActionError] = useState<
+    Record<string, NoticeEnvelope<string> | undefined>
+  >({});
 
   const loadTrackerRef = useRef(createRequestTracker());
   const loadingRef = useRef(true);
@@ -387,6 +404,7 @@ export function InventoryPage() {
     setReconcileRequestKey(generateClientKey());
     setReconcileError(null);
     setReconcileStaleNotice(null);
+    setReconcileNeedsFreshCount(false);
     setTimeout(() => reconcileCountInputRef.current?.focus(), 0);
   }
 
@@ -446,6 +464,8 @@ export function InventoryPage() {
       setItems((prev) => [...prev, response.item]);
       setAddProductOpen(false);
       setSaveNotice({
+        id: nextNoticeId(),
+        duration: "detailed",
         title: "Product saved",
         body: `${response.item.name} (${formatPesoCentavos(response.item.unitPriceCentavos ?? parsedPriceCentavos)}) was added as ${response.item.showInPos ? "Shown in POS" : "Hidden from POS"} with opening stock Not Set.`,
       });
@@ -510,6 +530,8 @@ export function InventoryPage() {
       );
       setEditProductItem(null);
       setSaveNotice({
+        id: nextNoticeId(),
+        duration: "detailed",
         title: "Product details updated",
         body: `${response.item.name} (${formatPesoCentavos(response.item.unitPriceCentavos ?? parsedPriceCentavos)}) was saved. Future POS checkouts will use these details while existing sales keep their original snapshots.`,
       });
@@ -542,12 +564,16 @@ export function InventoryPage() {
       setItems((prev) => prev.filter((entry) => getItemKey(entry) !== getItemKey(response.item)));
       setArchiveItem(null);
       setSaveNotice({
+        id: nextNoticeId(),
+        duration: "detailed",
         title: "Product archived",
         body: `${response.item.name} left active Inventory and new POS sales. Its ${formatQuantityLabel(response.item.currentQuantity, response.item.unit)} balance, opening count, and past sales remain preserved.`,
       });
     } catch (err) {
       setArchiveError(
-        err instanceof ApiError ? err.message : "Could not archive product. Please try again.",
+        wrapNotice(
+          err instanceof ApiError ? err.message : "Could not archive product. Please try again.",
+        ),
       );
     } finally {
       setArchiving(false);
@@ -580,6 +606,8 @@ export function InventoryPage() {
         ),
       );
       setSaveNotice({
+        id: nextNoticeId(),
+        duration: "brief",
         title: response.item.showInPos
           ? `${response.item.name} shown in POS`
           : `${response.item.name} hidden from POS`,
@@ -590,7 +618,9 @@ export function InventoryPage() {
     } catch (err) {
       setCardActionError((prev) => ({
         ...prev,
-        [itemKey]: err instanceof ApiError ? err.message : "Could not update POS visibility.",
+        [itemKey]: wrapNotice(
+          err instanceof ApiError ? err.message : "Could not update POS visibility.",
+        ),
       }));
     } finally {
       setTogglingItemKey(null);
@@ -633,13 +663,17 @@ export function InventoryPage() {
       );
       setSectionPickerItemId(null);
       setSaveNotice({
+        id: nextNoticeId(),
+        duration: "brief",
         title: response.item.showInPos ? "Product shown in POS" : "Product hidden from POS",
         body: `${response.item.name} is now ${response.item.showInPos ? "visible in Point of Sale" : "hidden from Point of Sale"}.`,
       });
     } catch (err) {
       setCardActionError((prev) => ({
         ...prev,
-        [itemKey]: err instanceof ApiError ? err.message : "Could not update POS visibility.",
+        [itemKey]: wrapNotice(
+          err instanceof ApiError ? err.message : "Could not update POS visibility.",
+        ),
       }));
     } finally {
       setTogglingItemKey(null);
@@ -654,6 +688,12 @@ export function InventoryPage() {
       reconciling ||
       !permissions?.canInitializeOpeningStock
     ) {
+      return;
+    }
+
+    if (reconcileNeedsFreshCount) {
+      setReconcileError("Enter a fresh physical count after reviewing the updated balance.");
+      reconcileCountInputRef.current?.focus();
       return;
     }
 
@@ -698,7 +738,10 @@ export function InventoryPage() {
         ),
       );
       setReconcileItem(null);
+      setReconcileNeedsFreshCount(false);
       setSaveNotice({
+        id: nextNoticeId(),
+        duration: "detailed",
         title:
           response.reconciliation.quantityDelta === 0
             ? "Physical count verified"
@@ -719,7 +762,10 @@ export function InventoryPage() {
           setReconcileItem(latestItem);
         }
         setReconcileRequestKey(generateClientKey());
+        setReconcileCountInput("");
+        setReconcileNeedsFreshCount(true);
         setReconcileStaleNotice(err.message);
+        setTimeout(() => reconcileCountInputRef.current?.focus(), 0);
       } else if (err instanceof ApiError && err.code === "ACTIVE_PAYMENT_COMMITMENT") {
         const latestItem = isInventoryItemView(err.details?.item) ? err.details.item : null;
         if (latestItem) {
@@ -784,6 +830,8 @@ export function InventoryPage() {
       );
       setInputs((prev) => ({ ...prev, [itemKey]: "" }));
       setSaveNotice({
+        id: nextNoticeId(),
+        duration: "brief",
         title: "Opening count saved",
         body: `Saved opening count for ${response.item.name}: ${formatQuantityLabel(
           response.item.currentQuantity,
@@ -805,7 +853,9 @@ export function InventoryPage() {
         setFieldErrors((prev) => ({ ...prev, [itemKey]: undefined }));
         setConflictNotices((prev) => ({
           ...prev,
-          [itemKey]: formatAlreadySetNotice(item.name, parsed.quantity, item.unit, existingItem, err.message),
+          [itemKey]: wrapNotice(
+            formatAlreadySetNotice(item.name, parsed.quantity, item.unit, existingItem, err.message),
+          ),
         }));
       } else {
         setFieldErrors((prev) => ({
@@ -938,10 +988,17 @@ export function InventoryPage() {
       </div>
 
       {saveNotice && (
-        <div className="callout callout--success" role="status">
+        <TemporaryNotice
+          occurrenceId={saveNotice.id}
+          duration={saveNotice.duration}
+          className="callout callout--success"
+          role="status"
+          closeLabel="Close inventory notice"
+          onDismiss={() => setSaveNotice(null)}
+        >
           <p className="callout__title">{saveNotice.title}</p>
           <p className="callout__body">{saveNotice.body}</p>
-        </div>
+        </TemporaryNotice>
       )}
 
       {loadError && (
@@ -1147,9 +1204,18 @@ export function InventoryPage() {
                         )}
 
                         {actionError && (
-                          <div className="alert alert--error inventory-card-alert" role="alert">
-                            {actionError}
-                          </div>
+                          <TemporaryNotice
+                            occurrenceId={actionError.id}
+                            duration="brief"
+                            className="alert alert--error inventory-card-alert"
+                            role="alert"
+                            closeLabel={`Close ${item.name} action error`}
+                            onDismiss={() =>
+                              setCardActionError((prev) => ({ ...prev, [itemKey]: undefined }))
+                            }
+                          >
+                            {actionError.data}
+                          </TemporaryNotice>
                         )}
 
                         <div className="inventory-item-card__metric-row">
@@ -1164,9 +1230,18 @@ export function InventoryPage() {
                         </div>
 
                         {conflictNotice && (
-                          <div className="alert alert--error inventory-card-alert" role="alert">
-                            {conflictNotice}
-                          </div>
+                          <TemporaryNotice
+                            occurrenceId={conflictNotice.id}
+                            duration="detailed"
+                            className="alert alert--error inventory-card-alert"
+                            role="alert"
+                            closeLabel={`Close ${item.name} conflict notice`}
+                            onDismiss={() =>
+                              setConflictNotices((prev) => ({ ...prev, [itemKey]: undefined }))
+                            }
+                          >
+                            {conflictNotice.data}
+                          </TemporaryNotice>
                         )}
 
                         <div className="inventory-item-card__body">
@@ -1595,9 +1670,16 @@ export function InventoryPage() {
             </p>
 
             {archiveError && (
-              <div className="alert alert--error" role="alert">
-                {archiveError}
-              </div>
+              <TemporaryNotice
+                occurrenceId={archiveError.id}
+                duration="brief"
+                className="alert alert--error"
+                role="alert"
+                closeLabel="Close archive error"
+                onDismiss={() => setArchiveError(null)}
+              >
+                {archiveError.data}
+              </TemporaryNotice>
             )}
 
             <div className="modal__actions">
@@ -1682,9 +1764,14 @@ export function InventoryPage() {
                   disabled={reconciling}
                   value={reconcileCountInput}
                   onChange={(e) => {
-                    setReconcileCountInput(e.target.value);
+                    const nextValue = e.target.value;
+                    setReconcileCountInput(nextValue);
                     setReconcileError(null);
                     setReconcileRequestKey(generateClientKey());
+                    if (reconcileNeedsFreshCount && nextValue.trim() !== "") {
+                      setReconcileNeedsFreshCount(false);
+                      setReconcileStaleNotice(null);
+                    }
                   }}
                 />
                 <small>Count usable station-owned stock (0 or more).</small>
@@ -1748,7 +1835,11 @@ export function InventoryPage() {
                 >
                   Cancel
                 </button>
-                <button type="submit" className="button button--primary" disabled={reconciling}>
+                <button
+                  type="submit"
+                  className="button button--primary"
+                  disabled={reconciling || reconcileNeedsFreshCount}
+                >
                   {reconciling
                     ? "Saving…"
                     : reconcilePreview?.delta === 0

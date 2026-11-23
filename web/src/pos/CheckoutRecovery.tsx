@@ -1,3 +1,5 @@
+import { type NoticeEnvelope } from "../notifications/noticeTiming";
+import { TemporaryNotice } from "../notifications/TemporaryNotice";
 import {
   formatCentavos,
   formatLiters,
@@ -17,7 +19,8 @@ export interface CheckoutRecoveryProps {
   todayDate?: string;
   checking: boolean;
   retrying: boolean;
-  errorMessage: string | null;
+  errorNotice: NoticeEnvelope<string> | null;
+  onDismissError(): void;
   onSelectReference?: (reference: string) => void;
   onCheckStatus(): void;
   onRetry(): void;
@@ -94,7 +97,8 @@ export function CheckoutRecovery({
   todayDate,
   checking,
   retrying,
-  errorMessage,
+  errorNotice,
+  onDismissError,
   onSelectReference,
   onCheckStatus,
   onRetry,
@@ -205,10 +209,17 @@ export function CheckoutRecovery({
             </div>
           </dl>
 
-          {errorMessage && (
-            <div className="alert alert--error" role="alert">
-              {errorMessage}
-            </div>
+          {errorNotice && (
+            <TemporaryNotice
+              occurrenceId={errorNotice.id}
+              duration="brief"
+              className="alert alert--error"
+              role="alert"
+              closeLabel="Close recovery error"
+              onDismiss={onDismissError}
+            >
+              {errorNotice.data}
+            </TemporaryNotice>
           )}
 
           <div className="recovery-actions">

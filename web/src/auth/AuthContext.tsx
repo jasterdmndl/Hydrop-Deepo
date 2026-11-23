@@ -1,6 +1,7 @@
 import { createContext, type ReactNode, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api, ApiError, onIdleExpiry, onSessionEnded, setCsrfToken } from "../api";
+import { nextNoticeId } from "../notifications/noticeTiming";
 import { clockOffsetMs, resolveLogoutOutcome, shouldSendHeartbeat } from "./idle";
 
 export type Role = "OWNER" | "CASHIER";
@@ -25,7 +26,7 @@ interface SessionResponse {
 
 type AuthState =
   | { status: "loading" }
-  | { status: "signed-out"; notice?: string }
+  | { status: "signed-out"; notice?: string; noticeId?: number }
   | { status: "signed-in"; user: SessionUser; idleExpiresAt: number };
 
 interface AuthContextValue {
@@ -35,6 +36,7 @@ interface AuthContextValue {
   logoutError: string | null;
   loggingOut: boolean;
   clearLogoutError(): void;
+  clearNotice(): void;
   login(username: string, password: string): Promise<void>;
   changePassword(currentPassword: string, newPassword: string): Promise<void>;
   logout(): Promise<void>;
@@ -66,11 +68,17 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const signOutLocally = useCallback((notice?: string) => {
     setCsrfToken(null);
     setLogoutError(null);
-    setState({ status: "signed-out", notice });
+    setState({ status: "signed-out", notice, noticeId: notice ? nextNoticeId() : undefined });
   }, []);
 
   const clearLogoutError = useCallback(() => {
     setLogoutError(null);
+  }, []);
+
+  const clearNotice = useCallback(() => {
+    setState((current) =>
+      current.status === "signed-out" && current.notice ? { status: "signed-out" } : current,
+    );
   }, []);
 
   const refreshSession = useCallback(async () => {
@@ -96,7 +104,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setState((current) => {
           if (current.status !== "signed-in") return current;
           setCsrfToken(null);
-          return { status: "signed-out", notice: code === "SESSION_EXPIRED" ? EXPIRED_NOTICE : undefined };
+          const notice = code === "SESSION_EXPIRED" ? EXPIRED_NOTICE : undefined;
+          return {
+            status: "signed-out",
+            notice,
+            noticeId: notice ? nextNoticeId() : undefined,
+          };
         });
       }),
     [],
@@ -141,6 +154,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       logoutError,
       loggingOut,
       clearLogoutError,
+      clearNotice,
       refreshSession,
       continueWorking,
       async login(username, password) {
@@ -176,7 +190,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         }
       },
     }),
-    [state, clockOffset, logoutError, loggingOut, clearLogoutError, refreshSession, continueWorking, accept, signOutLocally, navigate],
+    [state, clockOffset, logoutError, loggingOut, clearLogoutError, clearNotice, refreshSession, continueWorking, accept, signOutLocally, navigate],
   );
 
   return <AuthContext.Provider value={value}>{children}</AuthContext.Provider>;

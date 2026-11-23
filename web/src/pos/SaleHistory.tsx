@@ -1,6 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api, ApiError } from "../api";
 import { createRequestTracker } from "../calendar/calendarView";
+import { type NoticeEnvelope, wrapNotice } from "../notifications/noticeTiming";
+import { TemporaryNotice } from "../notifications/TemporaryNotice";
 import {
   formatCentavos,
   formatLiters,
@@ -67,7 +69,7 @@ export function SaleHistory({
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [selectedItem, setSelectedItem] = useState<SelectedHistoryItem | null>(null);
-  const [detailError, setDetailError] = useState<string | null>(null);
+  const [detailError, setDetailError] = useState<NoticeEnvelope<string> | null>(null);
 
   const listTrackerRef = useRef(createRequestTracker());
   const detailTrackerRef = useRef(createRequestTracker());
@@ -187,7 +189,9 @@ export function SaleHistory({
       })
       .catch((err) => {
         if (!detailTrackerRef.current.isCurrent(requestId)) return;
-        setDetailError(err instanceof ApiError ? err.message : "Could not load sale details.");
+        setDetailError(
+          wrapNotice(err instanceof ApiError ? err.message : "Could not load sale details."),
+        );
       });
   }, [initialReference]);
 
@@ -207,7 +211,9 @@ export function SaleHistory({
       .catch((err) => {
         if (!detailTrackerRef.current.isCurrent(requestId)) return;
         setDetailError(
-          err instanceof ApiError ? err.message : "Could not load prior-day settlement details.",
+          wrapNotice(
+            err instanceof ApiError ? err.message : "Could not load prior-day settlement details.",
+          ),
         );
       });
   }, [initialSettlementRef]);
@@ -223,7 +229,9 @@ export function SaleHistory({
       setSelectedItem({ kind: "sale", sale: res.sale ?? res });
     } catch (err) {
       if (!detailTrackerRef.current.isCurrent(requestId)) return;
-      setDetailError(err instanceof ApiError ? err.message : "Could not refresh sale details.");
+      setDetailError(
+        wrapNotice(err instanceof ApiError ? err.message : "Could not refresh sale details."),
+      );
     }
   }
 
@@ -241,7 +249,9 @@ export function SaleHistory({
     } catch (err) {
       if (!detailTrackerRef.current.isCurrent(requestId)) return;
       setDetailError(
-        err instanceof ApiError ? err.message : "Could not refresh prior-day settlement details.",
+        wrapNotice(
+          err instanceof ApiError ? err.message : "Could not refresh prior-day settlement details.",
+        ),
       );
     }
   }
@@ -505,9 +515,16 @@ export function SaleHistory({
             </div>
 
             {detailError && (
-              <div className="alert alert--error" role="alert">
-                {detailError}
-              </div>
+              <TemporaryNotice
+                occurrenceId={detailError.id}
+                duration="brief"
+                className="alert alert--error"
+                role="alert"
+                closeLabel="Close detail error"
+                onDismiss={() => setDetailError(null)}
+              >
+                {detailError.data}
+              </TemporaryNotice>
             )}
 
             {!selectedSale && !selectedSettlement ? (

@@ -1,9 +1,12 @@
 import { type FormEvent, useState } from "react";
 import { ApiError } from "../api";
+import { nextNoticeId } from "../notifications/noticeTiming";
+import { TemporaryNotice } from "../notifications/TemporaryNotice";
 import { useAuth } from "./AuthContext";
 import loginLogoUrl from "./login-logo.png";
 
 interface LoginErrorState {
+  id: number;
   code: string;
   message: string;
 }
@@ -27,8 +30,8 @@ function EyeIcon({ open }: { open: boolean }) {
   );
 }
 
-export function LoginPage({ notice }: { notice?: string }) {
-  const { login } = useAuth();
+export function LoginPage({ notice, noticeId }: { notice?: string; noticeId?: number }) {
+  const { login, clearNotice } = useAuth();
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
@@ -44,8 +47,12 @@ export function LoginPage({ notice }: { notice?: string }) {
     } catch (err) {
       setError(
         err instanceof ApiError
-          ? { code: err.code, message: err.message }
-          : { code: "UNKNOWN", message: "Sign-in failed. Please try again." },
+          ? { id: nextNoticeId(), code: err.code, message: err.message }
+          : {
+              id: nextNoticeId(),
+              code: "UNKNOWN",
+              message: "Sign-in failed. Please try again.",
+            },
       );
       setPassword("");
       setShowPassword(false);
@@ -128,13 +135,27 @@ export function LoginPage({ notice }: { notice?: string }) {
           </div>
 
           {notice && (
-            <p className="alert alert--info login-notice" role="status">
+            <TemporaryNotice
+              occurrenceId={noticeId ?? notice}
+              duration="brief"
+              className="alert alert--info login-notice"
+              role="status"
+              closeLabel="Close session notice"
+              onDismiss={clearNotice}
+            >
               {notice}
-            </p>
+            </TemporaryNotice>
           )}
 
           {error && (
-            <div className="alert alert--error login-error" role="alert">
+            <TemporaryNotice
+              occurrenceId={error.id}
+              duration="brief"
+              className="alert alert--error login-error"
+              role="alert"
+              closeLabel="Close login error"
+              onDismiss={() => setError(null)}
+            >
               <span className="login-error__icon" aria-hidden="true">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
                   <circle cx="12" cy="12" r="9.5" />
@@ -148,7 +169,7 @@ export function LoginPage({ notice }: { notice?: string }) {
                   <p className="login-error__detail">Check your credentials and try again.</p>
                 )}
               </div>
-            </div>
+            </TemporaryNotice>
           )}
 
           <label className="field login-field" htmlFor="login-username">
