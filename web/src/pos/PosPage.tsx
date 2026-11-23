@@ -1,4 +1,12 @@
-import { type FormEvent, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  type FormEvent,
+  type MouseEvent as ReactMouseEvent,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { api, ApiError } from "../api";
 import { useSignedInUser } from "../auth/AuthContext";
 import { createRequestTracker } from "../calendar/calendarView";
@@ -296,6 +304,9 @@ export function PosPage() {
   const activeConfirmingRef = useRef<PendingCheckoutRecovery | null>(null);
   const qtyInputRefs = useRef(new Map<string, HTMLInputElement | null>());
   const customQtyInputRef = useRef<HTMLInputElement | null>(null);
+  const cartRemoveBtnRefs = useRef(new Map<string, HTMLButtonElement | null>());
+  const cartRemoveKeyboardRef = useRef(false);
+  const currentSaleHeadingRef = useRef<HTMLHeadingElement | null>(null);
 
   const activeRecovery = useMemo(
     () =>
@@ -591,6 +602,36 @@ export function PosPage() {
     return counts;
   }, [customLines]);
 
+  const cartLineRemoveLabels = useMemo(() => {
+    const byName = new Map<string, CartDraftLine[]>();
+    for (const line of lines) {
+      const key = line.displayName.trim().toLowerCase();
+      const group = byName.get(key);
+      if (group) group.push(line);
+      else byName.set(key, [line]);
+    }
+    const labels = new Map<string, string>();
+    lines.forEach((line, index) => {
+      const group = byName.get(line.displayName.trim().toLowerCase()) ?? [];
+      if (group.length <= 1) {
+        labels.set(line.id, `Remove ${line.displayName}`);
+        return;
+      }
+      const samePriceCount = group.filter(
+        (other) => other.unitPriceCentavos === line.unitPriceCentavos,
+      ).length;
+      if (samePriceCount === 1) {
+        labels.set(line.id, `Remove ${line.displayName} (${formatCentavos(line.unitPriceCentavos)})`);
+      } else {
+        labels.set(
+          line.id,
+          `Remove ${line.displayName} (${formatCentavos(line.unitPriceCentavos)}, row ${index + 1})`,
+        );
+      }
+    });
+    return labels;
+  }, [lines]);
+
   const endDayGuard = useMemo(
     () =>
       evaluateEndDayGuard({
@@ -837,9 +878,53 @@ export function PosPage() {
   }
 
   function removeLine(id: string) {
-    clearFieldQtyEdit(id);
+    if (!dayStatus?.canSell || preparingCheckout) return;
+    setQtyEdits((prev) => {
+      const copy = { ...prev };
+      const hadId = id in copy;
+      delete copy[id];
+      const { nextEdits } = revealInvalidQuantityEdits(copy);
+      return hadId || nextEdits !== copy ? nextEdits : prev;
+    });
     setSaleError(null);
     setLines((prev) => prev.filter((line) => line.id !== id));
+    setTimeout(() => {
+      if (
+        document.activeElement instanceof HTMLInputElement &&
+        document.activeElement.classList.contains("qty-stepper__value")
+      ) {
+        document.activeElement.blur();
+      }
+    }, 0);
+  }
+
+  function handleRemoveCartLine(id: string, event: ReactMouseEvent<HTMLButtonElement>) {
+    if (!dayStatus?.canSell || preparingCheckout) return;
+    const isKeyboard = event.detail === 0 || cartRemoveKeyboardRef.current;
+    cartRemoveKeyboardRef.current = false;
+
+    let nextFocusLineId: string | null = null;
+    if (isKeyboard) {
+      const removedIdx = lines.findIndex((line) => line.id === id);
+      const remaining = lines.filter((line) => line.id !== id);
+      if (remaining.length > 0) {
+        const nextLine = remaining[Math.min(Math.max(removedIdx, 0), remaining.length - 1)];
+        nextFocusLineId = nextLine?.id ?? null;
+      }
+    }
+
+    removeLine(id);
+
+    if (isKeyboard) {
+      window.requestAnimationFrame(() => {
+        const nextButton = nextFocusLineId ? cartRemoveBtnRefs.current.get(nextFocusLineId) : null;
+        if (nextButton && nextButton.isConnected && !nextButton.disabled) {
+          nextButton.focus();
+        } else if (currentSaleHeadingRef.current?.isConnected) {
+          currentSaleHeadingRef.current.focus();
+        }
+      });
+    }
   }
 
   function openCustomizeModal() {
@@ -2485,7 +2570,9 @@ export function PosPage() {
 
                     <article className="card detail-card" aria-label="Current sale summary">
                       <div className="detail-card__header">
-                        <h2>Current sale</h2>
+                        <h2 ref={currentSaleHeadingRef} tabIndex={-1}>
+                          Current sale
+                        </h2>
                         <span className="pill pill--scheduled">
                           {formatCartCountPill(cartTotals.totalContainers, cartTotals.totalMerchandiseQty)}
                         </span>
@@ -2496,7 +2583,7 @@ export function PosPage() {
                       ) : (
                         <ul className="pos-summary-lines">
                           {lines.map((line) => (
-                            <li key={line.id} className="pos-summary-line">
+                            <li key={line.id} className="pos-summary-line pos-summary-line--editable">
                               <div className="pos-summary-line__meta">
                                 <strong>{line.displayName}</strong>
                                 <span className="muted-sm">
@@ -2508,9 +2595,37 @@ export function PosPage() {
                                     : ""}
                                 </span>
                               </div>
-                              <span className="pos-summary-line__amount">
-                                {formatCentavos(line.unitPriceCentavos * line.quantity)}
-                              </span>
+                              <div className="pos-summary-line__end">
+                                <span className="pos-summary-line__amount">
+                                  {formatCentavos(line.unitPriceCentavos * line.quantity)}
+                                </span>
+                                <button
+                                  ref={(el) => {
+                                    if (el) cartRemoveBtnRefs.current.set(line.id, el);
+                                    else cartRemoveBtnRefs.current.delete(line.id);
+                                  }}
+                                  type="button"
+                                  className="button button--ghost pos-summary-line__remove"
+                                  aria-label={
+                                    cartLineRemoveLabels.get(line.id) ?? `Remove ${line.displayName}`
+                                  }
+                                  disabled={!dayStatus?.canSell || preparingCheckout}
+                                  onPointerDown={() => {
+                                    cartRemoveKeyboardRef.current = false;
+                                  }}
+                                  onMouseDown={(event) => {
+                                    if (hasInvalidLineEdits) event.preventDefault();
+                                  }}
+                                  onKeyDown={(event) => {
+                                    if (event.key === "Enter" || event.key === " ") {
+                                      cartRemoveKeyboardRef.current = true;
+                                    }
+                                  }}
+                                  onClick={(event) => handleRemoveCartLine(line.id, event)}
+                                >
+                                  <span aria-hidden="true">×</span>
+                                </button>
+                              </div>
                             </li>
                           ))}
                         </ul>

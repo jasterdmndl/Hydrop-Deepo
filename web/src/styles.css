@@ -2817,6 +2817,54 @@ textarea:focus-visible {
   white-space: nowrap;
 }
 
+.pos-summary-line--editable {
+  align-items: center;
+  gap: 10px;
+}
+
+.pos-summary-line--editable .pos-summary-line__meta {
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.pos-summary-line__end {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+  max-width: 100%;
+}
+
+.pos-summary-line__remove {
+  width: 44px;
+  min-width: 44px;
+  height: 44px;
+  min-height: 44px;
+  padding: 0;
+  flex: 0 0 auto;
+  font-size: 1.25rem;
+  line-height: 1;
+  color: var(--text-muted);
+}
+
+.pos-summary-line__remove:hover:not(:disabled) {
+  background: var(--red-bg);
+  border-color: var(--red-border);
+  color: var(--red-text);
+}
+
+.pos-summary-line__remove:active:not(:disabled) {
+  background: #fee2e2;
+  border-color: #fca5a5;
+  color: var(--red-text);
+}
+
+.detail-card h2[tabindex="-1"]:focus-visible {
+  outline: 3px solid rgba(29, 99, 220, 0.35);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
 .detail-list__row--total {
   padding-top: 6px;
   border-top: 1px dashed var(--border);
