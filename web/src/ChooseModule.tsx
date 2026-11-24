@@ -232,6 +232,7 @@ export interface AppShellProps {
   pageLabel?: string;
   modulesData?: ModulesResponse | null;
   stationStatusOverride?: StationStatus | null;
+  shellClassName?: string;
   children: ReactNode;
 }
 
@@ -263,6 +264,7 @@ export function AppShell({
   pageLabel,
   modulesData,
   stationStatusOverride,
+  shellClassName: extraShellClassName,
   children,
 }: AppShellProps) {
   const user = useSignedInUser();
@@ -454,7 +456,12 @@ export function AppShell({
   const stationStatus =
     stationStatusOverride !== undefined ? stationStatusOverride : (effectiveModuleStation ?? fetchedStationStatus);
   const todayManila = formatManilaFullDate();
-  const shellClassName = ["shell", isHome ? "shell--home" : "", sidebarCollapsed ? "shell--sidebar-collapsed" : ""]
+  const shellClassName = [
+    "shell",
+    isHome ? "shell--home" : "",
+    sidebarCollapsed ? "shell--sidebar-collapsed" : "",
+    extraShellClassName ?? "",
+  ]
     .filter(Boolean)
     .join(" ");
 

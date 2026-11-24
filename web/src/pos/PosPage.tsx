@@ -3,6 +3,7 @@ import {
   type MouseEvent as ReactMouseEvent,
   useCallback,
   useEffect,
+  useLayoutEffect,
   useMemo,
   useRef,
   useState,
@@ -307,6 +308,12 @@ export function PosPage() {
   const cartRemoveBtnRefs = useRef(new Map<string, HTMLButtonElement | null>());
   const cartRemoveKeyboardRef = useRef(false);
   const currentSaleHeadingRef = useRef<HTMLHeadingElement | null>(null);
+  const posLayoutRef = useRef<HTMLDivElement | null>(null);
+  const catalogScrollRef = useRef<HTMLDivElement | null>(null);
+  const productScrollTopRef = useRef(0);
+
+  const [isCompactPosLayout, setIsCompactPosLayout] = useState(false);
+  const [mobilePane, setMobilePane] = useState<"products" | "cart">("products");
 
   const activeRecovery = useMemo(
     () =>
@@ -320,6 +327,59 @@ export function PosPage() {
     step === "review" && preparedCheckout !== null && preparedCheckout.status === "PAYMENT_PENDING";
   const showRecoveryScreen =
     activeRecovery !== null && activeConfirming === null && !inActiveCashStep;
+  const isEditableSaleView =
+    tab === "sale" && !(loading && !dayStatus) && !showRecoveryScreen && step === "select";
+
+  const switchMobilePane = useCallback(
+    (nextPane: "products" | "cart") => {
+      if (nextPane === mobilePane) return;
+      if (mobilePane === "products" && catalogScrollRef.current) {
+        productScrollTopRef.current = catalogScrollRef.current.scrollTop;
+      }
+      setMobilePane(nextPane);
+    },
+    [mobilePane],
+  );
+
+  useEffect(() => {
+    if (!isEditableSaleView) return;
+    const portraitMedia =
+      typeof window !== "undefined" && typeof window.matchMedia === "function"
+        ? window.matchMedia("(orientation: portrait) and (max-width: 900px)")
+        : null;
+    const workspaceEl = posLayoutRef.current?.closest(".workspace") ?? null;
+
+    const updateCompact = () => {
+      const portraitNarrow = portraitMedia ? portraitMedia.matches : false;
+      const workspaceNarrow = workspaceEl
+        ? workspaceEl.getBoundingClientRect().width < 740
+        : typeof window !== "undefined" && window.innerWidth < 740;
+      setIsCompactPosLayout(portraitNarrow || workspaceNarrow);
+    };
+
+    updateCompact();
+    portraitMedia?.addEventListener("change", updateCompact);
+    let observer: ResizeObserver | null = null;
+    if (workspaceEl && typeof ResizeObserver !== "undefined") {
+      observer = new ResizeObserver(updateCompact);
+      observer.observe(workspaceEl);
+    }
+    window.addEventListener("resize", updateCompact);
+    return () => {
+      portraitMedia?.removeEventListener("change", updateCompact);
+      observer?.disconnect();
+      window.removeEventListener("resize", updateCompact);
+    };
+  }, [isEditableSaleView]);
+
+  useLayoutEffect(() => {
+    if (!isEditableSaleView) return;
+    if (isCompactPosLayout && mobilePane !== "products") return;
+    const el = catalogScrollRef.current;
+    if (el && el.scrollTop !== productScrollTopRef.current) {
+      el.scrollTop = productScrollTopRef.current;
+    }
+  }, [isEditableSaleView, isCompactPosLayout, mobilePane]);
 
   const clearAllQtyEdits = useCallback(() => {
     setQtyEdits({});
@@ -1121,9 +1181,16 @@ export function PosPage() {
     if (preparingCheckout || lines.length === 0 || !dayStatus?.canSell) return;
     const { nextEdits, invalidIds } = revealInvalidQuantityEdits(qtyEdits);
     if (invalidIds.length > 0) {
-      qtyInputRefs.current.get(invalidIds[0]!)?.focus();
+      if (isCompactPosLayout && mobilePane !== "products") {
+        setMobilePane("products");
+      }
       setQtyEdits(nextEdits);
       setSaleError(wrapNotice("Fix invalid refill quantities before reviewing checkout."));
+      window.requestAnimationFrame(() => {
+        const targetInput = qtyInputRefs.current.get(invalidIds[0]!);
+        targetInput?.scrollIntoView({ block: "center" });
+        targetInput?.focus();
+      });
       return;
     }
 
@@ -1417,6 +1484,8 @@ export function PosPage() {
       setCashInput("");
       setConfirmNoCashChecked(false);
       setLastSavedSale(wrapNotice(confirmed.sale));
+      productScrollTopRef.current = 0;
+      setMobilePane("products");
       setStep("select");
       setHistoryRefreshSignal((n) => n + 1);
       await loadPosState();
@@ -1682,6 +1751,8 @@ export function PosPage() {
       setSaleError(null);
       setDayActionError(null);
       setRecoveryError(null);
+      productScrollTopRef.current = 0;
+      setMobilePane("products");
     }
     setTab(nextTab);
   }
@@ -1697,6 +1768,7 @@ export function PosPage() {
       sectionName="POS"
       modulesData={modulesData}
       stationStatusOverride={stationStatus}
+      shellClassName={isEditableSaleView ? "shell--pos-select" : undefined}
     >
       <section className="page-header page-header--split">
         <div>
@@ -1800,7 +1872,10 @@ export function PosPage() {
           <p className="muted">Loading station business day and refill options…</p>
         </div>
       ) : (
-        <section className="subview" aria-label="Cash refill checkout">
+        <section
+          className={`subview${isEditableSaleView ? " pos-subview--select" : ""}`}
+          aria-label="Cash refill checkout"
+        >
           <ol className="pos-stepper" aria-label="Checkout progress">
             <li
               className={`pos-step ${activeStepperNumber === 1 ? "pos-step--active" : ""} ${activeStepperNumber > 1 ? "pos-step--done" : ""
@@ -1882,7 +1957,56 @@ export function PosPage() {
             </>
           ) : (
             <>
-              {lastClosedSummary && dayStatus?.state === "CLOSED" && (
+              <div className={step === "select" ? "pos-select-notices" : "pos-review-notices"}>
+                {step === "select" && lastSavedSale && (
+                  <TemporaryNotice
+                    occurrenceId={lastSavedSale.id}
+                    duration="detailed"
+                    className="callout callout--success"
+                    role="status"
+                    closeLabel="Close sale confirmation"
+                    onDismiss={() => setLastSavedSale(null)}
+                  >
+                    <p className="callout__title">Sale {lastSavedSale.data.reference} saved successfully</p>
+                    <p className="callout__body">
+                      {formatCentavos(lastSavedSale.data.cashReceivedCentavos)} received for{" "}
+                      {formatCentavos(lastSavedSale.data.totalCentavos)} total. Return{" "}
+                      <strong>{formatCentavos(lastSavedSale.data.changeCentavos)}</strong> change,{" "}
+                      {formatSavedSaleHandover(lastSavedSale.data)}
+                    </p>
+                    <div className="callout__actions">
+                      <button
+                        type="button"
+                        className="button button--ghost button--sm"
+                        onMouseDown={(event) => {
+                          if (hasInvalidLineEdits) event.preventDefault();
+                        }}
+                        onClick={() => {
+                          setHistorySettlementFocusRef(null);
+                          setHistoryFocusRef(lastSavedSale.data.reference);
+                          switchPosTab("history");
+                        }}
+                      >
+                        View in History
+                      </button>
+                    </div>
+                  </TemporaryNotice>
+                )}
+
+                {step === "select" && saleError && (
+                  <TemporaryNotice
+                    occurrenceId={saleError.id}
+                    duration="brief"
+                    className="alert alert--error"
+                    role="alert"
+                    closeLabel="Close sale error"
+                    onDismiss={() => setSaleError(null)}
+                  >
+                    {saleError.data}
+                  </TemporaryNotice>
+                )}
+
+                {lastClosedSummary && dayStatus?.state === "CLOSED" && (
                 <TemporaryNotice
                   occurrenceId={lastClosedSummary.id}
                   duration="detailed"
@@ -2119,10 +2243,45 @@ export function PosPage() {
                   </div>
                 </div>
               )}
+              </div>
 
               {step === "select" ? (
-                <div className="pos-layout">
-                  <div className="pos-main">
+                <div
+                  ref={posLayoutRef}
+                  className={`pos-layout pos-layout--select${isCompactPosLayout ? " pos-layout--compact" : ""}`}
+                >
+                  {isCompactPosLayout && (
+                    <div className="pos-mobile-switch" role="tablist" aria-label="New sale view">
+                      <button
+                        type="button"
+                        role="tab"
+                        aria-selected={mobilePane === "products"}
+                        className={`pos-mobile-switch__btn${mobilePane === "products" ? " pos-mobile-switch__btn--active" : ""}`}
+                        onClick={() => switchMobilePane("products")}
+                      >
+                        Products
+                      </button>
+                      <button
+                        type="button"
+                        role="tab"
+                        aria-selected={mobilePane === "cart"}
+                        className={`pos-mobile-switch__btn${mobilePane === "cart" ? " pos-mobile-switch__btn--active" : ""}`}
+                        onClick={() => switchMobilePane("cart")}
+                      >
+                        Current sale ({lines.length})
+                      </button>
+                    </div>
+                  )}
+
+                  <div
+                    ref={catalogScrollRef}
+                    className={`pos-main pos-main--select${isCompactPosLayout && mobilePane !== "products" ? " pos-pane--hidden" : ""}`}
+                    onScroll={(event) => {
+                      if (!isCompactPosLayout || mobilePane === "products") {
+                        productScrollTopRef.current = event.currentTarget.scrollTop;
+                      }
+                    }}
+                  >
                     <article className="card pos-selection-card">
                       <div className="detail-card__header">
                         <div>
@@ -2130,19 +2289,6 @@ export function PosPage() {
                           <p className="muted-sm">Choose the quantity for each customer-owned container service.</p>
                         </div>
                       </div>
-
-                      {saleError && (
-                        <TemporaryNotice
-                          occurrenceId={saleError.id}
-                          duration="brief"
-                          className="alert alert--error"
-                          role="alert"
-                          closeLabel="Close sale error"
-                          onDismiss={() => setSaleError(null)}
-                        >
-                          {saleError.data}
-                        </TemporaryNotice>
-                      )}
 
                       <div className="refill-grid">
                         {catalog.map((item) => {
@@ -2532,43 +2678,10 @@ export function PosPage() {
                     ))}
                   </div>
 
-                  <aside className="side-stack">
-                    {lastSavedSale && (
-                      <TemporaryNotice
-                        occurrenceId={lastSavedSale.id}
-                        duration="detailed"
-                        className="callout callout--success"
-                        role="status"
-                        closeLabel="Close sale confirmation"
-                        onDismiss={() => setLastSavedSale(null)}
-                      >
-                        <p className="callout__title">Sale {lastSavedSale.data.reference} saved successfully</p>
-                        <p className="callout__body">
-                          {formatCentavos(lastSavedSale.data.cashReceivedCentavos)} received for{" "}
-                          {formatCentavos(lastSavedSale.data.totalCentavos)} total. Return{" "}
-                          <strong>{formatCentavos(lastSavedSale.data.changeCentavos)}</strong> change,{" "}
-                          {formatSavedSaleHandover(lastSavedSale.data)}
-                        </p>
-                        <div className="callout__actions">
-                          <button
-                            type="button"
-                            className="button button--ghost button--sm"
-                            onMouseDown={(event) => {
-                              if (hasInvalidLineEdits) event.preventDefault();
-                            }}
-                            onClick={() => {
-                              setHistorySettlementFocusRef(null);
-                              setHistoryFocusRef(lastSavedSale.data.reference);
-                              switchPosTab("history");
-                            }}
-                          >
-                            View in History
-                          </button>
-                        </div>
-                      </TemporaryNotice>
-                    )}
-
-                    <article className="card detail-card" aria-label="Current sale summary">
+                  <aside
+                    className={`side-stack${isCompactPosLayout && mobilePane !== "cart" ? " pos-pane--hidden" : ""}`}
+                  >
+                    <article className="card detail-card pos-cart-card" aria-label="Current sale summary">
                       <div className="detail-card__header">
                         <h2 ref={currentSaleHeadingRef} tabIndex={-1}>
                           Current sale
@@ -2578,111 +2691,115 @@ export function PosPage() {
                         </span>
                       </div>
 
-                      {lines.length === 0 ? (
-                        <p className="muted">No items selected. Choose a refill or product to start the sale.</p>
-                      ) : (
-                        <ul className="pos-summary-lines">
-                          {lines.map((line) => (
-                            <li key={line.id} className="pos-summary-line pos-summary-line--editable">
-                              <div className="pos-summary-line__meta">
-                                <strong>{line.displayName}</strong>
-                                <span className="muted-sm">
-                                  {line.quantity} × {formatCentavos(line.unitPriceCentavos)}
-                                  {line.kind === "STANDARD" ||
-                                  line.kind === "CUSTOM" ||
-                                  (line.kind === "CONTAINER_PACKAGE" && line.unitVolumeLiters > 0)
-                                    ? ` · ${formatLiters(line.unitVolumeLiters * line.quantity)}`
-                                    : ""}
-                                </span>
-                              </div>
-                              <div className="pos-summary-line__end">
-                                <span className="pos-summary-line__amount">
-                                  {formatCentavos(line.unitPriceCentavos * line.quantity)}
-                                </span>
-                                <button
-                                  ref={(el) => {
-                                    if (el) cartRemoveBtnRefs.current.set(line.id, el);
-                                    else cartRemoveBtnRefs.current.delete(line.id);
-                                  }}
-                                  type="button"
-                                  className="button button--ghost pos-summary-line__remove"
-                                  aria-label={
-                                    cartLineRemoveLabels.get(line.id) ?? `Remove ${line.displayName}`
-                                  }
-                                  disabled={!dayStatus?.canSell || preparingCheckout}
-                                  onPointerDown={() => {
-                                    cartRemoveKeyboardRef.current = false;
-                                  }}
-                                  onMouseDown={(event) => {
-                                    if (hasInvalidLineEdits) event.preventDefault();
-                                  }}
-                                  onKeyDown={(event) => {
-                                    if (event.key === "Enter" || event.key === " ") {
-                                      cartRemoveKeyboardRef.current = true;
+                      <div className="pos-cart-card__rows">
+                        {lines.length === 0 ? (
+                          <p className="muted">No items selected. Choose a refill or product to start the sale.</p>
+                        ) : (
+                          <ul className="pos-summary-lines">
+                            {lines.map((line) => (
+                              <li key={line.id} className="pos-summary-line pos-summary-line--editable">
+                                <div className="pos-summary-line__meta">
+                                  <strong>{line.displayName}</strong>
+                                  <span className="muted-sm">
+                                    {line.quantity} × {formatCentavos(line.unitPriceCentavos)}
+                                    {line.kind === "STANDARD" ||
+                                    line.kind === "CUSTOM" ||
+                                    (line.kind === "CONTAINER_PACKAGE" && line.unitVolumeLiters > 0)
+                                      ? ` · ${formatLiters(line.unitVolumeLiters * line.quantity)}`
+                                      : ""}
+                                  </span>
+                                </div>
+                                <div className="pos-summary-line__end">
+                                  <span className="pos-summary-line__amount">
+                                    {formatCentavos(line.unitPriceCentavos * line.quantity)}
+                                  </span>
+                                  <button
+                                    ref={(el) => {
+                                      if (el) cartRemoveBtnRefs.current.set(line.id, el);
+                                      else cartRemoveBtnRefs.current.delete(line.id);
+                                    }}
+                                    type="button"
+                                    className="button button--ghost pos-summary-line__remove"
+                                    aria-label={
+                                      cartLineRemoveLabels.get(line.id) ?? `Remove ${line.displayName}`
                                     }
-                                  }}
-                                  onClick={(event) => handleRemoveCartLine(line.id, event)}
-                                >
-                                  <span aria-hidden="true">×</span>
-                                </button>
-                              </div>
-                            </li>
-                          ))}
-                        </ul>
-                      )}
+                                    disabled={!dayStatus?.canSell || preparingCheckout}
+                                    onPointerDown={() => {
+                                      cartRemoveKeyboardRef.current = false;
+                                    }}
+                                    onMouseDown={(event) => {
+                                      if (hasInvalidLineEdits) event.preventDefault();
+                                    }}
+                                    onKeyDown={(event) => {
+                                      if (event.key === "Enter" || event.key === " ") {
+                                        cartRemoveKeyboardRef.current = true;
+                                      }
+                                    }}
+                                    onClick={(event) => handleRemoveCartLine(line.id, event)}
+                                  >
+                                    <span aria-hidden="true">×</span>
+                                  </button>
+                                </div>
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                      </div>
 
-                      <dl className="detail-list">
-                        <div className="detail-list__row">
-                          <dt>Containers</dt>
-                          <dd>{cartTotals.totalContainers}</dd>
-                        </div>
-                        <div className="detail-list__row">
-                          <dt>Total water</dt>
-                          <dd>{formatLiters(cartTotals.totalVolumeLiters)}</dd>
-                        </div>
-                        <div className="detail-list__row detail-list__row--total">
-                          <dt>Total amount</dt>
-                          <dd>{formatCentavos(cartTotals.totalCentavos)}</dd>
-                        </div>
-                      </dl>
+                      <div className="pos-cart-card__footer">
+                        <dl className="detail-list">
+                          <div className="detail-list__row">
+                            <dt>Containers</dt>
+                            <dd>{cartTotals.totalContainers}</dd>
+                          </div>
+                          <div className="detail-list__row">
+                            <dt>Total water</dt>
+                            <dd>{formatLiters(cartTotals.totalVolumeLiters)}</dd>
+                          </div>
+                          <div className="detail-list__row detail-list__row--total">
+                            <dt>Total amount</dt>
+                            <dd>{formatCentavos(cartTotals.totalCentavos)}</dd>
+                          </div>
+                        </dl>
 
-                      <div className="pos-summary-actions">
-                        <button
-                          type="button"
-                          className="button button--primary button--block"
-                          disabled={!dayStatus?.canSell || lines.length === 0 || preparingCheckout}
-                          onMouseDown={(event) => {
-                            if (hasInvalidLineEdits) event.preventDefault();
-                          }}
-                          onClick={() => void handleProceedToCash()}
-                        >
-                          {preparingCheckout ? "Preparing checkout…" : "Review checkout"}
-                        </button>
-                        {lines.length > 0 && (
+                        <div className="pos-summary-actions">
                           <button
                             type="button"
-                            className="button button--ghost button--block"
-                            disabled={preparingCheckout}
+                            className="button button--primary button--block"
+                            disabled={!dayStatus?.canSell || lines.length === 0 || preparingCheckout}
                             onMouseDown={(event) => {
                               if (hasInvalidLineEdits) event.preventDefault();
                             }}
-                            onClick={() => {
-                              setLines([]);
-                              clearAllQtyEdits();
-                              setSaleError(null);
-                              setTimeout(() => {
-                                if (
-                                  document.activeElement instanceof HTMLInputElement &&
-                                  document.activeElement.classList.contains("qty-stepper__value")
-                                ) {
-                                  document.activeElement.blur();
-                                }
-                              }, 0);
-                            }}
+                            onClick={() => void handleProceedToCash()}
                           >
-                            Clear sale
+                            {preparingCheckout ? "Preparing checkout…" : "Review checkout"}
                           </button>
-                        )}
+                          {lines.length > 0 && (
+                            <button
+                              type="button"
+                              className="button button--ghost button--block"
+                              disabled={preparingCheckout}
+                              onMouseDown={(event) => {
+                                if (hasInvalidLineEdits) event.preventDefault();
+                              }}
+                              onClick={() => {
+                                setLines([]);
+                                clearAllQtyEdits();
+                                setSaleError(null);
+                                setTimeout(() => {
+                                  if (
+                                    document.activeElement instanceof HTMLInputElement &&
+                                    document.activeElement.classList.contains("qty-stepper__value")
+                                  ) {
+                                    document.activeElement.blur();
+                                  }
+                                }, 0);
+                              }}
+                            >
+                              Clear sale
+                            </button>
+                          )}
+                        </div>
                       </div>
                     </article>
 
@@ -2694,6 +2811,39 @@ export function PosPage() {
                       </p>
                     </article>
                   </aside>
+
+                  {isCompactPosLayout && mobilePane === "products" && (
+                    <div className="pos-compact-cart-bar" aria-label="Cart quick summary">
+                      <div className="pos-compact-cart-bar__meta">
+                        <span className="pill pill--scheduled">
+                          {formatCartCountPill(cartTotals.totalContainers, cartTotals.totalMerchandiseQty)}
+                        </span>
+                        <strong className="pos-compact-cart-bar__total">
+                          {formatCentavos(cartTotals.totalCentavos)}
+                        </strong>
+                      </div>
+                      <div className="pos-compact-cart-bar__actions">
+                        <button
+                          type="button"
+                          className="button button--ghost button--sm"
+                          onClick={() => switchMobilePane("cart")}
+                        >
+                          View cart
+                        </button>
+                        <button
+                          type="button"
+                          className="button button--primary button--sm"
+                          disabled={!dayStatus?.canSell || lines.length === 0 || preparingCheckout}
+                          onMouseDown={(event) => {
+                            if (hasInvalidLineEdits) event.preventDefault();
+                          }}
+                          onClick={() => void handleProceedToCash()}
+                        >
+                          {preparingCheckout ? "Preparing…" : "Review checkout"}
+                        </button>
+                      </div>
+                    </div>
+                  )}
                 </div>
               ) : (
                 <div className="pos-layout">
