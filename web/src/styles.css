@@ -2117,7 +2117,7 @@ textarea:focus-visible {
   grid-template-columns: minmax(0, 1fr);
 }
 
-.shell.shell--sidebar-collapsed > .sidebar,
+.shell.shell--sidebar-collapsed>.sidebar,
 .sidebar[hidden] {
   display: none;
 }
@@ -3297,6 +3297,10 @@ textarea:focus-visible {
   align-items: start;
 }
 
+.inventory-item-grid>.inventory-item-card:only-child {
+  grid-column: 1 / -1;
+}
+
 .inventory-item-card {
   background: #ffffff;
   border: 1px solid #e2e8f0;
@@ -3562,15 +3566,10 @@ textarea:focus-visible {
   .inventory-board {
     min-height: 400px;
   }
-
-  .inventory-group,
-  .inventory-board-note,
-  .inventory-stale-banner {
-    max-width: 660px;
-  }
 }
 
 @media (orientation: portrait) and (max-width: 900px) {
+
   .pos-layout,
   .inventory-item-grid {
     grid-template-columns: minmax(0, 1fr);
