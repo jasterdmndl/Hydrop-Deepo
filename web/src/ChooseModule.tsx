@@ -618,24 +618,32 @@ export function AppShell({
               )}
             </button>
             <nav className="breadcrumb" aria-label="Breadcrumb">
-              {sectionName ? (
-                <>
-                  {isHome ? (
+              {isHome ? (
+                sectionName ? (
+                  <>
                     <span className="breadcrumb__root">Workspace</span>
-                  ) : (
-                    <Link to="/" className="breadcrumb__link">
-                      Workspace
-                    </Link>
-                  )}
-                  <span className="breadcrumb__sep" aria-hidden="true">
-                    ›
-                  </span>
-                  <span className="breadcrumb__current" aria-current={isHome ? "page" : undefined}>
-                    {sectionName}
+                    <span className="breadcrumb__sep" aria-hidden="true">
+                      ›
+                    </span>
+                    <span className="breadcrumb__current" aria-current="page">
+                      {sectionName}
+                    </span>
+                  </>
+                ) : (
+                  <span className="breadcrumb__current">Workspace</span>
+                )
+              ) : (
+                <>
+                  <Link to="/" className="topbar-back" aria-label="Back to Choose Module">
+                    <span className="topbar-back__arrow" aria-hidden="true">
+                      ←
+                    </span>
+                    <span>Back</span>
+                  </Link>
+                  <span className="breadcrumb__current" aria-current="page">
+                    {sectionName ?? "Workspace"}
                   </span>
                 </>
-              ) : (
-                <span className="breadcrumb__current">Workspace</span>
               )}
             </nav>
           </div>
