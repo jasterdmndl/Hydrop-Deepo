@@ -4578,4 +4578,336 @@ describe("POS station day and refill sales", () => {
       expect(day1History.body.priorDaySettlements).toEqual([]);
     });
   });
+
+  describe("DEC-085 fresh-browser and session takeover recovery", () => {
+    it("lets the same account check committed, server-pending, and other-account checkouts after device takeover without mutating checkouts or stock", async () => {
+      const faucetRes = await request(ctx.app)
+        .post("/api/inventory/products")
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          name: "Takeover Faucet",
+          unit: "pcs",
+          unitConfirmed: true,
+          unitPriceCentavos: 4000,
+          showInPos: true,
+          posSection: "CHANGE_OF_GRIPO",
+        });
+      expect(faucetRes.status).toBe(201);
+      const faucetId = faucetRes.body.item.id as string;
+
+      const openStock = await request(ctx.app)
+        .post(`/api/inventory/items/${encodeURIComponent(faucetId)}/opening-stock`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ quantity: 5 });
+      expect(openStock.status).toBe(201);
+
+      expect((await startDay(ctx, owner, { requestKey: "dec085-start" })).status).toBe(201);
+
+      // 1) Sale committed on Device A (cashier1), confirmation response lost -> Device B takes over session.
+      const savedPrep = await prepareCheckout(ctx, cashier, {
+        prepareKey: "dec085-saved-prep",
+        items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 2 }],
+      });
+      const savedRef = savedPrep.body.checkout.reference as string;
+      const savedConfirm = await confirmCheckout(ctx.app, cashier, savedRef, {
+        cashReceivedCentavos: 10000,
+      });
+      expect(savedConfirm.status).toBe(201);
+
+      // 2) Server-known PAYMENT_PENDING checkout on Device A (cashier1) with reserved merchandise stock and no cash sent to server.
+      const pendingPrep = await prepareCheckout(ctx, cashier, {
+        prepareKey: "dec085-pending-prep",
+        items: [{ kind: "MERCHANDISE", productId: faucetId, quantity: 2 }],
+      });
+      const pendingRef = pendingPrep.body.checkout.reference as string;
+      const beginPending = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(pendingRef)}/begin-payment`)
+        .set("Cookie", cashier.cookie)
+        .set("X-CSRF-Token", cashier.csrfToken)
+        .send({});
+      expect(beginPending.status).toBe(200);
+
+      // 3) Separate unpaid DRAFT on Device A (cashier1) — must remain in unpaidDrafts, not unresolvedCheckouts.
+      const draftPrep = await prepareCheckout(ctx, cashier, {
+        prepareKey: "dec085-draft-prep",
+        items: [{ kind: "STANDARD", waterType: "ALKALINE", quantity: 1 }],
+      });
+      const draftRef = draftPrep.body.checkout.reference as string;
+
+      // 4) Owner also has a PAYMENT_PENDING checkout for cross-account authorization checks.
+      const ownerPrep = await prepareCheckout(ctx, owner, {
+        prepareKey: "dec085-owner-prep",
+        items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 1 }],
+      });
+      const ownerPendingRef = ownerPrep.body.checkout.reference as string;
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/checkouts/${encodeURIComponent(ownerPendingRef)}/begin-payment`)
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({})
+        ).status,
+      ).toBe(200);
+
+      // Device B signs in as cashier1 (taking over cashier1's session; owner remains signed in).
+      const cashierDeviceB = await reauth(ctx, "cashier1", cashier);
+      expect((await request(ctx.app).get("/api/pos/day").set("Cookie", cashier.cookie)).status).toBe(401);
+      expect((await request(ctx.app).get("/api/pos/day").set("Cookie", owner.cookie)).status).toBe(200);
+
+      // Fresh Device B /day reports owned pending checkouts separately from unpaid drafts and other-account checkouts.
+      const dayB = await request(ctx.app).get("/api/pos/day").set("Cookie", cashierDeviceB.cookie);
+      expect(dayB.status).toBe(200);
+      expect(dayB.body.unresolvedCheckouts).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            reference: pendingRef,
+            status: "PAYMENT_PENDING",
+            ownedByCurrentUser: true,
+            cashReceivedCentavos: null,
+          }),
+          expect.objectContaining({
+            reference: ownerPendingRef,
+            status: "PAYMENT_PENDING",
+            ownedByCurrentUser: false,
+            cashReceivedCentavos: null,
+          }),
+        ]),
+      );
+      expect(dayB.body.unpaidDrafts.map((d: { reference: string }) => d.reference)).toEqual([draftRef]);
+
+      // Lookup committed sale by original reference on Device B -> SAVED, matching receipt, no mutation.
+      const savedLookup = await request(ctx.app)
+        .get(`/api/pos/checkouts/${encodeURIComponent(savedRef)}`)
+        .set("Cookie", cashierDeviceB.cookie);
+      expect(savedLookup.status).toBe(200);
+      expect(savedLookup.body).toMatchObject({
+        recoveryState: "SAVED",
+        canRetry: false,
+        canCancelUnpaid: false,
+        ownedByCurrentUser: true,
+      });
+      expect(savedLookup.body.sale).toMatchObject({
+        reference: savedRef,
+        cashReceivedCentavos: 10000,
+        changeCentavos: 5000,
+      });
+      const historyRes = await request(ctx.app)
+        .get(`/api/pos/sales?date=${dayB.body.todayDate}`)
+        .set("Cookie", cashierDeviceB.cookie);
+      expect(historyRes.status).toBe(200);
+      expect(historyRes.body.sales.map((s: { reference: string }) => s.reference)).toContain(savedRef);
+
+      // Lookup server-pending checkout on Device B -> SAFE_TO_RETRY, canCancelUnpaid true, cashReceivedCentavos stays null, stock commitment preserved.
+      const pendingLookup = await request(ctx.app)
+        .get(`/api/pos/checkouts/${encodeURIComponent(pendingRef)}`)
+        .set("Cookie", cashierDeviceB.cookie);
+      expect(pendingLookup.status).toBe(200);
+      expect(pendingLookup.body).toMatchObject({
+        recoveryState: "SAFE_TO_RETRY",
+        canRetry: true,
+        canCancelUnpaid: true,
+        ownedByCurrentUser: true,
+      });
+      expect(pendingLookup.body.checkout.cashReceivedCentavos).toBeNull();
+
+      const { rows: activeCommits } = await ctx.db.query<{ quantity: number; status: string }>(
+        `SELECT c.quantity, c.status
+           FROM pos_checkout_stock_commitments c
+           JOIN pos_checkouts pc ON pc.id = c.checkout_id
+          WHERE pc.reference = $1`,
+        [pendingRef],
+      );
+      expect(activeCommits).toEqual([{ quantity: 2, status: "ACTIVE" }]);
+
+      // Cross-account lookup on Device B: cashier checks owner's pending checkout -> UNRESOLVED / OWNED_BY_OTHER_ACCOUNT.
+      const otherLookup = await request(ctx.app)
+        .get(`/api/pos/checkouts/${encodeURIComponent(ownerPendingRef)}`)
+        .set("Cookie", cashierDeviceB.cookie);
+      expect(otherLookup.status).toBe(200);
+      expect(otherLookup.body).toMatchObject({
+        recoveryState: "UNRESOLVED",
+        reason: "OWNED_BY_OTHER_ACCOUNT",
+        canRetry: false,
+        canCancelUnpaid: false,
+        canSettlePriorDay: false,
+        ownedByCurrentUser: false,
+      });
+
+      // Ineligible cancellations fail cleanly: other account (403) and missing no-cash confirmation (409).
+      const otherCancel = await cancelCheckout(ctx, cashierDeviceB, ownerPendingRef, {
+        confirmNoCashTaken: true,
+        reason: "No cash received",
+      });
+      expect(otherCancel.status).toBe(403);
+      const unconfirmedCancel = await cancelCheckout(ctx, cashierDeviceB, pendingRef, {
+        confirmNoCashTaken: false,
+      });
+      expect(unconfirmedCancel.status).toBe(409);
+
+      // Initiating account (cashierDeviceB) explicitly cancels unpaid pendingRef -> releases merchandise reservation.
+      const validCancel = await cancelCheckout(ctx, cashierDeviceB, pendingRef, {
+        confirmNoCashTaken: true,
+        reason: "No cash received",
+      });
+      expect(validCancel.status).toBe(200);
+      expect(validCancel.body.checkout.status).toBe("CANCELLED_DRAFT");
+
+      const { rows: releasedCommits } = await ctx.db.query<{ status: string }>(
+        `SELECT c.status
+           FROM pos_checkout_stock_commitments c
+           JOIN pos_checkouts pc ON pc.id = c.checkout_id
+          WHERE pc.reference = $1`,
+        [pendingRef],
+      );
+      expect(releasedCommits).toEqual([{ status: "RELEASED" }]);
+
+      // Owner also cancels ownerPendingRef after fresh-device check -> End Day (clearing unpaid draft) succeeds.
+      const ownerLookup = await request(ctx.app)
+        .get(`/api/pos/checkouts/${encodeURIComponent(ownerPendingRef)}`)
+        .set("Cookie", owner.cookie);
+      expect(ownerLookup.status).toBe(200);
+      expect(ownerLookup.body.canCancelUnpaid).toBe(true);
+      expect(
+        (
+          await cancelCheckout(ctx, owner, ownerPendingRef, {
+            confirmNoCashTaken: true,
+            reason: "No cash received",
+          })
+        ).status,
+      ).toBe(200);
+
+      const endAfterCancels = await endDay(ctx, owner, {
+        requestKey: "dec085-end-after-cancels",
+        clearUnpaidDrafts: true,
+      });
+      expect(endAfterCancels.status).toBe(200);
+      expect(endAfterCancels.body.state).toBe("CLOSED");
+
+      // Unknown reference lookup returns 404 without mutating anything.
+      const missingLookup = await request(ctx.app)
+        .get("/api/pos/checkouts/HD-9999-999")
+        .set("Cookie", cashierDeviceB.cookie);
+      expect(missingLookup.status).toBe(404);
+    });
+
+    it("keeps an in-flight confirmation single-commit across session takeover and reports SAVE_IN_PROGRESS then SAVED on Device B", async () => {
+      const faucetRes = await request(ctx.app)
+        .post("/api/inventory/products")
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          name: "Inflight Takeover Faucet",
+          unit: "pcs",
+          unitConfirmed: true,
+          unitPriceCentavos: 5000,
+          showInPos: true,
+          posSection: "CHANGE_OF_GRIPO",
+        });
+      expect(faucetRes.status).toBe(201);
+      const faucetId = faucetRes.body.item.id as string;
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/inventory/items/${encodeURIComponent(faucetId)}/opening-stock`)
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({ quantity: 5 })
+        ).status,
+      ).toBe(201);
+
+      const enteredTx = deferred<void>();
+      const releaseTx = deferred<void>();
+      let pauseNextConfirmTx = false;
+
+      const wrappedDb: Database = {
+        query: (sql, params) => ctx.db.query(sql, params),
+        exec: (sql) => ctx.db.exec(sql),
+        close: () => ctx.db.close(),
+        async transaction<T>(fn: (tx: Queryable) => Promise<T>): Promise<T> {
+          if (pauseNextConfirmTx) {
+            pauseNextConfirmTx = false;
+            enteredTx.resolve();
+            await releaseTx.promise;
+          }
+          return ctx.db.transaction(fn);
+        },
+      };
+      const pausedApp = createApp({ db: wrappedDb, clock: ctx.clock, secureCookies: false });
+
+      expect((await startDay(ctx, owner, { requestKey: "dec085-inflight-day" })).status).toBe(201);
+      const prep = await prepareCheckout(ctx, cashier, {
+        prepareKey: "dec085-inflight-prep",
+        items: [{ kind: "MERCHANDISE", productId: faucetId, quantity: 2 }],
+      });
+      const ref = prep.body.checkout.reference as string;
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/checkouts/${encodeURIComponent(ref)}/begin-payment`)
+            .set("Cookie", cashier.cookie)
+            .set("X-CSRF-Token", cashier.csrfToken)
+            .send({})
+        ).status,
+      ).toBe(200);
+
+      // Device A starts confirm; pause right before its DB transaction.
+      pauseNextConfirmTx = true;
+      const confirmPromise = confirmCheckout(pausedApp, cashier, ref, {
+        cashReceivedCentavos: 10000,
+      });
+      await enteredTx.promise;
+
+      // Device B signs in as cashier1 while Device A's confirm is in flight.
+      const cashierDeviceB = await signIn(pausedApp, "cashier1", cashier.password);
+
+      // Device B checks status -> SAVE_IN_PROGRESS, canRetry: false.
+      const duringLookup = await request(pausedApp)
+        .get(`/api/pos/checkouts/${encodeURIComponent(ref)}`)
+        .set("Cookie", cashierDeviceB.cookie);
+      expect(duringLookup.status).toBe(200);
+      expect(duringLookup.body).toMatchObject({
+        recoveryState: "UNRESOLVED",
+        reason: "SAVE_IN_PROGRESS",
+        canRetry: false,
+        ownedByCurrentUser: true,
+      });
+
+      // Already-accepted transaction completes once; Device B sees SAVED with one sale and one stock deduction.
+      releaseTx.resolve();
+      const confirmed = await confirmPromise;
+      expect(confirmed.status).toBe(201);
+
+      const afterLookup = await request(pausedApp)
+        .get(`/api/pos/checkouts/${encodeURIComponent(ref)}`)
+        .set("Cookie", cashierDeviceB.cookie);
+      expect(afterLookup.status).toBe(200);
+      expect(afterLookup.body).toMatchObject({
+        recoveryState: "SAVED",
+        canRetry: false,
+        ownedByCurrentUser: true,
+      });
+
+      const { rows: saleCount } = await ctx.db.query<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM pos_sales WHERE reference = $1`,
+        [ref],
+      );
+      expect(saleCount[0]!.count).toBe("1");
+
+      const { rows: stockRows } = await ctx.db.query<{ current_quantity: number }>(
+        `SELECT current_quantity FROM inventory_items WHERE id = $1`,
+        [faucetId],
+      );
+      expect(Number(stockRows[0]!.current_quantity)).toBe(3);
+
+      // Device A's old session is now rejected on next request.
+      const oldSessionRes = await request(pausedApp)
+        .get("/api/pos/day")
+        .set("Cookie", cashier.cookie);
+      expect(oldSessionRes.status).toBe(401);
+      expect(oldSessionRes.body.error.code).toBe("SESSION_REPLACED");
+    });
+  });
 });

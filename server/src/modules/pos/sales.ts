@@ -273,6 +273,7 @@ export interface CheckoutView {
   businessDate: string;
   status: CheckoutStatus;
   createdBy: string;
+  ownedByCurrentUser?: boolean;
   createdAt: string;
   updatedAt: string;
   totalCentavos: number;
@@ -337,6 +338,7 @@ export interface CheckoutLookupView {
   recoveryState: RecoveryState;
   reason: string | null;
   canRetry: boolean;
+  canCancelUnpaid: boolean;
   canSettlePriorDay: boolean;
   canDismissCancelled: boolean;
   ownedByCurrentUser: boolean;
@@ -835,6 +837,7 @@ export function deriveCheckoutLookup(input: {
       recoveryState: "SAVED",
       reason: null,
       canRetry: false,
+      canCancelUnpaid: false,
       canSettlePriorDay: false,
       canDismissCancelled: false,
       ownedByCurrentUser,
@@ -850,6 +853,7 @@ export function deriveCheckoutLookup(input: {
       recoveryState: "SETTLED_PRIOR_DAY",
       reason: "SETTLED_PRIOR_DAY_PAID_AND_DELIVERED",
       canRetry: false,
+      canCancelUnpaid: false,
       canSettlePriorDay: false,
       canDismissCancelled: false,
       ownedByCurrentUser,
@@ -865,6 +869,7 @@ export function deriveCheckoutLookup(input: {
       recoveryState: "UNRESOLVED",
       reason: "SAVE_IN_PROGRESS",
       canRetry: false,
+      canCancelUnpaid: false,
       canSettlePriorDay: false,
       canDismissCancelled: false,
       ownedByCurrentUser,
@@ -880,6 +885,7 @@ export function deriveCheckoutLookup(input: {
       recoveryState: "REVIEW_REQUIRED",
       reason: input.checkout.resolutionReason ?? "REVIEW_REQUIRED",
       canRetry: false,
+      canCancelUnpaid: false,
       canSettlePriorDay,
       canDismissCancelled: false,
       ownedByCurrentUser,
@@ -900,6 +906,7 @@ export function deriveCheckoutLookup(input: {
         recoveryState: "CANCELLED",
         reason: input.checkout.resolutionReason ?? "CHECKOUT_CANCELLED",
         canRetry: false,
+        canCancelUnpaid: false,
         canSettlePriorDay: false,
         canDismissCancelled: true,
         ownedByCurrentUser,
@@ -913,6 +920,7 @@ export function deriveCheckoutLookup(input: {
       recoveryState: "REVIEW_REQUIRED",
       reason: input.checkout.resolutionReason ?? "CHECKOUT_CANCELLED",
       canRetry: false,
+      canCancelUnpaid: false,
       canSettlePriorDay: false,
       canDismissCancelled: false,
       ownedByCurrentUser,
@@ -928,6 +936,7 @@ export function deriveCheckoutLookup(input: {
       recoveryState: "REVIEW_REQUIRED",
       reason: "DAY_CLOSED",
       canRetry: false,
+      canCancelUnpaid: false,
       canSettlePriorDay,
       canDismissCancelled: false,
       ownedByCurrentUser,
@@ -943,6 +952,7 @@ export function deriveCheckoutLookup(input: {
       recoveryState: "REVIEW_REQUIRED",
       reason: "BUSINESS_DATE_CROSSED",
       canRetry: false,
+      canCancelUnpaid: false,
       canSettlePriorDay,
       canDismissCancelled: false,
       ownedByCurrentUser,
@@ -958,6 +968,7 @@ export function deriveCheckoutLookup(input: {
       recoveryState: "UNRESOLVED",
       reason: "OWNED_BY_OTHER_ACCOUNT",
       canRetry: false,
+      canCancelUnpaid: false,
       canSettlePriorDay: false,
       canDismissCancelled: false,
       ownedByCurrentUser,
@@ -972,6 +983,10 @@ export function deriveCheckoutLookup(input: {
     recoveryState: "SAFE_TO_RETRY",
     reason: "NOT_SAVED",
     canRetry: true,
+    canCancelUnpaid:
+      input.checkout.status === "PAYMENT_PENDING" &&
+      input.checkout.cashReceivedCentavos === null &&
+      input.checkout.paymentRecordedAt === null,
     canSettlePriorDay: false,
     canDismissCancelled: false,
     ownedByCurrentUser,

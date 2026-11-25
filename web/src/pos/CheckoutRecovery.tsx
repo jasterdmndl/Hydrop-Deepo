@@ -22,6 +22,7 @@ export interface CheckoutRecoveryProps {
   todayDate?: string;
   checking: boolean;
   retrying: boolean;
+  cancellingUnpaid?: boolean;
   statusNotice?: NoticeEnvelope<string> | null;
   errorNotice: NoticeEnvelope<string> | null;
   onDismissStatusNotice?: () => void;
@@ -30,9 +31,12 @@ export interface CheckoutRecoveryProps {
   onCheckStatus(): void;
   onRetry(): void;
   onContinueSaved(reference: string, sale: SaleView): void;
+  onViewSavedReceipt?: (reference: string, sale: SaleView) => void;
   onOpenPriorDaySettle?: (record: PendingCheckoutRecovery) => void;
   onContinueSettled?: (reference: string, settlement: PriorDaySettlementView) => void;
   onDismissCancelled?: (reference: string) => void;
+  onCancelUnpaid?: (reference: string) => void;
+  onCloseServerInspection?: () => void;
 }
 
 function pillClassForTone(tone: RecoveryTone): string {
@@ -103,6 +107,7 @@ export function CheckoutRecovery({
   todayDate,
   checking,
   retrying,
+  cancellingUnpaid = false,
   statusNotice,
   errorNotice,
   onDismissStatusNotice,
@@ -111,9 +116,12 @@ export function CheckoutRecovery({
   onCheckStatus,
   onRetry,
   onContinueSaved,
+  onViewSavedReceipt,
   onOpenPriorDaySettle,
   onContinueSettled,
   onDismissCancelled,
+  onCancelUnpaid,
+  onCloseServerInspection,
 }: CheckoutRecoveryProps) {
   const effectiveTodayDate = reconcileRecoveryTodayDate(todayDate, record.lastLookup?.checkedAt);
   const presentation = resolveRecoveryPresentation(
@@ -123,9 +131,11 @@ export function CheckoutRecovery({
     effectiveTodayDate,
   );
   const [confirmNoCashCancelled, setConfirmNoCashCancelled] = useState(false);
+  const [confirmNoCashUnpaid, setConfirmNoCashUnpaid] = useState(false);
 
   useEffect(() => {
     setConfirmNoCashCancelled(false);
+    setConfirmNoCashUnpaid(false);
   }, [record.reference, presentation.screen]);
 
   return (
@@ -267,38 +277,96 @@ export function CheckoutRecovery({
                     ? `Retry restricted to ${record.initiatedBy}`
                     : "Retry unavailable until status is checked"}
                 </button>
+                {record.source === "server" && onCloseServerInspection && (
+                  <button
+                    type="button"
+                    className="button button--ghost button--block"
+                    disabled={checking || retrying}
+                    onClick={onCloseServerInspection}
+                  >
+                    Back to New Sale
+                  </button>
+                )}
               </>
             )}
 
             {presentation.screen === "SAVED" && presentation.sale && (
-              <button
-                type="button"
-                className="button button--primary button--block"
-                onClick={() => onContinueSaved(record.reference, presentation.sale!)}
-              >
-                Continue with saved sale
-              </button>
-            )}
-
-            {presentation.screen === "SAFE_TO_RETRY" && (
               <>
                 <button
                   type="button"
                   className="button button--primary button--block"
-                  disabled={retrying || checking}
-                  onClick={onRetry}
+                  onClick={() => onContinueSaved(record.reference, presentation.sale!)}
                 >
-                  {retrying ? "Saving transaction…" : "Retry saving this transaction"}
+                  Continue with saved sale
                 </button>
+                {onViewSavedReceipt && (
+                  <button
+                    type="button"
+                    className="button button--ghost button--block"
+                    onClick={() => onViewSavedReceipt(record.reference, presentation.sale!)}
+                  >
+                    View saved receipt in History
+                  </button>
+                )}
+              </>
+            )}
+
+            {presentation.screen === "SAFE_TO_RETRY" && (
+              <>
+                {presentation.canRetry && (
+                  <button
+                    type="button"
+                    className="button button--primary button--block"
+                    disabled={retrying || checking || cancellingUnpaid}
+                    onClick={onRetry}
+                  >
+                    {retrying ? "Saving transaction…" : "Retry saving this transaction"}
+                  </button>
+                )}
                 <button
                   type="button"
-                  className="button button--ghost button--block"
+                  className={`button ${
+                    presentation.needsOriginalBrowserForRetry ? "button--primary" : "button--ghost"
+                  } button--block`}
                   aria-busy={checking}
-                  disabled={retrying || checking}
+                  disabled={retrying || checking || cancellingUnpaid}
                   onClick={onCheckStatus}
                 >
-                  {checking ? "Checking status…" : "Check transaction status"}
+                  {checking ? "Checking transaction status…" : "Check transaction status"}
                 </button>
+                {presentation.needsOriginalBrowserForRetry &&
+                  presentation.canCancelUnpaid &&
+                  onCancelUnpaid && (
+                    <div className="cancel-unpaid-box">
+                      <label className="checkbox-field">
+                        <input
+                          type="checkbox"
+                          checked={confirmNoCashUnpaid}
+                          disabled={checking || retrying || cancellingUnpaid}
+                          onChange={(event) => setConfirmNoCashUnpaid(event.target.checked)}
+                        />
+                        <span>Confirm no cash was received from the customer</span>
+                      </label>
+                      <button
+                        type="button"
+                        className="button button--ghost button--block"
+                        disabled={!confirmNoCashUnpaid || checking || retrying || cancellingUnpaid}
+                        onClick={() => onCancelUnpaid(record.reference)}
+                      >
+                        {cancellingUnpaid ? "Cancelling unpaid checkout…" : "Cancel unpaid checkout"}
+                      </button>
+                    </div>
+                  )}
+                {presentation.needsOriginalBrowserForRetry && onCloseServerInspection && (
+                  <button
+                    type="button"
+                    className="button button--ghost button--block"
+                    disabled={checking || retrying || cancellingUnpaid}
+                    onClick={onCloseServerInspection}
+                  >
+                    Back to New Sale
+                  </button>
+                )}
               </>
             )}
 
@@ -325,6 +393,16 @@ export function CheckoutRecovery({
                 >
                   {checking ? "Checking status…" : "Check transaction status"}
                 </button>
+                {record.source === "server" && onCloseServerInspection && (
+                  <button
+                    type="button"
+                    className="button button--ghost button--block"
+                    disabled={checking || retrying}
+                    onClick={onCloseServerInspection}
+                  >
+                    Back to New Sale
+                  </button>
+                )}
                 <p className="muted-sm">
                   {currentUserRole === "CASHIER" &&
                   effectiveTodayDate &&
@@ -377,6 +455,16 @@ export function CheckoutRecovery({
                   >
                     {checking ? "Checking status…" : "Check transaction status"}
                   </button>
+                  {record.source === "server" && onCloseServerInspection && (
+                    <button
+                      type="button"
+                      className="button button--ghost button--block"
+                      disabled={checking || retrying}
+                      onClick={onCloseServerInspection}
+                    >
+                      Back to New Sale
+                    </button>
+                  )}
                   <p className="muted-sm">
                     Returning to New Sale clears only this reference from this browser&apos;s recovery list and
                     keeps the cancelled server record and any other pending references intact. If cash was
@@ -440,11 +528,19 @@ export function CheckoutRecovery({
                   ? "Cash entered on this device"
                   : "Cash received"}
               </dt>
-              <dd>{formatCentavos(presentation.amounts.cashReceivedCentavos)}</dd>
+              <dd>
+                {presentation.amounts.cashReceivedCentavos !== null
+                  ? formatCentavos(presentation.amounts.cashReceivedCentavos)
+                  : "Not recorded on this device"}
+              </dd>
             </div>
             <div className="detail-list__row">
               <dt>{presentation.screen === "CANCELLED" ? "Calculated change" : "Change"}</dt>
-              <dd>{formatCentavos(presentation.amounts.changeCentavos)}</dd>
+              <dd>
+                {presentation.amounts.changeCentavos !== null
+                  ? formatCentavos(presentation.amounts.changeCentavos)
+                  : "—"}
+              </dd>
             </div>
             {presentation.screen === "CANCELLED" && (
               <div className="detail-list__row">

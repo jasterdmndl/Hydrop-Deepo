@@ -228,15 +228,22 @@ export function posRoutes(db: Database): Router {
     if (openRow) {
       const nonTerminal = await repo.listNonTerminalCheckoutsForDay(db, openRow.id);
       for (const row of nonTerminal) {
+        const ownedByCurrentUser = row.createdByUserId === req.auth!.user.id;
         if (row.status === "REVIEW_REQUIRED") {
-          unresolvedCheckouts.push(toCheckoutView(row));
+          unresolvedCheckouts.push({ ...toCheckoutView(row), ownedByCurrentUser });
         } else if (row.status === "PAYMENT_PENDING") {
           const active = inFlight.get(row.reference);
-          unresolvedCheckouts.push(active ? active.checkoutView : toCheckoutView(row));
+          unresolvedCheckouts.push({
+            ...(active ? active.checkoutView : toCheckoutView(row)),
+            ownedByCurrentUser: active ? active.createdByUserId === req.auth!.user.id : ownedByCurrentUser,
+          });
         } else if (row.status === "DRAFT") {
           const active = inFlight.get(row.reference);
           if (active) {
-            unresolvedCheckouts.push(active.checkoutView);
+            unresolvedCheckouts.push({
+              ...active.checkoutView,
+              ownedByCurrentUser: active.createdByUserId === req.auth!.user.id,
+            });
           } else {
             unpaidDrafts.push(toCheckoutView(row));
           }
@@ -248,7 +255,10 @@ export function posRoutes(db: Database): Router {
       ...status,
       unresolvedCheckouts,
       unpaidDrafts,
-      priorDayReviewCheckouts: closedPriorDayRows.map(toCheckoutView),
+      priorDayReviewCheckouts: closedPriorDayRows.map((row) => ({
+        ...toCheckoutView(row),
+        ownedByCurrentUser: row.createdByUserId === req.auth!.user.id,
+      })),
     });
   });
 

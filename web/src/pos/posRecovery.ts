@@ -151,6 +151,7 @@ export interface CheckoutView {
   businessDate: string;
   status: CheckoutStatus;
   createdBy: string;
+  ownedByCurrentUser?: boolean;
   createdAt: string;
   updatedAt: string;
   totalCentavos: number;
@@ -228,6 +229,7 @@ export interface CheckoutLookupView {
   recoveryState: RecoveryState;
   reason: string | null;
   canRetry: boolean;
+  canCancelUnpaid?: boolean;
   canSettlePriorDay?: boolean;
   canDismissCancelled?: boolean;
   ownedByCurrentUser: boolean;
@@ -335,14 +337,15 @@ export interface PendingCheckoutRecovery {
   reference: string;
   businessDate: string;
   initiatedBy: string;
+  source?: "local" | "server";
   items: CartItemInput[];
   quoteItems: QuoteLineItem[];
   totalCentavos: number;
   totalContainers: number;
   totalVolumeMl: number;
   totalVolumeLiters: number;
-  cashReceivedCentavos: number;
-  changeCentavos: number;
+  cashReceivedCentavos: number | null;
+  changeCentavos: number | null;
   attemptedAt: string;
   lastLookup: CheckoutLookupView | null;
   lastError: string | null;
@@ -360,8 +363,10 @@ export type RecoveryTone = "warning" | "success" | "danger" | "neutral";
 export interface RecoveryPresentation {
   screen: RecoveryScreen;
   isDifferentAccount: boolean;
+  needsOriginalBrowserForRetry: boolean;
   canCheckStatus: boolean;
   canRetry: boolean;
+  canCancelUnpaid: boolean;
   canContinueSaved: boolean;
   canContinueSettled: boolean;
   canSettlePriorDay: boolean;
@@ -376,8 +381,8 @@ export interface RecoveryPresentation {
   calloutTone: "warning" | "success" | "danger";
   amounts: {
     totalCentavos: number;
-    cashReceivedCentavos: number;
-    changeCentavos: number;
+    cashReceivedCentavos: number | null;
+    changeCentavos: number | null;
     totalContainers: number;
     totalVolumeLiters: number;
     items: QuoteLineItem[];
@@ -804,20 +809,78 @@ export function isPriorDaySettleableComposition(items: QuoteLineItem[]): boolean
   return !(hasMerchandise && hasRefill);
 }
 
+export function createServerRecoveryRecord(
+  checkout: CheckoutView,
+  initialLookup: CheckoutLookupView | null = null,
+): PendingCheckoutRecovery {
+  return {
+    reference: checkout.reference,
+    businessDate: checkout.businessDate,
+    initiatedBy: checkout.createdBy,
+    source: "server",
+    items: [],
+    quoteItems: checkout.items,
+    totalCentavos: checkout.totalCentavos,
+    totalContainers: checkout.totalContainers,
+    totalVolumeMl: checkout.totalVolumeMl,
+    totalVolumeLiters: checkout.totalVolumeLiters,
+    cashReceivedCentavos: checkout.cashReceivedCentavos,
+    changeCentavos: checkout.changeCentavos,
+    attemptedAt: checkout.paymentStartedAt ?? checkout.updatedAt,
+    lastLookup: initialLookup,
+    lastError: null,
+  };
+}
+
+function isTerminalLookup(lookup: CheckoutLookupView | null): boolean {
+  return (
+    lookup !== null &&
+    (lookup.recoveryState === "SAVED" || lookup.recoveryState === "SETTLED_PRIOR_DAY")
+  );
+}
+
+/**
+ * Merges a status lookup response without allowing failed or late responses to
+ * overwrite a newer saved/settled result or a more recently checked snapshot.
+ */
+export function mergeRecoveryLookup(
+  record: PendingCheckoutRecovery,
+  incoming: CheckoutLookupView,
+): PendingCheckoutRecovery {
+  const existing = record.lastLookup;
+  if (existing) {
+    if (isTerminalLookup(existing) && incoming.recoveryState !== existing.recoveryState) {
+      return record;
+    }
+    const existingTs = Date.parse(existing.checkedAt);
+    const incomingTs = Date.parse(incoming.checkedAt);
+    if (!Number.isNaN(existingTs) && !Number.isNaN(incomingTs) && incomingTs < existingTs) {
+      return record;
+    }
+  }
+  return {
+    ...record,
+    lastLookup: incoming,
+    lastError: null,
+  };
+}
+
 export function resolveRecoveryPresentation(
   record: PendingCheckoutRecovery,
   currentUsername: string,
   currentUserRole: "OWNER" | "CASHIER" = "CASHIER",
   todayDate?: string,
 ): RecoveryPresentation {
-  const isDifferentAccount =
-    record.initiatedBy.trim().toLowerCase() !== currentUsername.trim().toLowerCase();
   const lookup = record.lastLookup;
+  const isDifferentAccount =
+    record.initiatedBy.trim().toLowerCase() !== currentUsername.trim().toLowerCase() ||
+    lookup?.ownedByCurrentUser === false;
   const localCash = record.cashReceivedCentavos;
+  const hasLocalTender = record.source !== "server" && localCash !== null;
   const localAmounts = {
     totalCentavos: record.totalCentavos,
     cashReceivedCentavos: localCash,
-    changeCentavos: localCash - record.totalCentavos,
+    changeCentavos: localCash !== null ? localCash - record.totalCentavos : null,
     totalContainers: record.totalContainers,
     totalVolumeLiters: record.totalVolumeLiters,
     items: record.quoteItems,
@@ -828,8 +891,10 @@ export function resolveRecoveryPresentation(
     return {
       screen: "SAVED",
       isDifferentAccount,
+      needsOriginalBrowserForRetry: false,
       canCheckStatus: false,
       canRetry: false,
+      canCancelUnpaid: false,
       canContinueSaved: true,
       canContinueSettled: false,
       canSettlePriorDay: false,
@@ -863,12 +928,15 @@ export function resolveRecoveryPresentation(
     const isMerchOnly = isPriorDayMerchandiseOnly(settlement.items);
     const cashReceived = settlement.cashReceivedCentavos ?? localCash;
     const change =
-      settlement.changeCentavos ?? cashReceived - settlement.netAmountKeptCentavos;
+      settlement.changeCentavos ??
+      (cashReceived !== null ? cashReceived - settlement.netAmountKeptCentavos : null);
     return {
       screen: "SETTLED_PRIOR_DAY",
       isDifferentAccount,
+      needsOriginalBrowserForRetry: false,
       canCheckStatus: false,
       canRetry: false,
+      canCancelUnpaid: false,
       canContinueSaved: false,
       canContinueSettled: true,
       canSettlePriorDay: false,
@@ -910,8 +978,10 @@ export function resolveRecoveryPresentation(
     return {
       screen: "CANCELLED",
       isDifferentAccount,
+      needsOriginalBrowserForRetry: false,
       canCheckStatus: true,
       canRetry: false,
+      canCancelUnpaid: false,
       canContinueSaved: false,
       canContinueSettled: false,
       canSettlePriorDay: false,
@@ -927,7 +997,7 @@ export function resolveRecoveryPresentation(
       amounts: {
         totalCentavos: serverTotal,
         cashReceivedCentavos: localCash,
-        changeCentavos: localCash - serverTotal,
+        changeCentavos: localCash !== null ? localCash - serverTotal : null,
         totalContainers: lookup.checkout.totalContainers,
         totalVolumeLiters: lookup.checkout.totalVolumeLiters,
         items: lookup.checkout.items,
@@ -941,7 +1011,9 @@ export function resolveRecoveryPresentation(
   if (lookup && lookup.recoveryState === "REVIEW_REQUIRED") {
     const serverTotal = lookup.checkout.totalCentavos;
     const cashReceived = lookup.checkout.cashReceivedCentavos ?? localCash;
-    const change = lookup.checkout.changeCentavos ?? cashReceived - serverTotal;
+    const change =
+      lookup.checkout.changeCentavos ??
+      (cashReceived !== null ? cashReceived - serverTotal : null);
     const isDateCrossed = lookup.reason === "BUSINESS_DATE_CROSSED";
     const isDayClosed = lookup.reason === "DAY_CLOSED";
     const effectiveTodayDate = reconcileRecoveryTodayDate(todayDate, lookup.checkedAt);
@@ -958,8 +1030,10 @@ export function resolveRecoveryPresentation(
     return {
       screen: "REVIEW_REQUIRED",
       isDifferentAccount,
+      needsOriginalBrowserForRetry: false,
       canCheckStatus: true,
       canRetry: false,
+      canCancelUnpaid: false,
       canContinueSaved: false,
       canContinueSettled: false,
       canSettlePriorDay,
@@ -994,11 +1068,54 @@ export function resolveRecoveryPresentation(
 
   if (lookup && lookup.recoveryState === "SAFE_TO_RETRY" && lookup.canRetry && !isDifferentAccount) {
     const serverTotal = lookup.checkout.totalCentavos;
+    if (!hasLocalTender) {
+      const canCancelUnpaid =
+        lookup.canCancelUnpaid === true &&
+        lookup.checkout.status === "PAYMENT_PENDING" &&
+        lookup.checkout.cashReceivedCentavos === null &&
+        lookup.checkout.paymentRecordedAt === null;
+      return {
+        screen: "SAFE_TO_RETRY",
+        isDifferentAccount: false,
+        needsOriginalBrowserForRetry: true,
+        canCheckStatus: true,
+        canRetry: false,
+        canCancelUnpaid,
+        canContinueSaved: false,
+        canContinueSettled: false,
+        canSettlePriorDay: false,
+        canDismissCancelled: false,
+        blocksNewSale: true,
+        statusPillLabel: "Not saved · verified",
+        statusPillTone: "warning",
+        headline: "Not saved. Check original device.",
+        subline: `Transaction status checked at ${formatManilaTimeWithSeconds(lookup.checkedAt)}.`,
+        calloutTitle: "Do not take payment again.",
+        calloutBody: canCancelUnpaid
+          ? "A server check confirmed this transaction was not saved, and the original cash tender is not stored on this device. Sign back in on the original browser to check status and resume recovery, or confirm no cash was received to cancel this unpaid checkout."
+          : "A server check confirmed this transaction was not saved, and the original cash tender is not stored on this device. Sign back in on the original browser to check status and resume the existing recovery flow.",
+        calloutTone: "warning",
+        amounts: {
+          totalCentavos: serverTotal,
+          cashReceivedCentavos: lookup.checkout.cashReceivedCentavos,
+          changeCentavos: lookup.checkout.changeCentavos,
+          totalContainers: lookup.checkout.totalContainers,
+          totalVolumeLiters: lookup.checkout.totalVolumeLiters,
+          items: lookup.checkout.items,
+        },
+        checkedAt: lookup.checkedAt,
+        sale: null,
+        settlement: null,
+      };
+    }
+
     return {
       screen: "SAFE_TO_RETRY",
       isDifferentAccount: false,
+      needsOriginalBrowserForRetry: false,
       canCheckStatus: true,
       canRetry: true,
+      canCancelUnpaid: false,
       canContinueSaved: false,
       canContinueSettled: false,
       canSettlePriorDay: false,
@@ -1015,7 +1132,7 @@ export function resolveRecoveryPresentation(
       amounts: {
         totalCentavos: serverTotal,
         cashReceivedCentavos: localCash,
-        changeCentavos: localCash - serverTotal,
+        changeCentavos: localCash! - serverTotal,
         totalContainers: lookup.checkout.totalContainers,
         totalVolumeLiters: lookup.checkout.totalVolumeLiters,
         items: lookup.checkout.items,
@@ -1028,13 +1145,16 @@ export function resolveRecoveryPresentation(
 
   const inProgress = lookup?.reason === "SAVE_IN_PROGRESS";
   const serverCheckout = lookup?.checkout;
+  const resolvedCash = serverCheckout
+    ? (serverCheckout.cashReceivedCentavos ?? localCash)
+    : localCash;
   const resolvedAmounts = serverCheckout
     ? {
       totalCentavos: serverCheckout.totalCentavos,
-      cashReceivedCentavos: serverCheckout.cashReceivedCentavos ?? localCash,
+      cashReceivedCentavos: resolvedCash,
       changeCentavos:
         serverCheckout.changeCentavos ??
-        (serverCheckout.cashReceivedCentavos ?? localCash) - serverCheckout.totalCentavos,
+        (resolvedCash !== null ? resolvedCash - serverCheckout.totalCentavos : null),
       totalContainers: serverCheckout.totalContainers,
       totalVolumeLiters: serverCheckout.totalVolumeLiters,
       items: serverCheckout.items,
@@ -1044,8 +1164,10 @@ export function resolveRecoveryPresentation(
   return {
     screen: "UNKNOWN",
     isDifferentAccount,
+    needsOriginalBrowserForRetry: false,
     canCheckStatus: true,
     canRetry: false,
+    canCancelUnpaid: false,
     canContinueSaved: false,
     canContinueSettled: false,
     canSettlePriorDay: false,
@@ -1060,15 +1182,19 @@ export function resolveRecoveryPresentation(
     headline: isDifferentAccount ? "Pending checkout from another account" : "Check before retrying",
     subline: lookup
       ? `Transaction status checked at ${formatManilaTimeWithSeconds(lookup.checkedAt)}.`
-      : "The connection was interrupted during saving.",
+      : record.source === "server"
+        ? "This server checkout has not been verified from this device yet."
+        : "The connection was interrupted during saving.",
     calloutTitle: isDifferentAccount
       ? `Started by ${record.initiatedBy} — sign back into that account to retry`
       : inProgress
         ? "Save still in progress"
-        : "Do not confirm payment again",
+        : "Do not take payment again.",
     calloutBody: isDifferentAccount
-      ? "This workstation still has an unverified checkout started by another account. Check its status or sign in as the initiating operator before retrying."
-      : "The sale may already be saved. Check its status using the same transaction reference before taking any action.",
+      ? "This workstation or account has an unverified checkout started by another account. Do not take payment again. Check its status or sign in as the initiating operator before retrying."
+      : inProgress
+        ? "The save is still in progress on the server. Do not take payment again. Check transaction status before taking any action."
+        : "The sale may already be saved. Do not take payment again. Check its status using the same transaction reference before taking any action.",
     calloutTone: "warning",
     amounts: resolvedAmounts,
     checkedAt: lookup?.checkedAt ?? null,
@@ -1091,7 +1217,9 @@ export function formatRecoveryCheckFeedback(
     case "CANCELLED":
       return `Status confirmed (${checkedTime}) — checkout was cancelled with no payment recorded.`;
     case "SAFE_TO_RETRY":
-      return `Status confirmed (${checkedTime}) — not saved yet. Safe to retry.`;
+      return presentation.needsOriginalBrowserForRetry
+        ? `Status confirmed (${checkedTime}) — not saved yet. Original cash details are on the original browser.`
+        : `Status confirmed (${checkedTime}) — not saved yet. Safe to retry.`;
     case "REVIEW_REQUIRED":
       return presentation.canSettlePriorDay
         ? `Status confirmed (${checkedTime}) — still requires Owner review. Prior-day settlement is available below.`

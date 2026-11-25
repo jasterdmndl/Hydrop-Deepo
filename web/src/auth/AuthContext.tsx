@@ -1,6 +1,6 @@
 import { createContext, type ReactNode, useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
-import { api, ApiError, onIdleExpiry, onSessionEnded, setCsrfToken } from "../api";
+import { advanceAuthGeneration, api, ApiError, onIdleExpiry, onSessionEnded, setCsrfToken } from "../api";
 import { nextNoticeId } from "../notifications/noticeTiming";
 import { clockOffsetMs, resolveLogoutOutcome, shouldSendHeartbeat } from "./idle";
 
@@ -48,6 +48,14 @@ interface AuthContextValue {
 const AuthContext = createContext<AuthContextValue | null>(null);
 
 const EXPIRED_NOTICE = "You were signed out because the session ended. Please sign in again.";
+const REPLACED_NOTICE = "Your account was signed in on another device.";
+const SESSION_POLL_MS = 10_000;
+
+function sessionEndedNotice(code: string): string | undefined {
+  if (code === "SESSION_REPLACED") return REPLACED_NOTICE;
+  if (code === "SESSION_EXPIRED") return EXPIRED_NOTICE;
+  return undefined;
+}
 
 export function AuthProvider({ children }: { children: ReactNode }) {
   const navigate = useNavigate();
@@ -56,16 +64,22 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [logoutError, setLogoutError] = useState<string | null>(null);
   const [loggingOut, setLoggingOut] = useState(false);
   const lastHeartbeat = useRef(Date.now());
+  const sessionEpochRef = useRef(0);
+  const refreshInFlightRef = useRef(false);
 
-  const accept = useCallback((data: SessionResponse) => {
+  const accept = useCallback((data: SessionResponse, options?: { touchHeartbeat?: boolean }) => {
     setCsrfToken(data.csrfToken);
     setClockOffset(clockOffsetMs(data.session.serverNow, Date.now()));
     setLogoutError(null);
-    lastHeartbeat.current = Date.now();
+    if (options?.touchHeartbeat !== false) {
+      lastHeartbeat.current = Date.now();
+    }
     setState({ status: "signed-in", user: data.user, idleExpiresAt: Date.parse(data.session.idleExpiresAt) });
   }, []);
 
   const signOutLocally = useCallback((notice?: string) => {
+    advanceAuthGeneration();
+    sessionEpochRef.current += 1;
     setCsrfToken(null);
     setLogoutError(null);
     setState({ status: "signed-out", notice, noticeId: notice ? nextNoticeId() : undefined });
@@ -82,19 +96,34 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const refreshSession = useCallback(async () => {
+    if (refreshInFlightRef.current) return;
+    const epoch = sessionEpochRef.current;
+    refreshInFlightRef.current = true;
     try {
-      accept(await api<SessionResponse>("/api/auth/session", { background: true }));
+      const data = await api<SessionResponse>("/api/auth/session", { background: true });
+      if (epoch !== sessionEpochRef.current) return;
+      accept(data, { touchHeartbeat: false });
     } catch (error) {
+      if (epoch !== sessionEpochRef.current) return;
       if (error instanceof ApiError && error.status === 401) return; // handled by onSessionEnded
       throw error;
+    } finally {
+      refreshInFlightRef.current = false;
     }
   }, [accept]);
 
   // Initial session check (survives page reloads and server restarts).
   useEffect(() => {
+    const epoch = sessionEpochRef.current;
     api<SessionResponse>("/api/auth/session", { background: true })
-      .then(accept)
-      .catch(() => signOutLocally());
+      .then((data) => {
+        if (epoch !== sessionEpochRef.current) return;
+        accept(data);
+      })
+      .catch((error) => {
+        if (epoch !== sessionEpochRef.current) return;
+        signOutLocally(error instanceof ApiError ? sessionEndedNotice(error.code) : undefined);
+      });
   }, [accept, signOutLocally]);
 
   useEffect(
@@ -103,8 +132,10 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         setLogoutError(null);
         setState((current) => {
           if (current.status !== "signed-in") return current;
+          advanceAuthGeneration();
+          sessionEpochRef.current += 1;
           setCsrfToken(null);
-          const notice = code === "SESSION_EXPIRED" ? EXPIRED_NOTICE : undefined;
+          const notice = sessionEndedNotice(code);
           return {
             status: "signed-out",
             notice,
@@ -147,6 +178,31 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     };
   }, [signedIn, continueWorking]);
 
+  // Check session state without extending the idle timer when returning to the tab or periodically while visible.
+  useEffect(() => {
+    if (!signedIn) return;
+    const checkSessionInBackground = () => {
+      if (document.visibilityState !== "visible" || refreshInFlightRef.current) return;
+      void refreshSession().catch(() => undefined);
+    };
+    const onVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        checkSessionInBackground();
+      }
+    };
+    const onFocus = () => {
+      checkSessionInBackground();
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    window.addEventListener("focus", onFocus);
+    const interval = window.setInterval(checkSessionInBackground, SESSION_POLL_MS);
+    return () => {
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      window.removeEventListener("focus", onFocus);
+      window.clearInterval(interval);
+    };
+  }, [signedIn, refreshSession]);
+
   const value = useMemo<AuthContextValue>(
     () => ({
       state,
@@ -158,16 +214,20 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       refreshSession,
       continueWorking,
       async login(username, password) {
-        accept(await api<SessionResponse>("/api/auth/login", { method: "POST", body: { username, password } }));
+        const data = await api<SessionResponse>("/api/auth/login", { method: "POST", body: { username, password } });
+        advanceAuthGeneration();
+        sessionEpochRef.current += 1;
+        accept(data);
         navigate("/", { replace: true });
       },
       async changePassword(currentPassword, newPassword) {
-        accept(
-          await api<SessionResponse>("/api/auth/password", {
-            method: "POST",
-            body: { currentPassword, newPassword },
-          }),
-        );
+        const data = await api<SessionResponse>("/api/auth/password", {
+          method: "POST",
+          body: { currentPassword, newPassword },
+        });
+        advanceAuthGeneration();
+        sessionEpochRef.current += 1;
+        accept(data);
         navigate("/", { replace: true });
       },
       async logout() {
@@ -179,9 +239,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         } catch (error) {
           const outcome = resolveLogoutOutcome(error);
           if (outcome.signedOut) {
-            signOutLocally(
-              error instanceof ApiError && error.code === "SESSION_EXPIRED" ? EXPIRED_NOTICE : undefined,
-            );
+            signOutLocally(error instanceof ApiError ? sessionEndedNotice(error.code) : undefined);
           } else {
             setLogoutError(outcome.errorMessage);
           }

@@ -22,8 +22,14 @@ type SessionEndedListener = (code: string) => void;
 type IdleExpiryListener = (idleExpiresAt: string) => void;
 
 let csrfToken: string | null = null;
+let authGeneration = 0;
 const sessionEndedListeners = new Set<SessionEndedListener>();
 const idleExpiryListeners = new Set<IdleExpiryListener>();
+
+export function advanceAuthGeneration(): number {
+  authGeneration += 1;
+  return authGeneration;
+}
 
 export function setCsrfToken(token: string | null): void {
   csrfToken = token;
@@ -41,6 +47,7 @@ export function onIdleExpiry(listener: IdleExpiryListener): () => void {
 
 export async function api<T>(path: string, options: RequestOptions = {}): Promise<T> {
   const method = options.method ?? "GET";
+  const requestGeneration = authGeneration;
   const headers: Record<string, string> = { Accept: "application/json" };
   if (options.body !== undefined) headers["Content-Type"] = "application/json";
   if (method !== "GET" && csrfToken) headers["X-CSRF-Token"] = csrfToken;
@@ -59,7 +66,9 @@ export async function api<T>(path: string, options: RequestOptions = {}): Promis
   }
 
   const idleExpiresAt = response.headers.get("X-Session-Idle-Expires-At");
-  if (idleExpiresAt) idleExpiryListeners.forEach((l) => l(idleExpiresAt));
+  if (idleExpiresAt && requestGeneration === authGeneration) {
+    idleExpiryListeners.forEach((l) => l(idleExpiresAt));
+  }
 
   if (response.status === 204) return undefined as T;
   const payload = (await response.json().catch(() => ({}))) as Record<string, unknown> & {
@@ -68,8 +77,8 @@ export async function api<T>(path: string, options: RequestOptions = {}): Promis
   if (!response.ok) {
     const code = payload.error?.code ?? "HTTP_ERROR";
     const message = payload.error?.message ?? "Something went wrong. Please try again.";
-    // A failed sign-in attempt is not the end of a session.
-    if (response.status === 401 && path !== "/api/auth/login") {
+    // A failed sign-in attempt is not the end of a session, and stale responses after reauth are ignored.
+    if (response.status === 401 && path !== "/api/auth/login" && requestGeneration === authGeneration) {
       sessionEndedListeners.forEach((l) => l(code));
     }
     throw new ApiError(response.status, code, message, payload);

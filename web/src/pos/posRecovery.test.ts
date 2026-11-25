@@ -4,6 +4,7 @@ import {
   clearUnpaidCart,
   clearUnpaidCartIfMatchesReference,
   computeCashSummary,
+  createServerRecoveryRecord,
   evaluateEndDayGuard,
   formatCentavos,
   formatManilaTimeWithSeconds,
@@ -13,6 +14,7 @@ import {
   loadPendingRecoveries,
   loadPendingRecoveryByReference,
   loadUnpaidCart,
+  mergeRecoveryLookup,
   notifyPosStateChanged,
   parseLitersInput,
   parsePesoInputToCentavos,
@@ -1396,5 +1398,179 @@ describe("account-scoped unpaid cart and workstation recovery storage", () => {
     );
     expect(reviewOnly.screen).toBe("REVIEW_REQUIRED");
     expect(reviewOnly.canDismissCancelled).toBe(false);
+  });
+
+  describe("DEC-085 fresh-browser server recovery presentation and stale-lookup protection", () => {
+    it("createServerRecoveryRecord keeps server-only cash null and marks source as server", () => {
+      const checkout = makeLookup({}).checkout;
+      const serverRecord = createServerRecoveryRecord({
+        ...checkout,
+        status: "PAYMENT_PENDING",
+        cashReceivedCentavos: null,
+        changeCentavos: null,
+        paymentStartedAt: "2026-11-09T10:41:00+08:00",
+      });
+
+      expect(serverRecord.source).toBe("server");
+      expect(serverRecord.cashReceivedCentavos).toBeNull();
+      expect(serverRecord.changeCentavos).toBeNull();
+      expect(serverRecord.attemptedAt).toBe("2026-11-09T10:41:00+08:00");
+    });
+
+    it("blocks retry with missing tender on a fresh device, says Do not take payment again, and directs to original browser", () => {
+      const checkout: CheckoutView = {
+        ...makeLookup({}).checkout,
+        status: "PAYMENT_PENDING",
+        cashReceivedCentavos: null,
+        changeCentavos: null,
+        paymentStartedAt: "2026-11-09T10:41:00+08:00",
+      };
+      const serverRecord = createServerRecoveryRecord(checkout);
+
+      const beforeLookup = resolveRecoveryPresentation(serverRecord, "cashier1", "CASHIER");
+      expect(beforeLookup.screen).toBe("UNKNOWN");
+      expect(beforeLookup.canCheckStatus).toBe(true);
+      expect(beforeLookup.canRetry).toBe(false);
+      expect(beforeLookup.calloutBody).toContain("Do not take payment again.");
+      expect(beforeLookup.amounts.cashReceivedCentavos).toBeNull();
+      expect(beforeLookup.amounts.changeCentavos).toBeNull();
+
+      const safeLookup = makeLookup({
+        recoveryState: "SAFE_TO_RETRY",
+        reason: "NOT_SAVED",
+        canRetry: true,
+        canCancelUnpaid: true,
+        ownedByCurrentUser: true,
+        checkedAt: "2026-11-09T10:43:00+08:00",
+        checkout,
+      });
+      const safeOnNewDevice = resolveRecoveryPresentation(
+        mergeRecoveryLookup(serverRecord, safeLookup),
+        "cashier1",
+        "CASHIER",
+      );
+      expect(safeOnNewDevice).toMatchObject({
+        screen: "SAFE_TO_RETRY",
+        canCheckStatus: true,
+        canRetry: false,
+        canCancelUnpaid: true,
+        needsOriginalBrowserForRetry: true,
+        calloutTitle: "Do not take payment again.",
+      });
+      expect(safeOnNewDevice.calloutBody).toContain("original browser");
+      expect(safeOnNewDevice.amounts.cashReceivedCentavos).toBeNull();
+      expect(formatRecoveryCheckFeedback(safeLookup, safeOnNewDevice)).toContain(
+        "Original cash details are on the original browser.",
+      );
+
+      // Ineligible cancellation cases keep canCancelUnpaid false on fresh-device SAFE_TO_RETRY.
+      const disallowedFlag = resolveRecoveryPresentation(
+        mergeRecoveryLookup(serverRecord, { ...safeLookup, canCancelUnpaid: false }),
+        "cashier1",
+        "CASHIER",
+      );
+      expect(disallowedFlag.canCancelUnpaid).toBe(false);
+
+      const withRecordedCash = resolveRecoveryPresentation(
+        mergeRecoveryLookup(serverRecord, {
+          ...safeLookup,
+          checkout: { ...checkout, cashReceivedCentavos: 50000, paymentRecordedAt: "2026-11-09T10:42:00+08:00" },
+        }),
+        "cashier1",
+        "CASHIER",
+      );
+      expect(withRecordedCash.canCancelUnpaid).toBe(false);
+    });
+
+    it("shows saved sale details from a fresh device and preserves Owner vs Cashier review permissions", () => {
+      const savedSale = makeSale();
+      const checkout: CheckoutView = {
+        ...makeLookup({}).checkout,
+        status: "SAVED",
+        cashReceivedCentavos: 50000,
+        changeCentavos: 17500,
+      };
+      const savedLookup = makeLookup({
+        recoveryState: "SAVED",
+        reason: null,
+        canRetry: false,
+        ownedByCurrentUser: true,
+        checkout,
+        sale: savedSale,
+      });
+      const savedRecord = createServerRecoveryRecord(checkout, savedLookup);
+      const savedPresentation = resolveRecoveryPresentation(savedRecord, "cashier1", "CASHIER");
+      expect(savedPresentation).toMatchObject({
+        screen: "SAVED",
+        canContinueSaved: true,
+        canRetry: false,
+        amounts: {
+          totalCentavos: 32500,
+          cashReceivedCentavos: 50000,
+          changeCentavos: 17500,
+        },
+      });
+
+      const priorCheckout: CheckoutView = {
+        ...makeLookup({}).checkout,
+        businessDate: "2026-11-08",
+        status: "REVIEW_REQUIRED",
+        resolutionReason: "BUSINESS_DATE_CROSSED",
+      };
+      const priorLookup = makeLookup({
+        recoveryState: "REVIEW_REQUIRED",
+        reason: "BUSINESS_DATE_CROSSED",
+        canRetry: false,
+        canSettlePriorDay: true,
+        ownedByCurrentUser: true,
+        checkedAt: "2026-11-09T10:43:00+08:00",
+        checkout: priorCheckout,
+      });
+      const priorRecord = createServerRecoveryRecord(priorCheckout, priorLookup);
+      expect(
+        resolveRecoveryPresentation(priorRecord, "owner1", "OWNER", "2026-11-09").canSettlePriorDay,
+      ).toBe(true);
+      expect(
+        resolveRecoveryPresentation(priorRecord, "cashier1", "CASHIER", "2026-11-09").canSettlePriorDay,
+      ).toBe(false);
+    });
+
+    it("mergeRecoveryLookup does not allow late or older lookups to overwrite SAVED or SETTLED_PRIOR_DAY", () => {
+      const savedLookup = makeLookup({
+        recoveryState: "SAVED",
+        reason: null,
+        canRetry: false,
+        checkedAt: "2026-11-09T10:44:00+08:00",
+        sale: makeSale(),
+      });
+      const base = createServerRecoveryRecord(savedLookup.checkout, savedLookup);
+
+      const lateUnresolved = makeLookup({
+        recoveryState: "UNRESOLVED",
+        reason: "SAVE_IN_PROGRESS",
+        canRetry: false,
+        checkedAt: "2026-11-09T10:45:00+08:00",
+      });
+      const mergedAfterSaved = mergeRecoveryLookup(base, lateUnresolved);
+      expect(mergedAfterSaved.lastLookup?.recoveryState).toBe("SAVED");
+
+      const olderRetry = makeLookup({
+        recoveryState: "SAFE_TO_RETRY",
+        reason: "NOT_SAVED",
+        canRetry: true,
+        checkedAt: "2026-11-09T10:41:00+08:00",
+      });
+      const pendingBase = createServerRecoveryRecord(
+        makeLookup({}).checkout,
+        makeLookup({
+          recoveryState: "UNRESOLVED",
+          reason: "SAVE_IN_PROGRESS",
+          checkedAt: "2026-11-09T10:43:00+08:00",
+        }),
+      );
+      expect(mergeRecoveryLookup(pendingBase, olderRetry).lastLookup?.checkedAt).toBe(
+        "2026-11-09T10:43:00+08:00",
+      );
+    });
   });
 });

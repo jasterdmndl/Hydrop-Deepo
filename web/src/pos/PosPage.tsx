@@ -27,6 +27,7 @@ import {
   computeCashSummary,
   type ConfirmSaleResponse,
   type ContainerPackageCode,
+  createServerRecoveryRecord,
   currentManilaIso,
   type DaySummaryView,
   type EndDayResponse,
@@ -41,7 +42,9 @@ import {
   isPriorDayMerchandiseOnly,
   isPriorDaySettleableComposition,
   loadPendingRecoveries,
+  loadPendingRecoveryByReference,
   loadUnpaidCart,
+  mergeRecoveryLookup,
   notifyPosStateChanged,
   parseLitersInput,
   parsePesoInputToCentavos,
@@ -260,6 +263,12 @@ export function PosPage() {
   const [selectedRecoveryRef, setSelectedRecoveryRef] = useState<string | null>(
     () => loadPendingRecoveries()[0]?.reference ?? null,
   );
+  const [serverRecovery, setServerRecovery] = useState<PendingCheckoutRecovery | null>(null);
+  const serverRecoveryRef = useRef<PendingCheckoutRecovery | null>(null);
+  serverRecoveryRef.current = serverRecovery;
+  const [lookupRefInput, setLookupRefInput] = useState("");
+  const [lookupSubmitting, setLookupSubmitting] = useState(false);
+  const [lookupInputError, setLookupInputError] = useState<NoticeEnvelope<string> | null>(null);
   const [activeConfirming, setActiveConfirming] = useState<PendingCheckoutRecovery | null>(null);
   const [checkingStatus, setCheckingStatus] = useState(false);
   const [retryingRecovery, setRetryingRecovery] = useState(false);
@@ -311,6 +320,9 @@ export function PosPage() {
   const isCartHydrated = cartHydratedUser === user.username;
   const loadTrackerRef = useRef(createRequestTracker());
   const dayStatusTrackerRef = useRef(createRequestTracker());
+  const recoveryLookupTrackerRef = useRef(createRequestTracker());
+  const manualLookupRequestIdRef = useRef<number | null>(null);
+  const statusCheckRequestIdRef = useRef<number | null>(null);
   const preparedCheckoutRef = useRef<CheckoutView | null>(null);
   preparedCheckoutRef.current = preparedCheckout;
   const activeConfirmingRef = useRef<PendingCheckoutRecovery | null>(null);
@@ -326,13 +338,14 @@ export function PosPage() {
   const [isCompactPosLayout, setIsCompactPosLayout] = useState(false);
   const [mobilePane, setMobilePane] = useState<"products" | "cart">("products");
 
-  const activeRecovery = useMemo(
+  const localActiveRecovery = useMemo(
     () =>
       pendingRecoveries.find((r) => r.reference === selectedRecoveryRef) ??
       pendingRecoveries[0] ??
       null,
     [pendingRecoveries, selectedRecoveryRef],
   );
+  const activeRecovery = localActiveRecovery ?? serverRecovery;
 
   const inActiveCashStep =
     step === "review" && preparedCheckout !== null && preparedCheckout.status === "PAYMENT_PENDING";
@@ -485,12 +498,20 @@ export function PosPage() {
 
   useEffect(() => {
     const recoveries = loadPendingRecoveries();
+    recoveryLookupTrackerRef.current.next();
+    manualLookupRequestIdRef.current = null;
+    statusCheckRequestIdRef.current = null;
     setPendingRecoveries(recoveries);
     setSelectedRecoveryRef((prev) =>
       prev && recoveries.some((r) => r.reference === prev)
         ? prev
         : (recoveries[0]?.reference ?? null),
     );
+    setServerRecovery(null);
+    setCheckingStatus(false);
+    setLookupRefInput("");
+    setLookupSubmitting(false);
+    setLookupInputError(null);
     setLines([]);
     setPreparedCheckout(null);
     setPrepareKey(null);
@@ -512,6 +533,11 @@ export function PosPage() {
       setSelectedRecoveryRef((prev) =>
         prev && next.some((r) => r.reference === prev) ? prev : (next[0]?.reference ?? null),
       );
+      setServerRecovery((prev) => {
+        if (!prev) return null;
+        const normalized = prev.reference.trim().toUpperCase();
+        return next.some((r) => r.reference.trim().toUpperCase() === normalized) ? null : prev;
+      });
     };
     window.addEventListener("storage", onStorage);
     return () => window.removeEventListener("storage", onStorage);
@@ -880,11 +906,11 @@ export function PosPage() {
         return prev.map((l) =>
           l.id === id
             ? {
-                ...l,
-                displayName: item.name,
-                unitPriceCentavos: item.unitPriceCentavos,
-                quantity: clamped,
-              }
+              ...l,
+              displayName: item.name,
+              unitPriceCentavos: item.unitPriceCentavos,
+              quantity: clamped,
+            }
             : l,
         );
       }
@@ -930,11 +956,11 @@ export function PosPage() {
       return prev.map((l) =>
         l.id === id
           ? {
-              ...l,
-              displayName,
-              unitPriceCentavos: pkg.unitPriceCentavos,
-              quantity: targetQty,
-            }
+            ...l,
+            displayName,
+            unitPriceCentavos: pkg.unitPriceCentavos,
+            quantity: targetQty,
+          }
           : l,
       );
     }
@@ -1397,20 +1423,166 @@ export function PosPage() {
     }
   }
 
-  function handleResumeServerPending(checkout: CheckoutView) {
-    const hydrated = quoteItemsToDraftLines(checkout.items);
-    setLines(hydrated);
-    clearAllQtyEdits();
-    setPreparedCheckout(checkout);
-    setPrepareKey(null);
-    setPrepareSignature(cartLinesSignature(hydrated));
-    setCashInput("");
-    setConfirmNoCashChecked(false);
+  async function runServerInspectionLookup(
+    baseRecord: PendingCheckoutRecovery,
+    options: { showCheckingSpinner?: boolean } = {},
+  ) {
+    const requestId = recoveryLookupTrackerRef.current.next();
+    statusCheckRequestIdRef.current = requestId;
+    manualLookupRequestIdRef.current = null;
+    setLookupSubmitting(false);
+    const targetRef = baseRecord.reference.trim().toUpperCase();
+    if (options.showCheckingSpinner !== false) {
+      setCheckingStatus(true);
+    }
+    setRecoveryStatusNotice(null);
+    setRecoveryError(null);
+    try {
+      const lookup = await api<CheckoutLookupView>(
+        `/api/pos/checkouts/${encodeURIComponent(baseRecord.reference)}`,
+      );
+      if (!recoveryLookupTrackerRef.current.isCurrent(requestId)) return;
+
+      const currentLocal = loadPendingRecoveryByReference(baseRecord.reference);
+      if (currentLocal) {
+        const updatedLocal = mergeRecoveryLookup(currentLocal, lookup);
+        savePendingRecovery(updatedLocal);
+        setPendingRecoveries(loadPendingRecoveries());
+        setSelectedRecoveryRef(updatedLocal.reference);
+        setServerRecovery(null);
+        const nextPresentation = resolveRecoveryPresentation(
+          updatedLocal,
+          user.username,
+          user.role,
+          reconcileRecoveryTodayDate(dayStatus?.todayDate, updatedLocal.lastLookup?.checkedAt),
+        );
+        setRecoveryStatusNotice(
+          wrapNotice({
+            reference: updatedLocal.reference,
+            message: formatRecoveryCheckFeedback(updatedLocal.lastLookup ?? lookup, nextPresentation),
+          }),
+        );
+      } else {
+        const currentServer =
+          serverRecoveryRef.current &&
+            serverRecoveryRef.current.reference.trim().toUpperCase() === targetRef
+            ? serverRecoveryRef.current
+            : baseRecord;
+        const updatedServer = mergeRecoveryLookup(currentServer, lookup);
+        serverRecoveryRef.current = updatedServer;
+        setServerRecovery(updatedServer);
+        const nextPresentation = resolveRecoveryPresentation(
+          updatedServer,
+          user.username,
+          user.role,
+          reconcileRecoveryTodayDate(dayStatus?.todayDate, updatedServer.lastLookup?.checkedAt),
+        );
+        setRecoveryStatusNotice(
+          wrapNotice({
+            reference: updatedServer.reference,
+            message: formatRecoveryCheckFeedback(updatedServer.lastLookup ?? lookup, nextPresentation),
+          }),
+        );
+      }
+      refreshDayStatusInBackground();
+    } catch (err) {
+      if (!recoveryLookupTrackerRef.current.isCurrent(requestId)) return;
+      setRecoveryError(
+        wrapNotice(
+          err instanceof ApiError
+            ? err.message
+            : "Status check could not reach the server. Keep this reference and check again.",
+        ),
+      );
+    } finally {
+      if (statusCheckRequestIdRef.current === requestId) {
+        statusCheckRequestIdRef.current = null;
+        setCheckingStatus(false);
+      }
+    }
+  }
+
+  function handleInspectServerCheckout(checkout: CheckoutView) {
+    setLookupInputError(null);
     setSaleError(null);
-    setLastSavedSale(null);
-    setLastSettledPriorDay(null);
-    setLastAlreadySavedPriorDay(null);
-    setStep("review");
+    const existingLocal = loadPendingRecoveryByReference(checkout.reference);
+    if (existingLocal) {
+      setServerRecovery(null);
+      setSelectedRecoveryRef(existingLocal.reference);
+      void runServerInspectionLookup(existingLocal);
+      return;
+    }
+    const record = createServerRecoveryRecord(checkout);
+    serverRecoveryRef.current = record;
+    setServerRecovery(record);
+    void runServerInspectionLookup(record);
+  }
+
+  async function handleLookupByReference(event: FormEvent) {
+    event.preventDefault();
+    if (lookupSubmitting) return;
+    const normalizedRef = lookupRefInput.trim().toUpperCase();
+    if (!normalizedRef) {
+      setLookupInputError(wrapNotice("Enter a transaction reference to check."));
+      return;
+    }
+
+    const existingLocal = loadPendingRecoveryByReference(normalizedRef);
+    if (existingLocal) {
+      setLookupRefInput("");
+      setLookupInputError(null);
+      setServerRecovery(null);
+      setSelectedRecoveryRef(existingLocal.reference);
+      void runServerInspectionLookup(existingLocal);
+      return;
+    }
+
+    const requestId = recoveryLookupTrackerRef.current.next();
+    manualLookupRequestIdRef.current = requestId;
+    statusCheckRequestIdRef.current = null;
+    setCheckingStatus(false);
+    setLookupSubmitting(true);
+    setLookupInputError(null);
+    setRecoveryStatusNotice(null);
+    setRecoveryError(null);
+    try {
+      const lookup = await api<CheckoutLookupView>(
+        `/api/pos/checkouts/${encodeURIComponent(normalizedRef)}`,
+      );
+      if (!recoveryLookupTrackerRef.current.isCurrent(requestId)) return;
+
+      const record = createServerRecoveryRecord(lookup.checkout, lookup);
+      serverRecoveryRef.current = record;
+      setServerRecovery(record);
+      setLookupRefInput("");
+      const nextPresentation = resolveRecoveryPresentation(
+        record,
+        user.username,
+        user.role,
+        reconcileRecoveryTodayDate(dayStatus?.todayDate, lookup.checkedAt),
+      );
+      setRecoveryStatusNotice(
+        wrapNotice({
+          reference: record.reference,
+          message: formatRecoveryCheckFeedback(lookup, nextPresentation),
+        }),
+      );
+      refreshDayStatusInBackground();
+    } catch (err) {
+      if (!recoveryLookupTrackerRef.current.isCurrent(requestId)) return;
+      setLookupInputError(
+        wrapNotice(
+          err instanceof ApiError
+            ? err.message
+            : "Could not check that transaction reference. Check the connection and try again.",
+        ),
+      );
+    } finally {
+      if (manualLookupRequestIdRef.current === requestId) {
+        manualLookupRequestIdRef.current = null;
+        setLookupSubmitting(false);
+      }
+    }
   }
 
   const parsedCashCentavos = parsePesoInputToCentavos(cashInput);
@@ -1653,52 +1825,12 @@ export function PosPage() {
   async function handleCheckRecoveryStatus() {
     const target = activeRecovery;
     if (!target) return;
-    setCheckingStatus(true);
-    setRecoveryStatusNotice(null);
-    setRecoveryError(null);
-    try {
-      const lookup = await api<CheckoutLookupView>(
-        `/api/pos/checkouts/${encodeURIComponent(target.reference)}`,
-      );
-      const updated: PendingCheckoutRecovery = {
-        ...target,
-        lastLookup: lookup,
-        lastError: null,
-      };
-      savePendingRecovery(updated);
-      setPendingRecoveries(loadPendingRecoveries());
-      setSelectedRecoveryRef(updated.reference);
-
-      const nextPresentation = resolveRecoveryPresentation(
-        updated,
-        user.username,
-        user.role,
-        reconcileRecoveryTodayDate(dayStatus?.todayDate, lookup.checkedAt),
-      );
-      setRecoveryStatusNotice(
-        wrapNotice({
-          reference: updated.reference,
-          message: formatRecoveryCheckFeedback(lookup, nextPresentation),
-        }),
-      );
-
-      refreshDayStatusInBackground();
-    } catch (err) {
-      setRecoveryError(
-        wrapNotice(
-          err instanceof ApiError
-            ? err.message
-            : "Status check could not reach the server. Keep this reference and check again.",
-        ),
-      );
-    } finally {
-      setCheckingStatus(false);
-    }
+    await runServerInspectionLookup(target);
   }
 
   async function handleRetryRecovery() {
     const target = activeRecovery;
-    if (!target) return;
+    if (!target || target.source === "server" || target.cashReceivedCentavos === null) return;
     activeConfirmingRef.current = target;
     setActiveConfirming(target);
     setRetryingRecovery(true);
@@ -1770,7 +1902,9 @@ export function PosPage() {
   }
 
   function handleContinueSavedSale(reference: string, sale: SaleView) {
+    recoveryLookupTrackerRef.current.next();
     removePendingRecovery(reference);
+    setServerRecovery(null);
     notifyPosStateChanged("sale-saved");
     clearMatchingPreparedCheckout(reference);
     const remaining = loadPendingRecoveries();
@@ -1786,8 +1920,32 @@ export function PosPage() {
     void loadPosState();
   }
 
-  function handlePriorDayAlreadySaved(reference: string, sale: SaleView) {
+  function handleViewSavedReceiptFromRecovery(reference: string, sale: SaleView) {
+    recoveryLookupTrackerRef.current.next();
     removePendingRecovery(reference);
+    setServerRecovery(null);
+    notifyPosStateChanged("sale-saved");
+    clearMatchingPreparedCheckout(reference);
+    const remaining = loadPendingRecoveries();
+    setPendingRecoveries(remaining);
+    setSelectedRecoveryRef(remaining[0]?.reference ?? null);
+    setRecoveryStatusNotice(null);
+    setRecoveryError(null);
+    setLastSavedSale(null);
+    setLastSettledPriorDay(null);
+    setLastAlreadySavedPriorDay(null);
+    setSettlementTarget(null);
+    setHistorySettlementFocusRef(null);
+    setHistoryFocusRef(sale.reference);
+    setHistoryRefreshSignal((n) => n + 1);
+    setTab("history");
+    void loadPosState();
+  }
+
+  function handlePriorDayAlreadySaved(reference: string, sale: SaleView) {
+    recoveryLookupTrackerRef.current.next();
+    removePendingRecovery(reference);
+    setServerRecovery(null);
     notifyPosStateChanged("sale-saved");
     clearMatchingPreparedCheckout(reference);
     const remaining = loadPendingRecoveries();
@@ -1837,11 +1995,16 @@ export function PosPage() {
       resolutionReason: "BUSINESS_DATE_CROSSED",
       items: record.quoteItems,
     };
-    openPriorDaySettleForCheckout(checkout, record.cashReceivedCentavos);
+    openPriorDaySettleForCheckout(
+      checkout,
+      record.source === "server" ? null : record.cashReceivedCentavos,
+    );
   }
 
   async function handlePriorDaySettled(settlement: PriorDaySettlementView) {
+    recoveryLookupTrackerRef.current.next();
     removePendingRecovery(settlement.checkoutReference);
+    setServerRecovery(null);
     notifyPosStateChanged("prior-day-settled");
     clearMatchingPreparedCheckout(settlement.checkoutReference);
     const remaining = loadPendingRecoveries();
@@ -1858,7 +2021,9 @@ export function PosPage() {
   }
 
   function handleContinueSettledSale(reference: string, settlement: PriorDaySettlementView) {
+    recoveryLookupTrackerRef.current.next();
     removePendingRecovery(reference);
+    setServerRecovery(null);
     notifyPosStateChanged("prior-day-settled");
     clearMatchingPreparedCheckout(reference);
     const remaining = loadPendingRecoveries();
@@ -1875,7 +2040,9 @@ export function PosPage() {
   }
 
   function handleDismissCancelledRecovery(reference: string) {
+    recoveryLookupTrackerRef.current.next();
     removePendingRecovery(reference);
+    setServerRecovery(null);
     clearMatchingPreparedCheckout(reference);
     const remaining = loadPendingRecoveries();
     setPendingRecoveries(remaining);
@@ -1887,6 +2054,59 @@ export function PosPage() {
     setLastAlreadySavedPriorDay(null);
     setLastSettledPriorDay(null);
     void loadPosState();
+  }
+
+  function handleCloseServerInspection() {
+    recoveryLookupTrackerRef.current.next();
+    manualLookupRequestIdRef.current = null;
+    statusCheckRequestIdRef.current = null;
+    setCheckingStatus(false);
+    setLookupSubmitting(false);
+    setServerRecovery(null);
+    setRecoveryStatusNotice(null);
+    setRecoveryError(null);
+    void loadPosState();
+  }
+
+  async function handleCancelUnpaidFromRecovery(reference: string) {
+    if (cancellingDraft) return;
+    setCancellingDraft(true);
+    setRecoveryStatusNotice(null);
+    setRecoveryError(null);
+    try {
+      await api(`/api/pos/checkouts/${encodeURIComponent(reference)}/cancel`, {
+        method: "POST",
+        body: { confirmNoCashTaken: true, reason: "No cash received" },
+      });
+      recoveryLookupTrackerRef.current.next();
+      manualLookupRequestIdRef.current = null;
+      statusCheckRequestIdRef.current = null;
+      setCheckingStatus(false);
+      setLookupSubmitting(false);
+      removePendingRecovery(reference);
+      setServerRecovery(null);
+      notifyPosStateChanged("payment-cancelled");
+      clearMatchingPreparedCheckout(reference);
+      const remaining = loadPendingRecoveries();
+      setPendingRecoveries(remaining);
+      setSelectedRecoveryRef(remaining[0]?.reference ?? null);
+      setSettlementTarget(null);
+      setLastSavedSale(null);
+      setLastAlreadySavedPriorDay(null);
+      setLastSettledPriorDay(null);
+      await loadPosState();
+    } catch (err) {
+      setRecoveryError(
+        wrapNotice(
+          err instanceof ApiError
+            ? err.message
+            : "Could not cancel unpaid checkout. Check status or try again.",
+        ),
+      );
+      await loadPosState();
+    } finally {
+      setCancellingDraft(false);
+    }
   }
 
   function switchPosTab(nextTab: PosTab) {
@@ -2094,9 +2314,10 @@ export function PosPage() {
                 )}
                 checking={checkingStatus}
                 retrying={retryingRecovery}
+                cancellingUnpaid={cancellingDraft}
                 statusNotice={
                   recoveryStatusNotice &&
-                  recoveryStatusNotice.data.reference === activeRecovery.reference
+                    recoveryStatusNotice.data.reference === activeRecovery.reference
                     ? { id: recoveryStatusNotice.id, data: recoveryStatusNotice.data.message }
                     : null
                 }
@@ -2111,9 +2332,14 @@ export function PosPage() {
                 onCheckStatus={() => void handleCheckRecoveryStatus()}
                 onRetry={() => void handleRetryRecovery()}
                 onContinueSaved={handleContinueSavedSale}
+                onViewSavedReceipt={handleViewSavedReceiptFromRecovery}
                 onOpenPriorDaySettle={handleOpenPriorDaySettleFromRecovery}
                 onContinueSettled={handleContinueSettledSale}
                 onDismissCancelled={handleDismissCancelledRecovery}
+                onCancelUnpaid={(ref) => void handleCancelUnpaidFromRecovery(ref)}
+                onCloseServerInspection={
+                  activeRecovery.source === "server" ? handleCloseServerInspection : undefined
+                }
               />
             </>
           ) : (
@@ -2168,242 +2394,289 @@ export function PosPage() {
                 )}
 
                 {lastClosedSummary && dayStatus?.state === "CLOSED" && (
-                <TemporaryNotice
-                  occurrenceId={lastClosedSummary.id}
-                  duration="detailed"
-                  className="callout callout--success"
-                  role="status"
-                  closeLabel="Close day summary"
-                  onDismiss={() => setLastClosedSummary(null)}
-                >
-                  <p className="callout__title">Business day {lastClosedSummary.data.businessDate} closed</p>
-                  <p className="callout__body">
-                    Recorded {lastClosedSummary.data.validTransactionCount} valid transaction
-                    {lastClosedSummary.data.validTransactionCount === 1 ? "" : "s"} totaling{" "}
-                    {formatCentavos(lastClosedSummary.data.totalSalesCentavos)} (
-                    {formatLiters(lastClosedSummary.data.totalVolumeLiters)}).
-                  </p>
-                </TemporaryNotice>
-              )}
+                  <TemporaryNotice
+                    occurrenceId={lastClosedSummary.id}
+                    duration="detailed"
+                    className="callout callout--success"
+                    role="status"
+                    closeLabel="Close day summary"
+                    onDismiss={() => setLastClosedSummary(null)}
+                  >
+                    <p className="callout__title">Business day {lastClosedSummary.data.businessDate} closed</p>
+                    <p className="callout__body">
+                      Recorded {lastClosedSummary.data.validTransactionCount} valid transaction
+                      {lastClosedSummary.data.validTransactionCount === 1 ? "" : "s"} totaling{" "}
+                      {formatCentavos(lastClosedSummary.data.totalSalesCentavos)} (
+                      {formatLiters(lastClosedSummary.data.totalVolumeLiters)}).
+                    </p>
+                  </TemporaryNotice>
+                )}
 
-              {lastAlreadySavedPriorDay && (
-                <TemporaryNotice
-                  occurrenceId={lastAlreadySavedPriorDay.id}
-                  duration="detailed"
-                  className="callout callout--success"
-                  role="status"
-                  closeLabel="Close prior-day confirmation"
-                  onDismiss={() => setLastAlreadySavedPriorDay(null)}
-                >
-                  <p className="callout__title">
-                    Original sale {lastAlreadySavedPriorDay.data.reference} was already saved
-                  </p>
-                  <p className="callout__body">
-                    Already delivered — do not refill or hand over again, and collect no further payment. No
-                    duplicate settlement was created; original receipt from{" "}
-                    {lastAlreadySavedPriorDay.data.businessDate} for{" "}
-                    {formatCentavos(lastAlreadySavedPriorDay.data.totalCentavos)} (
-                    {formatCentavos(lastAlreadySavedPriorDay.data.cashReceivedCentavos)} received,{" "}
-                    {formatCentavos(lastAlreadySavedPriorDay.data.changeCentavos)} change,{" "}
-                    {lastAlreadySavedPriorDay.data.totalContainers} container
-                    {lastAlreadySavedPriorDay.data.totalContainers === 1 ? "" : "s"} ·{" "}
-                    {formatLiters(lastAlreadySavedPriorDay.data.totalVolumeLiters)}).
-                  </p>
-                  <div className="callout__actions">
-                    <button
-                      type="button"
-                      className="button button--ghost button--sm"
-                      onClick={() => {
-                        setHistorySettlementFocusRef(null);
-                        setHistoryFocusRef(lastAlreadySavedPriorDay.data.reference);
-                        switchPosTab("history");
-                      }}
-                    >
-                      View original receipt in History
-                    </button>
-                  </div>
-                </TemporaryNotice>
-              )}
-
-              {lastSettledPriorDay && (
-                <TemporaryNotice
-                  occurrenceId={lastSettledPriorDay.id}
-                  duration="detailed"
-                  className="callout callout--success"
-                  role="status"
-                  closeLabel="Close settlement confirmation"
-                  onDismiss={() => setLastSettledPriorDay(null)}
-                >
-                  <p className="callout__title">
-                    {isPriorDayMerchandiseOnly(lastSettledPriorDay.data.items)
-                      ? `Prior-day merchandise ${lastSettledPriorDay.data.checkoutReference} settled`
-                      : `Prior-day refill ${lastSettledPriorDay.data.checkoutReference} settled`}
-                  </p>
-                  <p className="callout__body">
-                    Net amount kept {formatCentavos(lastSettledPriorDay.data.netAmountKeptCentavos)} · Original payment
-                    date {lastSettledPriorDay.data.originalBusinessDate} · Settlement date (Manila){" "}
-                    {lastSettledPriorDay.data.settlementDate}. No further payment collected; recorded separately from{" "}
-                    {isPriorDayMerchandiseOnly(lastSettledPriorDay.data.items)
-                      ? "today's sales."
-                      : "today's refill sales."}
-                  </p>
-                  <div className="callout__actions">
-                    <button
-                      type="button"
-                      className="button button--ghost button--sm"
-                      onClick={() => {
-                        setHistoryFocusRef(null);
-                        setHistorySettlementFocusRef(lastSettledPriorDay.data.checkoutReference);
-                        switchPosTab("history");
-                      }}
-                    >
-                      View in History
-                    </button>
-                  </div>
-                </TemporaryNotice>
-              )}
-
-              {dayStatus && dayStatus.state !== "OPEN" && (
-                <div
-                  className={`callout ${dayStatus.state === "PREVIOUS_DAY_OPEN" ? "callout--warning" : "callout--info"
-                    }`}
-                  role="status"
-                >
-                  <p className="callout__title">
-                    {dayStatus.state === "NOT_STARTED"
-                      ? "Today's station day is not started"
-                      : dayStatus.state === "PREVIOUS_DAY_OPEN"
-                        ? `Previous day (${dayStatus.day?.businessDate}) is still open`
-                        : "Today's business day is closed"}
-                  </p>
-                  <p className="callout__body">
-                    {dayStatus.state === "NOT_STARTED"
-                      ? "Start the station day before selecting refills or receiving cash."
-                      : dayStatus.state === "PREVIOUS_DAY_OPEN"
-                        ? "Review and close the open previous day before starting today's sales."
-                        : "Sales are locked for today. You can still view Transaction History."}
-                  </p>
-                  <div className="callout__actions">
-                    {dayStatus.canStartDay && (
-                      <button
-                        type="button"
-                        className="button button--primary button--sm"
-                        disabled={startingDay}
-                        onClick={() => void handleStartDay()}
-                      >
-                        {startingDay ? "Starting day…" : "Start Day"}
-                      </button>
-                    )}
-                    {dayStatus.canEndDay && (
-                      <button
-                        type="button"
-                        className="button button--primary button--sm"
-                        onClick={() => void openEndDayModal()}
-                      >
-                        Review &amp; Close Previous Day
-                      </button>
-                    )}
-                    {dayStatus.state === "CLOSED" && (
+                {lastAlreadySavedPriorDay && (
+                  <TemporaryNotice
+                    occurrenceId={lastAlreadySavedPriorDay.id}
+                    duration="detailed"
+                    className="callout callout--success"
+                    role="status"
+                    closeLabel="Close prior-day confirmation"
+                    onDismiss={() => setLastAlreadySavedPriorDay(null)}
+                  >
+                    <p className="callout__title">
+                      Original sale {lastAlreadySavedPriorDay.data.reference} was already saved
+                    </p>
+                    <p className="callout__body">
+                      Already delivered — do not refill or hand over again, and collect no further payment. No
+                      duplicate settlement was created; original receipt from{" "}
+                      {lastAlreadySavedPriorDay.data.businessDate} for{" "}
+                      {formatCentavos(lastAlreadySavedPriorDay.data.totalCentavos)} (
+                      {formatCentavos(lastAlreadySavedPriorDay.data.cashReceivedCentavos)} received,{" "}
+                      {formatCentavos(lastAlreadySavedPriorDay.data.changeCentavos)} change,{" "}
+                      {lastAlreadySavedPriorDay.data.totalContainers} container
+                      {lastAlreadySavedPriorDay.data.totalContainers === 1 ? "" : "s"} ·{" "}
+                      {formatLiters(lastAlreadySavedPriorDay.data.totalVolumeLiters)}).
+                    </p>
+                    <div className="callout__actions">
                       <button
                         type="button"
                         className="button button--ghost button--sm"
-                        onClick={() => switchPosTab("history")}
+                        onClick={() => {
+                          setHistorySettlementFocusRef(null);
+                          setHistoryFocusRef(lastAlreadySavedPriorDay.data.reference);
+                          switchPosTab("history");
+                        }}
                       >
-                        Open Transaction History
+                        View original receipt in History
                       </button>
-                    )}
-                  </div>
-                </div>
-              )}
+                    </div>
+                  </TemporaryNotice>
+                )}
 
-              {step === "select" && serverOnlyUnresolved.length > 0 && (
-                <div className="callout callout--warning" role="status">
-                  <p className="callout__title">Cash-protected checkout(s) awaiting completion or review</p>
-                  <div className="callout__body">
-                    {serverOnlyUnresolved.map((c) => {
-                      const canResumeHere =
-                        c.status === "PAYMENT_PENDING" &&
-                        c.createdBy.toLowerCase() === user.username.toLowerCase() &&
-                        dayStatus?.state === "OPEN" &&
-                        c.businessDate === dayStatus.todayDate;
-                      const isPriorDay = Boolean(
-                        dayStatus?.todayDate && c.businessDate < dayStatus.todayDate,
-                      );
-                      const canSettleHere =
-                        user.role === "OWNER" &&
-                        isPriorDay &&
-                        isPriorDaySettleableComposition(c.items) &&
-                        (c.status === "REVIEW_REQUIRED" || c.status === "PAYMENT_PENDING");
-                      return (
+                {lastSettledPriorDay && (
+                  <TemporaryNotice
+                    occurrenceId={lastSettledPriorDay.id}
+                    duration="detailed"
+                    className="callout callout--success"
+                    role="status"
+                    closeLabel="Close settlement confirmation"
+                    onDismiss={() => setLastSettledPriorDay(null)}
+                  >
+                    <p className="callout__title">
+                      {isPriorDayMerchandiseOnly(lastSettledPriorDay.data.items)
+                        ? `Prior-day merchandise ${lastSettledPriorDay.data.checkoutReference} settled`
+                        : `Prior-day refill ${lastSettledPriorDay.data.checkoutReference} settled`}
+                    </p>
+                    <p className="callout__body">
+                      Net amount kept {formatCentavos(lastSettledPriorDay.data.netAmountKeptCentavos)} · Original payment
+                      date {lastSettledPriorDay.data.originalBusinessDate} · Settlement date (Manila){" "}
+                      {lastSettledPriorDay.data.settlementDate}. No further payment collected; recorded separately from{" "}
+                      {isPriorDayMerchandiseOnly(lastSettledPriorDay.data.items)
+                        ? "today's sales."
+                        : "today's refill sales."}
+                    </p>
+                    <div className="callout__actions">
+                      <button
+                        type="button"
+                        className="button button--ghost button--sm"
+                        onClick={() => {
+                          setHistoryFocusRef(null);
+                          setHistorySettlementFocusRef(lastSettledPriorDay.data.checkoutReference);
+                          switchPosTab("history");
+                        }}
+                      >
+                        View in History
+                      </button>
+                    </div>
+                  </TemporaryNotice>
+                )}
+
+                {dayStatus && dayStatus.state !== "OPEN" && (
+                  <div
+                    className={`callout ${dayStatus.state === "PREVIOUS_DAY_OPEN" ? "callout--warning" : "callout--info"
+                      }`}
+                    role="status"
+                  >
+                    <p className="callout__title">
+                      {dayStatus.state === "NOT_STARTED"
+                        ? "Today's station day is not started"
+                        : dayStatus.state === "PREVIOUS_DAY_OPEN"
+                          ? `Previous day (${dayStatus.day?.businessDate}) is still open`
+                          : "Today's business day is closed"}
+                    </p>
+                    <p className="callout__body">
+                      {dayStatus.state === "NOT_STARTED"
+                        ? "Start the station day before selecting refills or receiving cash."
+                        : dayStatus.state === "PREVIOUS_DAY_OPEN"
+                          ? "Review and close the open previous day before starting today's sales."
+                          : "Sales are locked for today. You can still view Transaction History."}
+                    </p>
+                    <div className="callout__actions">
+                      {dayStatus.canStartDay && (
+                        <button
+                          type="button"
+                          className="button button--primary button--sm"
+                          disabled={startingDay}
+                          onClick={() => void handleStartDay()}
+                        >
+                          {startingDay ? "Starting day…" : "Start Day"}
+                        </button>
+                      )}
+                      {dayStatus.canEndDay && (
+                        <button
+                          type="button"
+                          className="button button--primary button--sm"
+                          onClick={() => void openEndDayModal()}
+                        >
+                          Review &amp; Close Previous Day
+                        </button>
+                      )}
+                      {dayStatus.state === "CLOSED" && (
+                        <button
+                          type="button"
+                          className="button button--ghost button--sm"
+                          onClick={() => switchPosTab("history")}
+                        >
+                          Open Transaction History
+                        </button>
+                      )}
+                    </div>
+                  </div>
+                )}
+
+                {step === "select" && serverOnlyUnresolved.length > 0 && (
+                  <div className="callout callout--warning" role="status">
+                    <p className="callout__title">Cash-protected checkout(s) awaiting completion or review</p>
+                    <div className="callout__body">
+                      {serverOnlyUnresolved.map((c) => {
+                        const ownedByMe =
+                          c.ownedByCurrentUser ??
+                          c.createdBy.toLowerCase() === user.username.toLowerCase();
+                        const canCheckHere = c.status === "PAYMENT_PENDING" && ownedByMe;
+                        const isPriorDay = Boolean(
+                          dayStatus?.todayDate && c.businessDate < dayStatus.todayDate,
+                        );
+                        const canSettleHere =
+                          user.role === "OWNER" &&
+                          isPriorDay &&
+                          isPriorDaySettleableComposition(c.items) &&
+                          (c.status === "REVIEW_REQUIRED" || c.status === "PAYMENT_PENDING");
+                        return (
+                          <div key={c.reference} className="pos-unresolved-row">
+                            <span>
+                              <strong className="mono-ref">{c.reference}</strong> ·{" "}
+                              {formatCentavos(c.totalCentavos)} ({c.createdBy}, original date{" "}
+                              {c.businessDate}) —{" "}
+                              {c.status === "PAYMENT_PENDING"
+                                ? ownedByMe
+                                  ? isPriorDay
+                                    ? "Prior-day payment pending verification"
+                                    : "Cash payment started"
+                                  : isPriorDay
+                                    ? "Prior-day payment pending Owner review"
+                                    : "Started by another operator"
+                                : c.resolutionReason ?? "Owner review required"}
+                            </span>
+                            {(canCheckHere || canSettleHere) && (
+                              <span className="callout__actions">
+                                {canCheckHere && (
+                                  <button
+                                    type="button"
+                                    className="button button--primary button--sm"
+                                    onClick={() => handleInspectServerCheckout(c)}
+                                  >
+                                    Check transaction status
+                                  </button>
+                                )}
+                                {canSettleHere && (
+                                  <button
+                                    type="button"
+                                    className="button button--ghost button--sm"
+                                    onClick={() => openPriorDaySettleForCheckout(c)}
+                                  >
+                                    Review prior-day checkout
+                                  </button>
+                                )}
+                              </span>
+                            )}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {step === "select" && serverOnlyClosedPriorDayReview.length > 0 && (
+                  <div className="callout callout--warning" role="status">
+                    <p className="callout__title">Closed prior-day checkout(s) awaiting Owner review</p>
+                    <div className="callout__body">
+                      {serverOnlyClosedPriorDayReview.map((c) => (
                         <div key={c.reference} className="pos-unresolved-row">
                           <span>
                             <strong className="mono-ref">{c.reference}</strong> ·{" "}
-                            {formatCentavos(c.totalCentavos)} ({c.createdBy}, original date{" "}
-                            {c.businessDate}) —{" "}
-                            {c.status === "PAYMENT_PENDING"
-                              ? canResumeHere
-                                ? "Cash payment started"
-                                : isPriorDay
-                                  ? "Prior-day payment pending Owner review"
-                                  : "Started by another operator"
-                              : c.resolutionReason ?? "Owner review required"}
+                            {formatCentavos(c.totalCentavos)} ({c.createdBy}, original date {c.businessDate}) —{" "}
+                            {c.resolutionReason ?? "Prior-day payment pending Owner review"}
                           </span>
-                          {(canResumeHere || canSettleHere) && (
+                          {user.role === "OWNER" && isPriorDaySettleableComposition(c.items) && (
                             <span className="callout__actions">
-                              {canResumeHere && (
-                                <button
-                                  type="button"
-                                  className="button button--ghost button--sm"
-                                  onClick={() => handleResumeServerPending(c)}
-                                >
-                                  Resume cash payment
-                                </button>
-                              )}
-                              {canSettleHere && (
-                                <button
-                                  type="button"
-                                  className="button button--primary button--sm"
-                                  onClick={() => openPriorDaySettleForCheckout(c)}
-                                >
-                                  Review prior-day checkout
-                                </button>
-                              )}
+                              <button
+                                type="button"
+                                className="button button--primary button--sm"
+                                onClick={() => openPriorDaySettleForCheckout(c)}
+                              >
+                                Review prior-day checkout
+                              </button>
                             </span>
                           )}
                         </div>
-                      );
-                    })}
+                      ))}
+                    </div>
                   </div>
-                </div>
-              )}
+                )}
 
-              {step === "select" && serverOnlyClosedPriorDayReview.length > 0 && (
-                <div className="callout callout--warning" role="status">
-                  <p className="callout__title">Closed prior-day checkout(s) awaiting Owner review</p>
-                  <div className="callout__body">
-                    {serverOnlyClosedPriorDayReview.map((c) => (
-                      <div key={c.reference} className="pos-unresolved-row">
-                        <span>
-                          <strong className="mono-ref">{c.reference}</strong> ·{" "}
-                          {formatCentavos(c.totalCentavos)} ({c.createdBy}, original date {c.businessDate}) —{" "}
-                          {c.resolutionReason ?? "Prior-day payment pending Owner review"}
-                        </span>
-                        {user.role === "OWNER" && isPriorDaySettleableComposition(c.items) && (
-                          <span className="callout__actions">
-                            <button
-                              type="button"
-                              className="button button--primary button--sm"
-                              onClick={() => openPriorDaySettleForCheckout(c)}
-                            >
-                              Review prior-day checkout
-                            </button>
-                          </span>
-                        )}
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
+                {step === "select" && (
+                  <form
+                    className="callout callout--info"
+                    aria-label="Check transaction status by reference"
+                    onSubmit={(event) => void handleLookupByReference(event)}
+                  >
+                    <p className="callout__title">Check an uncertain transaction on another device</p>
+                    <p className="callout__body">
+                      If cash was taken on another device and you are unsure whether the sale saved, check the original
+                      reference before taking any further payment.
+                    </p>
+                    <div className="pos-unresolved-row">
+                      <input
+                        type="text"
+                        aria-label="Transaction reference to check"
+                        placeholder="e.g. HD-1125-001"
+                        value={lookupRefInput}
+                        disabled={lookupSubmitting}
+                        onChange={(event) => {
+                          setLookupRefInput(event.target.value);
+                          setLookupInputError(null);
+                        }}
+                      />
+                      <button
+                        type="submit"
+                        className="button button--ghost button--sm"
+                        disabled={lookupSubmitting || !lookupRefInput.trim()}
+                      >
+                        {lookupSubmitting ? "Checking…" : "Check transaction status"}
+                      </button>
+                    </div>
+                    {lookupInputError && (
+                      <TemporaryNotice
+                        occurrenceId={lookupInputError.id}
+                        duration="brief"
+                        className="alert alert--error"
+                        role="alert"
+                        closeLabel="Close reference check error"
+                        onDismiss={() => setLookupInputError(null)}
+                      >
+                        {lookupInputError.data}
+                      </TemporaryNotice>
+                    )}
+                  </form>
+                )}
               </div>
 
               {step === "select" ? (
@@ -2641,13 +2914,12 @@ export function PosPage() {
                                   <h3>{pkg.name}</h3>
                                   <p className="muted-sm">{pkg.description}</p>
                                   <p
-                                    className={`pos-stock-note ${
-                                      pkg.stockStatus === "NOT_SET"
+                                    className={`pos-stock-note ${pkg.stockStatus === "NOT_SET"
                                         ? "pos-stock-note--warn"
                                         : (pkg.availableQuantity ?? 0) === 0 || shapeRemaining === 0
                                           ? "pos-stock-note--out"
                                           : ""
-                                    }`}
+                                      }`}
                                   >
                                     {stockLabel}
                                   </p>
@@ -2818,13 +3090,12 @@ export function PosPage() {
                                   <h3>{item.name}</h3>
                                   {item.description && <p className="muted-sm">{item.description}</p>}
                                   <p
-                                    className={`pos-stock-note ${
-                                      item.stockStatus === "NOT_SET"
+                                    className={`pos-stock-note ${item.stockStatus === "NOT_SET"
                                         ? "pos-stock-note--warn"
                                         : item.stockStatus === "OUT_OF_STOCK" || available === 0
                                           ? "pos-stock-note--out"
                                           : ""
-                                    }`}
+                                      }`}
                                   >
                                     {stockLabel}
                                   </p>
@@ -2901,8 +3172,8 @@ export function PosPage() {
                                   <span className="muted-sm">
                                     {line.quantity} × {formatCentavos(line.unitPriceCentavos)}
                                     {line.kind === "STANDARD" ||
-                                    line.kind === "CUSTOM" ||
-                                    (line.kind === "CONTAINER_PACKAGE" && line.unitVolumeLiters > 0)
+                                      line.kind === "CUSTOM" ||
+                                      (line.kind === "CONTAINER_PACKAGE" && line.unitVolumeLiters > 0)
                                       ? ` · ${formatLiters(line.unitVolumeLiters * line.quantity)}`
                                       : ""}
                                   </span>
@@ -3274,7 +3545,7 @@ export function PosPage() {
                                   item.kind === "MERCHANDISE" || item.kind === "CONTAINER_PACKAGE",
                               )
                               .reduce((sum, item) => sum + item.quantity, 0) ||
-                              (preparedCheckout ? 0 : cartTotals.totalMerchandiseQty),
+                            (preparedCheckout ? 0 : cartTotals.totalMerchandiseQty),
                           )}
                         </span>
                       </div>
@@ -3287,8 +3558,8 @@ export function PosPage() {
                               <span className="muted-sm">
                                 {item.quantity} × {formatCentavos(item.unitPriceCentavos)}
                                 {item.kind === "STANDARD" ||
-                                item.kind === "CUSTOM" ||
-                                (item.kind === "CONTAINER_PACKAGE" && item.lineVolumeLiters > 0)
+                                  item.kind === "CUSTOM" ||
+                                  (item.kind === "CONTAINER_PACKAGE" && item.lineVolumeLiters > 0)
                                   ? ` · ${formatLiters(item.lineVolumeLiters)}`
                                   : ""}
                               </span>

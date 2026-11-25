@@ -62,6 +62,8 @@ export function authenticate(
       if (token) clearSessionCookie(res, settings);
       if (result.reason === "SESSION_EXPIRED") {
         sendError(res, 401, "SESSION_EXPIRED", "Your session has ended. Please sign in again.");
+      } else if (result.reason === "SESSION_REPLACED") {
+        sendError(res, 401, "SESSION_REPLACED", "Your account was signed in on another device.");
       } else {
         sendError(res, 401, "UNAUTHENTICATED", "Please sign in.");
       }

@@ -271,6 +271,87 @@ describe("shared sign-in and module entry", () => {
       expect(ended.status).toBe(401);
       expect(ended.body.error.code).toBe("SESSION_EXPIRED");
     });
+
+    it("a successful sign-in replaces only earlier sessions for that account", async () => {
+      const ownerA = await activatedAccount(ctx, "owner1", "OWNER");
+      const cashier = await activatedAccount(ctx, "cashier1", "CASHIER");
+
+      // Failed password preserves the active session on Device A.
+      const failed = await request(ctx.app)
+        .post("/api/auth/login")
+        .send({ username: "owner1", password: "wrong-password" });
+      expect(failed.status).toBe(401);
+      expect((await request(ctx.app).get("/api/modules").set("Cookie", ownerA.cookie)).status).toBe(200);
+
+      // Separate cookie jar for Device B signs in as owner1.
+      const ownerB = await signIn(ctx.app, "owner1", ownerA.password);
+      expect((await request(ctx.app).get("/api/modules").set("Cookie", ownerB.cookie)).status).toBe(200);
+      expect((await request(ctx.app).get("/api/modules").set("Cookie", cashier.cookie)).status).toBe(200);
+
+      // Device A's first protected GET and representative write are rejected with SESSION_REPLACED.
+      const getReplaced = await request(ctx.app).get("/api/modules").set("Cookie", ownerA.cookie);
+      expect(getReplaced.status).toBe(401);
+      expect(getReplaced.body.error.code).toBe("SESSION_REPLACED");
+      expect(getReplaced.body.error.message).toBe("Your account was signed in on another device.");
+
+      const writeReplaced = await request(ctx.app)
+        .post("/api/auth/activity")
+        .set("Cookie", ownerA.cookie)
+        .set("X-CSRF-Token", ownerA.csrfToken);
+      expect(writeReplaced.status).toBe(401);
+      expect(writeReplaced.body.error.code).toBe("SESSION_REPLACED");
+
+      // Delayed logout from Device A fails cleanly and never ends Device B's session.
+      const delayedLogout = await request(ctx.app)
+        .post("/api/auth/logout")
+        .set("Cookie", ownerA.cookie)
+        .set("X-CSRF-Token", ownerA.csrfToken);
+      expect(delayedLogout.status).toBe(401);
+      expect(delayedLogout.body.error.code).toBe("SESSION_REPLACED");
+      expect((await request(ctx.app).get("/api/modules").set("Cookie", ownerB.cookie)).status).toBe(200);
+
+      // Password rotation on Device B revokes Device B's old session and issues a new one; Device A remains revoked.
+      const rotatedPassword = randomPassword();
+      const changed = await request(ctx.app)
+        .post("/api/auth/password")
+        .set("Cookie", ownerB.cookie)
+        .set("X-CSRF-Token", ownerB.csrfToken)
+        .send({ currentPassword: ownerA.password, newPassword: rotatedPassword });
+      expect(changed.status).toBe(200);
+      const ownerBNextCookie = sessionCookie(changed);
+      expect((await request(ctx.app).get("/api/modules").set("Cookie", ownerBNextCookie)).status).toBe(200);
+      expect((await request(ctx.app).get("/api/modules").set("Cookie", ownerB.cookie)).status).toBe(401);
+      expect((await request(ctx.app).get("/api/modules").set("Cookie", ownerA.cookie)).status).toBe(401);
+      expect((await request(ctx.app).post("/api/auth/login").send({ username: "owner1", password: ownerA.password })).status).toBe(401);
+    });
+
+    it("simultaneous logins leave exactly one usable session", async () => {
+      const owner = await activatedAccount(ctx, "owner1", "OWNER");
+      const results = await Promise.all([
+        signIn(ctx.app, "owner1", owner.password),
+        signIn(ctx.app, "owner1", owner.password),
+        signIn(ctx.app, "owner1", owner.password),
+      ]);
+
+      const { rows } = await ctx.db.query<{ active_count: string }>(
+        `SELECT count(*)::text AS active_count
+           FROM auth_sessions s
+           JOIN app_users u ON u.id = s.user_id
+          WHERE u.username_key = 'owner1' AND s.revoked_at IS NULL`,
+      );
+      expect(Number(rows[0]!.active_count)).toBe(1);
+
+      const checks = await Promise.all(
+        results.map((s) => request(ctx.app).get("/api/auth/session").set("Cookie", s.cookie)),
+      );
+      const okCount = checks.filter((res) => res.status === 200).length;
+      const replaced = checks.filter((res) => res.status === 401);
+      expect(okCount).toBe(1);
+      expect(replaced).toHaveLength(2);
+      for (const res of replaced) {
+        expect(res.body.error.code).toBe("SESSION_REPLACED");
+      }
+    });
   });
 
   describe("request protection", () => {

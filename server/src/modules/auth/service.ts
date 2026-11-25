@@ -45,7 +45,7 @@ export type LoginResult =
 
 export type AuthenticateResult =
   | { ok: true; session: ActiveSession }
-  | { ok: false; reason: "UNAUTHENTICATED" | "SESSION_EXPIRED" };
+  | { ok: false; reason: "UNAUTHENTICATED" | "SESSION_EXPIRED" | "SESSION_REPLACED" };
 
 export type ChangePasswordResult =
   | { ok: true; session: IssuedSession }
@@ -121,13 +121,23 @@ export class AuthService {
     }
 
     const session = await this.db.transaction(async (tx) => {
+      const currentUser = await repo.lockUserById(tx, user.id);
+      if (!currentUser || currentUser.disabledAt || currentUser.passwordHash !== user.passwordHash) {
+        return null;
+      }
       await repo.clearThrottle(tx, keys[0]!);
       if (input.replacingToken) {
         const previous = await repo.findSessionByTokenHash(tx, hashToken(input.replacingToken));
-        if (previous) await repo.revokeSession(tx, previous.session.id, now, "replaced_by_login");
+        if (previous && previous.session.userId !== currentUser.id) {
+          await repo.revokeSession(tx, previous.session.id, now, "replaced_by_login");
+        }
       }
-      return this.issueSession(tx, user, now);
+      await repo.revokeUserSessions(tx, currentUser.id, now, "replaced_by_newer_login");
+      return this.issueSession(tx, currentUser, now);
     });
+    if (!session) {
+      return { ok: false, reason: "INVALID_CREDENTIALS" };
+    }
     return { ok: true, session };
   }
 
@@ -138,7 +148,13 @@ export class AuthService {
   async authenticate(token: string | undefined, now: Date, background: boolean): Promise<AuthenticateResult> {
     if (!token) return { ok: false, reason: "UNAUTHENTICATED" };
     const found = await repo.findSessionByTokenHash(this.db, hashToken(token));
-    if (!found || found.session.revokedAt) return { ok: false, reason: "UNAUTHENTICATED" };
+    if (!found) return { ok: false, reason: "UNAUTHENTICATED" };
+    if (found.session.revokedAt) {
+      if (found.session.revokeReason === "replaced_by_newer_login") {
+        return { ok: false, reason: "SESSION_REPLACED" };
+      }
+      return { ok: false, reason: "UNAUTHENTICATED" };
+    }
     const { session, user } = found;
 
     if (user.disabledAt) {
@@ -193,10 +209,17 @@ export class AuthService {
 
     const passwordHash = await hashPassword(input.newPassword);
     const session = await this.db.transaction(async (tx) => {
-      await repo.setPassword(tx, user.id, passwordHash, false, now);
-      await repo.revokeUserSessions(tx, user.id, now, "password_changed");
-      return this.issueSession(tx, { ...user, mustChangePassword: false }, now);
+      const currentUser = await repo.lockUserById(tx, user.id);
+      if (!currentUser || currentUser.disabledAt || currentUser.passwordHash !== user.passwordHash) {
+        return null;
+      }
+      await repo.setPassword(tx, currentUser.id, passwordHash, false, now);
+      await repo.revokeUserSessions(tx, currentUser.id, now, "password_changed");
+      return this.issueSession(tx, { ...currentUser, mustChangePassword: false }, now);
     });
+    if (!session) {
+      return { ok: false, reason: "INVALID_CURRENT_PASSWORD" };
+    }
     return { ok: true, session };
   }
 

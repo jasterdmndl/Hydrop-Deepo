@@ -18,6 +18,7 @@ export interface SessionRecord {
   lastActivityAt: Date;
   absoluteExpiresAt: Date;
   revokedAt: Date | null;
+  revokeReason: string | null;
 }
 
 export interface ThrottleRecord {
@@ -34,7 +35,7 @@ const USER_COLUMNS = `
 const SESSION_COLUMNS = `
   s.id, s.user_id AS "userId", s.csrf_token AS "csrfToken", s.created_at AS "createdAt",
   s.last_activity_at AS "lastActivityAt", s.absolute_expires_at AS "absoluteExpiresAt",
-  s.revoked_at AS "revokedAt"`;
+  s.revoked_at AS "revokedAt", s.revoke_reason AS "revokeReason"`;
 
 /** PostgreSQL adapter for accounts, sessions and sign-in throttling. */
 export const authRepository = {
@@ -42,6 +43,14 @@ export const authRepository = {
     const { rows } = await db.query<UserRecord>(
       `SELECT ${USER_COLUMNS} FROM app_users u WHERE u.username_key = lower($1)`,
       [username],
+    );
+    return rows[0];
+  },
+
+  async lockUserById(db: Queryable, userId: string): Promise<UserRecord | undefined> {
+    const { rows } = await db.query<UserRecord>(
+      `SELECT ${USER_COLUMNS} FROM app_users u WHERE u.id = $1 FOR UPDATE`,
+      [userId],
     );
     return rows[0];
   },
