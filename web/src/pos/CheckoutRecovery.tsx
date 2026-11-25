@@ -1,3 +1,4 @@
+import { useEffect, useState } from "react";
 import { type NoticeEnvelope } from "../notifications/noticeTiming";
 import { TemporaryNotice } from "../notifications/TemporaryNotice";
 import {
@@ -31,6 +32,7 @@ export interface CheckoutRecoveryProps {
   onContinueSaved(reference: string, sale: SaleView): void;
   onOpenPriorDaySettle?: (record: PendingCheckoutRecovery) => void;
   onContinueSettled?: (reference: string, settlement: PriorDaySettlementView) => void;
+  onDismissCancelled?: (reference: string) => void;
 }
 
 function pillClassForTone(tone: RecoveryTone): string {
@@ -111,6 +113,7 @@ export function CheckoutRecovery({
   onContinueSaved,
   onOpenPriorDaySettle,
   onContinueSettled,
+  onDismissCancelled,
 }: CheckoutRecoveryProps) {
   const effectiveTodayDate = reconcileRecoveryTodayDate(todayDate, record.lastLookup?.checkedAt);
   const presentation = resolveRecoveryPresentation(
@@ -119,6 +122,11 @@ export function CheckoutRecovery({
     currentUserRole,
     effectiveTodayDate,
   );
+  const [confirmNoCashCancelled, setConfirmNoCashCancelled] = useState(false);
+
+  useEffect(() => {
+    setConfirmNoCashCancelled(false);
+  }, [record.reference, presentation.screen]);
 
   return (
     <div className="pos-layout">
@@ -338,6 +346,44 @@ export function CheckoutRecovery({
                   Continue with settled record
                 </button>
               )}
+
+            {presentation.screen === "CANCELLED" &&
+              presentation.canDismissCancelled &&
+              onDismissCancelled && (
+                <>
+                  <label className="checkbox-field">
+                    <input
+                      type="checkbox"
+                      checked={confirmNoCashCancelled}
+                      disabled={checking || retrying}
+                      onChange={(event) => setConfirmNoCashCancelled(event.target.checked)}
+                    />
+                    <span>Confirm no cash was received for this cancelled checkout</span>
+                  </label>
+                  <button
+                    type="button"
+                    className="button button--primary button--block"
+                    disabled={!confirmNoCashCancelled || checking || retrying}
+                    onClick={() => onDismissCancelled(record.reference)}
+                  >
+                    Return to New Sale
+                  </button>
+                  <button
+                    type="button"
+                    className="button button--ghost button--block"
+                    aria-busy={checking}
+                    disabled={checking || retrying}
+                    onClick={onCheckStatus}
+                  >
+                    {checking ? "Checking status…" : "Check transaction status"}
+                  </button>
+                  <p className="muted-sm">
+                    Returning to New Sale clears only this reference from this browser&apos;s recovery list and
+                    keeps the cancelled server record and any other pending references intact. If cash was
+                    received, keep this reference for Owner review.
+                  </p>
+                </>
+              )}
           </div>
         </article>
 
@@ -389,13 +435,23 @@ export function CheckoutRecovery({
               <dd>{formatCentavos(presentation.amounts.totalCentavos)}</dd>
             </div>
             <div className="detail-list__row">
-              <dt>Cash received</dt>
+              <dt>
+                {presentation.screen === "CANCELLED"
+                  ? "Cash entered on this device"
+                  : "Cash received"}
+              </dt>
               <dd>{formatCentavos(presentation.amounts.cashReceivedCentavos)}</dd>
             </div>
             <div className="detail-list__row">
-              <dt>Change</dt>
+              <dt>{presentation.screen === "CANCELLED" ? "Calculated change" : "Change"}</dt>
               <dd>{formatCentavos(presentation.amounts.changeCentavos)}</dd>
             </div>
+            {presentation.screen === "CANCELLED" && (
+              <div className="detail-list__row">
+                <dt>Server payment record</dt>
+                <dd>None recorded</dd>
+              </div>
+            )}
           </dl>
         </article>
 

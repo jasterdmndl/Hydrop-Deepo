@@ -30,7 +30,8 @@ export type RecoveryState =
   | "SAFE_TO_RETRY"
   | "UNRESOLVED"
   | "REVIEW_REQUIRED"
-  | "SETTLED_PRIOR_DAY";
+  | "SETTLED_PRIOR_DAY"
+  | "CANCELLED";
 
 export interface CatalogRefill {
   code: string;
@@ -228,6 +229,7 @@ export interface CheckoutLookupView {
   reason: string | null;
   canRetry: boolean;
   canSettlePriorDay?: boolean;
+  canDismissCancelled?: boolean;
   ownedByCurrentUser: boolean;
   checkedAt: string;
   checkout: CheckoutView;
@@ -351,7 +353,8 @@ export type RecoveryScreen =
   | "SAVED"
   | "SAFE_TO_RETRY"
   | "REVIEW_REQUIRED"
-  | "SETTLED_PRIOR_DAY";
+  | "SETTLED_PRIOR_DAY"
+  | "CANCELLED";
 export type RecoveryTone = "warning" | "success" | "danger" | "neutral";
 
 export interface RecoveryPresentation {
@@ -362,6 +365,7 @@ export interface RecoveryPresentation {
   canContinueSaved: boolean;
   canContinueSettled: boolean;
   canSettlePriorDay: boolean;
+  canDismissCancelled: boolean;
   blocksNewSale: boolean;
   statusPillLabel: string;
   statusPillTone: RecoveryTone;
@@ -829,6 +833,7 @@ export function resolveRecoveryPresentation(
       canContinueSaved: true,
       canContinueSettled: false,
       canSettlePriorDay: false,
+      canDismissCancelled: false,
       blocksNewSale: true,
       statusPillLabel: "Saved · verified",
       statusPillTone: "success",
@@ -867,6 +872,7 @@ export function resolveRecoveryPresentation(
       canContinueSaved: false,
       canContinueSettled: true,
       canSettlePriorDay: false,
+      canDismissCancelled: false,
       blocksNewSale: true,
       statusPillLabel: "Settled · prior day",
       statusPillTone: "success",
@@ -888,6 +894,47 @@ export function resolveRecoveryPresentation(
       checkedAt: lookup.checkedAt,
       sale: null,
       settlement,
+    };
+  }
+
+  if (
+    lookup &&
+    lookup.recoveryState === "CANCELLED" &&
+    lookup.canDismissCancelled === true &&
+    lookup.checkout.status === "CANCELLED_DRAFT" &&
+    lookup.checkout.cashReceivedCentavos === null &&
+    lookup.checkout.paymentRecordedAt === null
+  ) {
+    const serverTotal = lookup.checkout.totalCentavos;
+    const cancelReason = lookup.reason?.trim() || "No cash received";
+    return {
+      screen: "CANCELLED",
+      isDifferentAccount,
+      canCheckStatus: true,
+      canRetry: false,
+      canContinueSaved: false,
+      canContinueSettled: false,
+      canSettlePriorDay: false,
+      canDismissCancelled: true,
+      blocksNewSale: true,
+      statusPillLabel: "Cancelled",
+      statusPillTone: "neutral",
+      headline: "Checkout cancelled",
+      subline: `Transaction status checked at ${formatManilaTimeWithSeconds(lookup.checkedAt)}.`,
+      calloutTitle: "Cancelled before payment was recorded",
+      calloutBody: `The server verified an explicit unpaid cancellation (${cancelReason}) with no saved sale or recorded payment. Confirm no cash was received before returning to New Sale; if cash changed hands, keep this reference for Owner review.`,
+      calloutTone: "warning",
+      amounts: {
+        totalCentavos: serverTotal,
+        cashReceivedCentavos: localCash,
+        changeCentavos: localCash - serverTotal,
+        totalContainers: lookup.checkout.totalContainers,
+        totalVolumeLiters: lookup.checkout.totalVolumeLiters,
+        items: lookup.checkout.items,
+      },
+      checkedAt: lookup.checkedAt,
+      sale: null,
+      settlement: null,
     };
   }
 
@@ -916,6 +963,7 @@ export function resolveRecoveryPresentation(
       canContinueSaved: false,
       canContinueSettled: false,
       canSettlePriorDay,
+      canDismissCancelled: false,
       blocksNewSale: true,
       statusPillLabel: "Review required",
       statusPillTone: "danger",
@@ -954,6 +1002,7 @@ export function resolveRecoveryPresentation(
       canContinueSaved: false,
       canContinueSettled: false,
       canSettlePriorDay: false,
+      canDismissCancelled: false,
       blocksNewSale: true,
       statusPillLabel: "Not saved · verified",
       statusPillTone: "neutral",
@@ -1000,6 +1049,7 @@ export function resolveRecoveryPresentation(
     canContinueSaved: false,
     canContinueSettled: false,
     canSettlePriorDay: false,
+    canDismissCancelled: false,
     blocksNewSale: true,
     statusPillLabel: isDifferentAccount
       ? "Pending · other account"
@@ -1038,6 +1088,8 @@ export function formatRecoveryCheckFeedback(
       return `Status confirmed (${checkedTime}) — sale is already saved.`;
     case "SETTLED_PRIOR_DAY":
       return `Status confirmed (${checkedTime}) — prior-day settlement is already recorded.`;
+    case "CANCELLED":
+      return `Status confirmed (${checkedTime}) — checkout was cancelled with no payment recorded.`;
     case "SAFE_TO_RETRY":
       return `Status confirmed (${checkedTime}) — not saved yet. Safe to retry.`;
     case "REVIEW_REQUIRED":

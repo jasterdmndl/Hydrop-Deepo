@@ -1874,6 +1874,21 @@ export function PosPage() {
     void loadPosState();
   }
 
+  function handleDismissCancelledRecovery(reference: string) {
+    removePendingRecovery(reference);
+    clearMatchingPreparedCheckout(reference);
+    const remaining = loadPendingRecoveries();
+    setPendingRecoveries(remaining);
+    setSelectedRecoveryRef(remaining[0]?.reference ?? null);
+    setSettlementTarget(null);
+    setRecoveryStatusNotice(null);
+    setRecoveryError(null);
+    setLastSavedSale(null);
+    setLastAlreadySavedPriorDay(null);
+    setLastSettledPriorDay(null);
+    void loadPosState();
+  }
+
   function switchPosTab(nextTab: PosTab) {
     if (nextTab === tab) return;
     if (nextTab === "history") {
@@ -2098,6 +2113,7 @@ export function PosPage() {
                 onContinueSaved={handleContinueSavedSale}
                 onOpenPriorDaySettle={handleOpenPriorDaySettleFromRecovery}
                 onContinueSettled={handleContinueSettledSale}
+                onDismissCancelled={handleDismissCancelledRecovery}
               />
             </>
           ) : (

@@ -1298,4 +1298,103 @@ describe("account-scoped unpaid cart and workstation recovery storage", () => {
       "Status confirmed (12:01:08 AM) — save is still in progress.",
     );
   });
+
+  it("exposes Cancelled dismissal only when server verifies an explicit unpaid cancellation", () => {
+    const cancelledLookup = makeLookup({
+      recoveryState: "CANCELLED",
+      reason: "No cash received",
+      canRetry: false,
+      canSettlePriorDay: false,
+      canDismissCancelled: true,
+      ownedByCurrentUser: false,
+      checkedAt: "2026-11-25T10:05:12+08:00",
+      checkout: {
+        ...makeLookup({}).checkout,
+        reference: "HD-1124-001",
+        businessDate: "2026-11-24",
+        status: "CANCELLED_DRAFT",
+        cashReceivedCentavos: null,
+        changeCentavos: null,
+        paymentStartedAt: "2026-11-24T17:10:00+08:00",
+        paymentRecordedAt: null,
+        resolutionReason: "No cash received",
+      },
+    });
+    const record = makePendingRecord({
+      reference: "HD-1124-001",
+      businessDate: "2026-11-24",
+      lastLookup: cancelledLookup,
+    });
+
+    const ownerCancelled = resolveRecoveryPresentation(record, "owner1", "OWNER", "2026-11-25");
+    expect(ownerCancelled).toMatchObject({
+      screen: "CANCELLED",
+      canCheckStatus: true,
+      canRetry: false,
+      canContinueSaved: false,
+      canContinueSettled: false,
+      canSettlePriorDay: false,
+      canDismissCancelled: true,
+      statusPillLabel: "Cancelled",
+      headline: "Checkout cancelled",
+    });
+    expect(ownerCancelled.subline).toContain("10:05:12 AM");
+    expect(formatRecoveryCheckFeedback(cancelledLookup, ownerCancelled)).toBe(
+      "Status confirmed (10:05:12 AM) — checkout was cancelled with no payment recorded.",
+    );
+
+    const cashierCancelled = resolveRecoveryPresentation(record, "cashier2", "CASHIER", "2026-11-25");
+    expect(cashierCancelled.screen).toBe("CANCELLED");
+    expect(cashierCancelled.canDismissCancelled).toBe(true);
+
+    // Must NOT allow dismissal if canDismissCancelled is false/missing (e.g. AUTO_END_DAY / uncertain payment)
+    const blockedFlag = resolveRecoveryPresentation(
+      makePendingRecord({
+        ...record,
+        lastLookup: { ...cancelledLookup, canDismissCancelled: false },
+      }),
+      "owner1",
+      "OWNER",
+      "2026-11-25",
+    );
+    expect(blockedFlag.screen).toBe("UNKNOWN");
+    expect(blockedFlag.canDismissCancelled).toBe(false);
+
+    // Must NOT allow dismissal if paymentRecordedAt or cashReceivedCentavos is non-null
+    const paidCancelled = resolveRecoveryPresentation(
+      makePendingRecord({
+        ...record,
+        lastLookup: {
+          ...cancelledLookup,
+          checkout: {
+            ...cancelledLookup.checkout,
+            cashReceivedCentavos: 10000,
+            paymentRecordedAt: "2026-11-24T17:11:00+08:00",
+          },
+        },
+      }),
+      "owner1",
+      "OWNER",
+      "2026-11-25",
+    );
+    expect(paidCancelled.screen).toBe("UNKNOWN");
+    expect(paidCancelled.canDismissCancelled).toBe(false);
+
+    // REVIEW_REQUIRED with No cash received reason still stays in REVIEW_REQUIRED (not dismissible)
+    const reviewOnly = resolveRecoveryPresentation(
+      makePendingRecord({
+        ...record,
+        lastLookup: {
+          ...cancelledLookup,
+          recoveryState: "REVIEW_REQUIRED",
+          canDismissCancelled: false,
+        },
+      }),
+      "owner1",
+      "OWNER",
+      "2026-11-25",
+    );
+    expect(reviewOnly.screen).toBe("REVIEW_REQUIRED");
+    expect(reviewOnly.canDismissCancelled).toBe(false);
+  });
 });

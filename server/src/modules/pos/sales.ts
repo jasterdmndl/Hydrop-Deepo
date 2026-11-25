@@ -36,7 +36,8 @@ export type RecoveryState =
   | "SAFE_TO_RETRY"
   | "UNRESOLVED"
   | "REVIEW_REQUIRED"
-  | "SETTLED_PRIOR_DAY";
+  | "SETTLED_PRIOR_DAY"
+  | "CANCELLED";
 
 export const MAX_ITEMS_PER_SALE = 50;
 export const MAX_QUANTITY_PER_LINE = 500;
@@ -337,6 +338,7 @@ export interface CheckoutLookupView {
   reason: string | null;
   canRetry: boolean;
   canSettlePriorDay: boolean;
+  canDismissCancelled: boolean;
   ownedByCurrentUser: boolean;
   checkedAt: string;
   checkout: CheckoutView;
@@ -810,6 +812,7 @@ export function deriveCheckoutLookup(input: {
   checkout: CheckoutView;
   checkoutOwnerUserId: string;
   dayClosedAt: string | null;
+  cancellationOrigin?: "EXPLICIT_OPERATOR" | "AUTO_END_DAY" | null;
   sale: SaleView | null;
   settlement: PriorDaySettlementView | null;
   todayDate: string;
@@ -833,6 +836,7 @@ export function deriveCheckoutLookup(input: {
       reason: null,
       canRetry: false,
       canSettlePriorDay: false,
+      canDismissCancelled: false,
       ownedByCurrentUser,
       checkedAt: input.checkedAt,
       checkout: input.checkout,
@@ -847,6 +851,7 @@ export function deriveCheckoutLookup(input: {
       reason: "SETTLED_PRIOR_DAY_PAID_AND_DELIVERED",
       canRetry: false,
       canSettlePriorDay: false,
+      canDismissCancelled: false,
       ownedByCurrentUser,
       checkedAt: input.checkedAt,
       checkout: input.checkout,
@@ -861,6 +866,7 @@ export function deriveCheckoutLookup(input: {
       reason: "SAVE_IN_PROGRESS",
       canRetry: false,
       canSettlePriorDay: false,
+      canDismissCancelled: false,
       ownedByCurrentUser,
       checkedAt: input.checkedAt,
       checkout: input.inFlightEntry.checkoutView,
@@ -875,6 +881,7 @@ export function deriveCheckoutLookup(input: {
       reason: input.checkout.resolutionReason ?? "REVIEW_REQUIRED",
       canRetry: false,
       canSettlePriorDay,
+      canDismissCancelled: false,
       ownedByCurrentUser,
       checkedAt: input.checkedAt,
       checkout: input.checkout,
@@ -884,11 +891,30 @@ export function deriveCheckoutLookup(input: {
   }
 
   if (input.checkout.status === "CANCELLED_DRAFT") {
+    const isExplicitUnpaidCancellation =
+      input.cancellationOrigin === "EXPLICIT_OPERATOR" &&
+      input.checkout.cashReceivedCentavos === null &&
+      input.checkout.paymentRecordedAt === null;
+    if (isExplicitUnpaidCancellation) {
+      return {
+        recoveryState: "CANCELLED",
+        reason: input.checkout.resolutionReason ?? "CHECKOUT_CANCELLED",
+        canRetry: false,
+        canSettlePriorDay: false,
+        canDismissCancelled: true,
+        ownedByCurrentUser,
+        checkedAt: input.checkedAt,
+        checkout: input.checkout,
+        sale: null,
+        settlement: null,
+      };
+    }
     return {
       recoveryState: "REVIEW_REQUIRED",
       reason: input.checkout.resolutionReason ?? "CHECKOUT_CANCELLED",
       canRetry: false,
       canSettlePriorDay: false,
+      canDismissCancelled: false,
       ownedByCurrentUser,
       checkedAt: input.checkedAt,
       checkout: input.checkout,
@@ -903,6 +929,7 @@ export function deriveCheckoutLookup(input: {
       reason: "DAY_CLOSED",
       canRetry: false,
       canSettlePriorDay,
+      canDismissCancelled: false,
       ownedByCurrentUser,
       checkedAt: input.checkedAt,
       checkout: input.checkout,
@@ -917,6 +944,7 @@ export function deriveCheckoutLookup(input: {
       reason: "BUSINESS_DATE_CROSSED",
       canRetry: false,
       canSettlePriorDay,
+      canDismissCancelled: false,
       ownedByCurrentUser,
       checkedAt: input.checkedAt,
       checkout: input.checkout,
@@ -931,6 +959,7 @@ export function deriveCheckoutLookup(input: {
       reason: "OWNED_BY_OTHER_ACCOUNT",
       canRetry: false,
       canSettlePriorDay: false,
+      canDismissCancelled: false,
       ownedByCurrentUser,
       checkedAt: input.checkedAt,
       checkout: input.checkout,
@@ -944,6 +973,7 @@ export function deriveCheckoutLookup(input: {
     reason: "NOT_SAVED",
     canRetry: true,
     canSettlePriorDay: false,
+    canDismissCancelled: false,
     ownedByCurrentUser,
     checkedAt: input.checkedAt,
     checkout: input.checkout,

@@ -986,6 +986,7 @@ export function posRoutes(db: Database): Router {
       checkout: toCheckoutView(row),
       checkoutOwnerUserId: row.createdByUserId,
       dayClosedAt: toIsoOrNull(row.dayClosedAt),
+      cancellationOrigin: row.cancellationOrigin,
       sale: sale ?? null,
       settlement: settlement ?? null,
       todayDate: formatManilaDate(req.now),

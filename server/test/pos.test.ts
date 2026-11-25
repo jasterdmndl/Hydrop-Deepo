@@ -2095,11 +2095,29 @@ describe("POS station day and refill sales", () => {
         .get(`/api/pos/checkouts/${explicitRef}`)
         .set("Cookie", owner.cookie);
       expect(lookupAfterMidnight.status).toBe(200);
+      expect(lookupAfterMidnight.body).toMatchObject({
+        recoveryState: "CANCELLED",
+        canRetry: false,
+        canSettlePriorDay: false,
+        canDismissCancelled: true,
+      });
       expect(lookupAfterMidnight.body.checkout).toMatchObject({
         status: "CANCELLED_DRAFT",
         resolutionReason: "CLEARED_ON_END_DAY",
       });
-      expect(lookupAfterMidnight.body.canSettlePriorDay).toBe(false);
+
+      // Cashier also receives verified CANCELLED state for explicit unpaid cancellation
+      const cashierLookupCancelled = await request(ctx.app)
+        .get(`/api/pos/checkouts/${explicitRef}`)
+        .set("Cookie", cashier.cookie);
+      expect(cashierLookupCancelled.status).toBe(200);
+      expect(cashierLookupCancelled.body).toMatchObject({
+        recoveryState: "CANCELLED",
+        canRetry: false,
+        canSettlePriorDay: false,
+        canDismissCancelled: true,
+        ownedByCurrentUser: true,
+      });
 
       const settleAfterMidnight = await request(ctx.app)
         .post(`/api/pos/checkouts/${encodeURIComponent(explicitRef)}/settle`)
@@ -2117,6 +2135,43 @@ describe("POS station day and refill sales", () => {
       expect(closedDay.status).toBe(200);
       expect(closedDay.body.clearedDraftReferences).toEqual([autoClearedRef]);
 
+      // Automatic End Day clearance must remain REVIEW_REQUIRED with canDismissCancelled: false
+      const lookupAutoCleared = await request(ctx.app)
+        .get(`/api/pos/checkouts/${autoClearedRef}`)
+        .set("Cookie", owner.cookie);
+      expect(lookupAutoCleared.status).toBe(200);
+      expect(lookupAutoCleared.body).toMatchObject({
+        recoveryState: "REVIEW_REQUIRED",
+        canRetry: false,
+        canDismissCancelled: false,
+      });
+
+      // Legacy CANCELLED_DRAFT row with null cancellation_origin must NOT allow dismissal even with "No cash received" reason
+      const legacyNullRef = "HD-1118-LEGACY";
+      await ctx.db.query(
+        `INSERT INTO pos_checkouts (
+           reference, business_day_id, business_date, created_by_user_id, prepare_key, status,
+           quote_snapshot, quote_hash, total_centavos, total_containers, total_volume_ml,
+           resolution_reason, cancellation_origin, created_at, updated_at
+         )
+         SELECT $1, business_day_id, business_date, created_by_user_id, 'legacy-null-origin', 'CANCELLED_DRAFT',
+                quote_snapshot, quote_hash, total_centavos, total_containers, total_volume_ml,
+                'No cash received', NULL, created_at, updated_at
+           FROM pos_checkouts
+          WHERE reference = $2`,
+        [legacyNullRef, explicitRef],
+      );
+      const lookupLegacyNull = await request(ctx.app)
+        .get(`/api/pos/checkouts/${legacyNullRef}`)
+        .set("Cookie", owner.cookie);
+      expect(lookupLegacyNull.status).toBe(200);
+      expect(lookupLegacyNull.body).toMatchObject({
+        recoveryState: "REVIEW_REQUIRED",
+        canRetry: false,
+        canSettlePriorDay: false,
+        canDismissCancelled: false,
+      });
+
       // Delayed confirm on explicitRef AFTER day close STILL preserves CANCELLED_DRAFT & its reason
       const confirmAfterClose = await confirmCheckout(ctx.app, cashier, explicitRef, {
         cashReceivedCentavos: 10000,
@@ -2127,6 +2182,13 @@ describe("POS station day and refill sales", () => {
       const lookupAfterClose = await request(ctx.app)
         .get(`/api/pos/checkouts/${explicitRef}`)
         .set("Cookie", owner.cookie);
+      expect(lookupAfterClose.status).toBe(200);
+      expect(lookupAfterClose.body).toMatchObject({
+        recoveryState: "CANCELLED",
+        canRetry: false,
+        canSettlePriorDay: false,
+        canDismissCancelled: true,
+      });
       expect(lookupAfterClose.body.checkout).toMatchObject({
         status: "CANCELLED_DRAFT",
         resolutionReason: "CLEARED_ON_END_DAY",
