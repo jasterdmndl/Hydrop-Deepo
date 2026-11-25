@@ -64,6 +64,9 @@ import {
   type WaterType,
 } from "./posRecovery";
 import {
+  canApplyContainerPackageQuantity,
+  getContainerPackageOverMaxMessage,
+  getContainerPackageRowMax,
   getVisibleQuantityError,
   hasInvalidQuantityEdits,
   isQuantityEditInvalid,
@@ -72,6 +75,7 @@ import {
   type QuantityEditState,
   revealInvalidQuantityEdit,
   revealInvalidQuantityEdits,
+  syncContainerPackageQuantityEdit,
 } from "./quantityInput";
 import { QuantityStepper } from "./QuantityStepper";
 import { PriorDaySettlementModal } from "./PriorDaySettlementModal";
@@ -639,6 +643,46 @@ export function PosPage() {
     return map;
   }, [lines]);
 
+  // Sync container package edits when other rows or stock refresh change remaining availability.
+  useEffect(() => {
+    if (containerPackages.length === 0) return;
+    setQtyEdits((prev) => {
+      let changed = false;
+      const next = { ...prev };
+      for (const pkg of containerPackages) {
+        const isInStock = pkg.stockStatus === "IN_STOCK" && (pkg.availableQuantity ?? 0) > 0;
+        for (const gripo of INCLUDED_GRIPO_OPTIONS) {
+          const fieldId = containerPkgLineId(pkg.packageCode, gripo.value);
+          const edit = next[fieldId];
+          if (!edit) continue;
+          const qty =
+            containerPkgQtyByKey.get(containerPkgKey(pkg.packageCode, gripo.value)) ?? 0;
+          const rowMax = getContainerPackageRowMax(
+            lines,
+            pkg.productId,
+            fieldId,
+            pkg.availableQuantity,
+          );
+          const synced = syncContainerPackageQuantityEdit(
+            edit,
+            qty,
+            rowMax,
+            pkg.availableQuantity,
+            isInStock,
+          );
+          if (synced === null) {
+            delete next[fieldId];
+            changed = true;
+          } else if (synced !== edit) {
+            next[fieldId] = synced;
+            changed = true;
+          }
+        }
+      }
+      return changed ? next : prev;
+    });
+  }, [containerPackages, containerPkgQtyByKey, lines]);
+
   const merchandiseSections = useMemo(() => {
     const orderedSections = (posSections.length > 0 ? posSections : DEFAULT_MERCHANDISE_SECTIONS)
       .filter((s) => s.code !== "CONTAINERS")
@@ -865,22 +909,71 @@ export function PosPage() {
     return true;
   }
 
+  function updateContainerPackageLines(
+    prev: CartDraftLine[],
+    pkg: PosContainerPackageItem,
+    includedGripo: IncludedGripoType,
+    targetQty: number,
+  ): CartDraftLine[] {
+    const id = containerPkgLineId(pkg.packageCode, includedGripo);
+    const displayName = `${pkg.name} · ${formatIncludedGripoLabel(includedGripo)}`;
+    const idx = prev.findIndex((l) => l.id === id);
+    const currentQty = idx === -1 ? 0 : prev[idx]!.quantity;
+    const rowMax = getContainerPackageRowMax(prev, pkg.productId, id, pkg.availableQuantity);
+    if (!canApplyContainerPackageQuantity(currentQty, targetQty, rowMax)) {
+      return prev;
+    }
+    if (targetQty === 0) {
+      return idx === -1 ? prev : prev.filter((l) => l.id !== id);
+    }
+    if (idx !== -1) {
+      return prev.map((l) =>
+        l.id === id
+          ? {
+              ...l,
+              displayName,
+              unitPriceCentavos: pkg.unitPriceCentavos,
+              quantity: targetQty,
+            }
+          : l,
+      );
+    }
+    if (prev.length >= MAX_LINES) {
+      return prev;
+    }
+    return [
+      ...prev,
+      {
+        id,
+        kind: "CONTAINER_PACKAGE",
+        packageCode: pkg.packageCode,
+        includedGripo,
+        productId: pkg.productId,
+        displayName,
+        unitVolumeMl: pkg.unitVolumeMl,
+        unitVolumeLiters: pkg.unitVolumeLiters,
+        unitPriceCentavos: pkg.unitPriceCentavos,
+        stockUnit: pkg.unit,
+        quantity: targetQty,
+      },
+    ];
+  }
+
   function setContainerPackageQuantity(
     pkg: PosContainerPackageItem,
     includedGripo: IncludedGripoType,
     nextQty: number,
   ): boolean {
-    const currentQty = containerPkgQtyByKey.get(containerPkgKey(pkg.packageCode, includedGripo)) ?? 0;
-    const otherQty = Math.max(0, (selectedContainerQtyByProductId.get(pkg.productId) ?? 0) - currentQty);
-    const remainingAvailable =
-      pkg.availableQuantity !== null ? Math.max(0, pkg.availableQuantity - otherQty) : 0;
-    const maxAllowed = Math.min(MAX_LINE_QTY, currentQty + remainingAvailable);
-    const clamped = Math.max(0, Math.min(maxAllowed, Math.trunc(nextQty)));
     const id = containerPkgLineId(pkg.packageCode, includedGripo);
-    const displayName = `${pkg.name} · ${formatIncludedGripoLabel(includedGripo)}`;
+    const currentQty = containerPkgQtyByKey.get(containerPkgKey(pkg.packageCode, includedGripo)) ?? 0;
+    const rowMax = getContainerPackageRowMax(lines, pkg.productId, id, pkg.availableQuantity);
+    const targetQty = Math.trunc(nextQty);
+    if (!canApplyContainerPackageQuantity(currentQty, targetQty, rowMax)) {
+      return false;
+    }
     const existingIdx = lines.findIndex((l) => l.id === id);
 
-    if (clamped > 0 && existingIdx === -1 && lines.length >= MAX_LINES) {
+    if (targetQty > 0 && existingIdx === -1 && lines.length >= MAX_LINES) {
       setSaleError(wrapNotice(`Maximum ${MAX_LINES} lines per sale.`));
       return false;
     }
@@ -889,44 +982,30 @@ export function PosPage() {
     setLastSavedSale(null);
     setLastSettledPriorDay(null);
     setLastAlreadySavedPriorDay(null);
-    setLines((prev) => {
-      const idx = prev.findIndex((l) => l.id === id);
-      if (clamped === 0) {
-        return idx === -1 ? prev : prev.filter((l) => l.id !== id);
-      }
-      if (idx !== -1) {
-        return prev.map((l) =>
-          l.id === id
-            ? {
-                ...l,
-                displayName,
-                unitPriceCentavos: pkg.unitPriceCentavos,
-                quantity: clamped,
-              }
-            : l,
-        );
-      }
-      if (prev.length >= MAX_LINES) {
-        return prev;
-      }
-      return [
-        ...prev,
-        {
-          id,
-          kind: "CONTAINER_PACKAGE",
-          packageCode: pkg.packageCode,
-          includedGripo,
-          productId: pkg.productId,
-          displayName,
-          unitVolumeMl: pkg.unitVolumeMl,
-          unitVolumeLiters: pkg.unitVolumeLiters,
-          unitPriceCentavos: pkg.unitPriceCentavos,
-          stockUnit: pkg.unit,
-          quantity: clamped,
-        },
-      ];
-    });
+    setLines((prev) => updateContainerPackageLines(prev, pkg, includedGripo, targetQty));
     return true;
+  }
+
+  function stepContainerPackageQuantity(
+    pkg: PosContainerPackageItem,
+    includedGripo: IncludedGripoType,
+    delta: -1 | 1,
+  ): void {
+    const id = containerPkgLineId(pkg.packageCode, includedGripo);
+    const existingIdx = lines.findIndex((l) => l.id === id);
+    if (delta > 0 && existingIdx === -1 && lines.length >= MAX_LINES) {
+      setSaleError(wrapNotice(`Maximum ${MAX_LINES} lines per sale.`));
+      return;
+    }
+
+    setSaleError(null);
+    setLastSavedSale(null);
+    setLastSettledPriorDay(null);
+    setLastAlreadySavedPriorDay(null);
+    setLines((prev) => {
+      const currentQty = prev.find((l) => l.id === id)?.quantity ?? 0;
+      return updateContainerPackageLines(prev, pkg, includedGripo, currentQty + delta);
+    });
   }
 
   function setCustomLineQuantity(id: string, nextQty: number) {
@@ -1208,7 +1287,7 @@ export function PosPage() {
         setMobilePane("products");
       }
       setQtyEdits(nextEdits);
-      setSaleError(wrapNotice("Fix invalid refill quantities before reviewing checkout."));
+      setSaleError(wrapNotice("Fix invalid item quantities before reviewing checkout."));
       window.requestAnimationFrame(() => {
         const targetInput = qtyInputRefs.current.get(invalidIds[0]!);
         targetInput?.scrollIntoView({ block: "center" });
@@ -2576,14 +2655,19 @@ export function PosPage() {
                                       const edit = qtyEdits[fieldId];
                                       const visibleError = getVisibleQuantityError(edit);
                                       const errorId = `qty-error-${fieldId}`;
-                                      const otherQty = Math.max(0, totalShapeSelected - qty);
-                                      const remainingAvailable =
-                                        pkg.availableQuantity === null
-                                          ? 0
-                                          : Math.max(0, pkg.availableQuantity - otherQty);
-                                      const maxStep = isInStock
-                                        ? Math.min(MAX_LINE_QTY, qty + remainingAvailable)
-                                        : MAX_LINE_QTY;
+                                      const rowMax = getContainerPackageRowMax(
+                                        lines,
+                                        pkg.productId,
+                                        fieldId,
+                                        pkg.availableQuantity,
+                                      );
+                                      const effectiveMax = Math.max(rowMax, qty);
+                                      const overMaxMessage = getContainerPackageOverMaxMessage(
+                                        rowMax,
+                                        pkg.availableQuantity,
+                                      );
+                                      const isUnselectedUnavailable =
+                                        qty === 0 && (!isInStock || rowMax <= 0);
                                       const labelWithGripo = `${pkg.name} (${gripo.label})`;
 
                                       return (
@@ -2599,7 +2683,7 @@ export function PosPage() {
                                               }
                                               onStep={(delta) => {
                                                 clearFieldQtyEdit(fieldId);
-                                                setContainerPackageQuantity(pkg, gripo.value, qty + delta);
+                                                stepContainerPackageQuantity(pkg, gripo.value, delta);
                                               }}
                                               groupLabel={`${labelWithGripo} quantity controls`}
                                               inputLabel={`${labelWithGripo} quantity`}
@@ -2608,7 +2692,7 @@ export function PosPage() {
                                               disabled={
                                                 !dayStatus?.canSell ||
                                                 preparingCheckout ||
-                                                (!isInStock && qty === 0)
+                                                isUnselectedUnavailable
                                               }
                                               decreaseDisabled={
                                                 !dayStatus?.canSell || preparingCheckout || qty === 0
@@ -2617,11 +2701,11 @@ export function PosPage() {
                                                 !dayStatus?.canSell ||
                                                 preparingCheckout ||
                                                 !isInStock ||
-                                                remainingAvailable <= 0 ||
-                                                qty >= maxStep
+                                                qty >= rowMax
                                               }
                                               allowRestingZero
-                                              max={maxStep}
+                                              max={effectiveMax}
+                                              overMaxMessage={overMaxMessage}
                                               errorId={errorId}
                                               inputRef={(el) => {
                                                 if (el) qtyInputRefs.current.set(fieldId, el);
@@ -2630,9 +2714,41 @@ export function PosPage() {
                                             />
                                           </div>
                                           {visibleError && (
-                                            <p id={errorId} className="qty-stepper__error" role="alert">
-                                              {visibleError}
-                                            </p>
+                                            <div id={errorId} className="qty-stepper__error" role="alert">
+                                              <span>{visibleError}</span>
+                                              {edit?.pendingCommitValue != null && (
+                                                <div className="callout__actions">
+                                                  <button
+                                                    type="button"
+                                                    className="button button--primary button--sm"
+                                                    disabled={!dayStatus?.canSell || preparingCheckout}
+                                                    onMouseDown={(event) => event.preventDefault()}
+                                                    onClick={() => {
+                                                      const targetQty = edit.pendingCommitValue!;
+                                                      const committed = setContainerPackageQuantity(
+                                                        pkg,
+                                                        gripo.value,
+                                                        targetQty,
+                                                      );
+                                                      if (committed) {
+                                                        clearFieldQtyEdit(fieldId);
+                                                      }
+                                                    }}
+                                                  >
+                                                    Apply {edit.pendingCommitValue}
+                                                  </button>
+                                                  <button
+                                                    type="button"
+                                                    className="button button--ghost button--sm"
+                                                    disabled={!dayStatus?.canSell || preparingCheckout}
+                                                    onMouseDown={(event) => event.preventDefault()}
+                                                    onClick={() => clearFieldQtyEdit(fieldId)}
+                                                  >
+                                                    Keep {qty}
+                                                  </button>
+                                                </div>
+                                              )}
+                                            </div>
                                           )}
                                         </div>
                                       );

@@ -13,6 +13,7 @@ export interface QuantityEditState {
   invalid: boolean;
   errorMessage: string | null;
   showError: boolean;
+  pendingCommitValue?: number | null;
 }
 
 function quantityRangeMessage(max: number): string {
@@ -24,17 +25,129 @@ function quantityRangeMessage(max: number): string {
 export function parseQuantityInput(
   raw: string,
   max: number = MAX_LINE_QTY,
+  overMaxMessage?: string,
 ): QuantityParseResult {
   const cleaned = raw.trim();
   const message = quantityRangeMessage(max);
-  if (!cleaned || !/^\d+$/.test(cleaned)) {
+  if (!cleaned || !/^\d+$/.test(cleaned) || /^0+$/.test(cleaned)) {
     return { valid: false, message };
   }
   const parsed = Number(cleaned);
-  if (!Number.isSafeInteger(parsed) || parsed < MIN_LINE_QTY || parsed > max) {
+  if (!Number.isSafeInteger(parsed) || parsed > max) {
+    return { valid: false, message: overMaxMessage ?? message };
+  }
+  if (parsed < MIN_LINE_QTY) {
     return { valid: false, message };
   }
   return { valid: true, value: parsed };
+}
+
+export interface ContainerPackageQuantityLine {
+  id: string;
+  kind: string;
+  productId?: string;
+  quantity: number;
+}
+
+export function getContainerPackageOtherQuantity(
+  lines: readonly ContainerPackageQuantityLine[],
+  productId: string,
+  rowId: string,
+): number {
+  let otherQty = 0;
+  for (const line of lines) {
+    if (line.kind === "CONTAINER_PACKAGE" && line.productId === productId && line.id !== rowId) {
+      otherQty += line.quantity;
+    }
+  }
+  return otherQty;
+}
+
+export function getContainerPackageRowMax(
+  lines: readonly ContainerPackageQuantityLine[],
+  productId: string,
+  rowId: string,
+  availableQuantity: number | null,
+  maxLineQty: number = MAX_LINE_QTY,
+): number {
+  if (availableQuantity === null) return 0;
+  const otherQty = getContainerPackageOtherQuantity(lines, productId, rowId);
+  return Math.max(0, Math.min(maxLineQty, availableQuantity - otherQty));
+}
+
+export function getContainerPackageOverMaxMessage(
+  rowMax: number,
+  availableQuantity: number | null,
+  maxLineQty: number = MAX_LINE_QTY,
+): string | undefined {
+  if (availableQuantity === null) {
+    return "Opening stock is not set for this option.";
+  }
+  if (rowMax <= 0) {
+    return "No remaining stock available for this option.";
+  }
+  if (rowMax < maxLineQty) {
+    return `Only ${rowMax} available for this option.`;
+  }
+  return undefined;
+}
+
+export function canApplyContainerPackageQuantity(
+  currentQty: number,
+  nextQty: number,
+  rowMax: number,
+): boolean {
+  if (!Number.isInteger(nextQty) || nextQty < 0) {
+    return false;
+  }
+  return nextQty <= currentQty || nextQty <= rowMax;
+}
+
+export function syncContainerPackageQuantityEdit(
+  edit: QuantityEditState,
+  currentQty: number,
+  rowMax: number,
+  availableQuantity: number | null,
+  isInStock: boolean,
+  maxLineQty: number = MAX_LINE_QTY,
+): QuantityEditState | null {
+  if (currentQty === 0 && (!isInStock || rowMax <= 0)) {
+    return null;
+  }
+  if (!edit.invalid) {
+    return edit;
+  }
+  const effectiveMax = Math.max(rowMax, currentQty);
+  const overMaxMessage = getContainerPackageOverMaxMessage(
+    rowMax,
+    availableQuantity,
+    maxLineQty,
+  );
+  const recheck = parseQuantityInput(edit.draft, effectiveMax, overMaxMessage);
+  if (recheck.valid) {
+    const nextMessage = `${recheck.value} now fits. Apply ${recheck.value} or keep ${currentQty}.`;
+    if (
+      edit.showError &&
+      edit.pendingCommitValue === recheck.value &&
+      edit.errorMessage === nextMessage
+    ) {
+      return edit;
+    }
+    return {
+      ...edit,
+      showError: true,
+      pendingCommitValue: recheck.value,
+      errorMessage: nextMessage,
+    };
+  }
+  if (!edit.pendingCommitValue && edit.errorMessage === recheck.message) {
+    return edit;
+  }
+  return {
+    ...edit,
+    pendingCommitValue: null,
+    errorMessage: recheck.message,
+  };
 }
 
 export function getDisplayedQuantity(
@@ -59,8 +172,9 @@ export function getVisibleQuantityError(
 export function handleQuantityTextChange(
   raw: string,
   max: number = MAX_LINE_QTY,
+  overMaxMessage?: string,
 ): { edit: QuantityEditState; validValue: number | null } {
-  const parsed = parseQuantityInput(raw, max);
+  const parsed = parseQuantityInput(raw, max, overMaxMessage);
   if (parsed.valid) {
     return {
       edit: {

@@ -1,5 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  canApplyContainerPackageQuantity,
+  getContainerPackageOtherQuantity,
+  getContainerPackageOverMaxMessage,
+  getContainerPackageRowMax,
   getDisplayedQuantity,
   getVisibleQuantityError,
   handleQuantityBlur,
@@ -14,6 +18,7 @@ import {
   type QuantityEditState,
   revealInvalidQuantityEdit,
   revealInvalidQuantityEdits,
+  syncContainerPackageQuantityEdit,
 } from "./quantityInput";
 
 describe("parseQuantityInput", () => {
@@ -163,5 +168,123 @@ describe("quantity edit state transitions", () => {
     });
     expect(revealInvalidQuantityEdit(validEdit)).toEqual(validEdit);
     expect(revealInvalidQuantityEdit(null)).toBeNull();
+  });
+});
+
+describe("container package shared quantity helpers", () => {
+  it("uses overMaxMessage only for positive whole numbers above max", () => {
+    const overMaxMsg = "Only 8 available for this option.";
+    expect(parseQuantityInput("8", 8, overMaxMsg)).toEqual({ valid: true, value: 8 });
+    expect(parseQuantityInput("9", 8, overMaxMsg)).toEqual({
+      valid: false,
+      message: overMaxMsg,
+    });
+    expect(parseQuantityInput("99999999999999999999", 8, overMaxMsg)).toEqual({
+      valid: false,
+      message: overMaxMsg,
+    });
+
+    for (const nonPositiveOrMalformed of ["", "0", "00", "-1", "2.5", "abc"]) {
+      expect(parseQuantityInput(nonPositiveOrMalformed, 8, overMaxMsg)).toEqual({
+        valid: false,
+        message: "Enter a whole number from 1 to 8.",
+      });
+    }
+
+    const change = handleQuantityTextChange("9", 8, overMaxMsg);
+    expect(change).toEqual({
+      edit: {
+        draft: "9",
+        invalid: true,
+        errorMessage: overMaxMsg,
+        showError: false,
+      },
+      validValue: null,
+    });
+  });
+
+  it("computes shared container limits across fill and gripo lines while ignoring other shapes and refills", () => {
+    const lines = [
+      { id: "std-PURIFIED", kind: "STANDARD", quantity: 4 },
+      { id: "pkg-ROUND_ALKALINE-PUSH_TYPE", kind: "CONTAINER_PACKAGE", productId: "round-1", quantity: 2 },
+      { id: "pkg-ROUND_ALKALINE-TWIST_TYPE", kind: "CONTAINER_PACKAGE", productId: "round-1", quantity: 1 },
+      { id: "pkg-ROUND_EMPTY-PUSH_TYPE", kind: "CONTAINER_PACKAGE", productId: "round-1", quantity: 3 },
+      { id: "pkg-SLIM_EMPTY-PUSH_TYPE", kind: "CONTAINER_PACKAGE", productId: "slim-1", quantity: 5 },
+    ];
+
+    expect(
+      getContainerPackageOtherQuantity(lines, "round-1", "pkg-ROUND_ALKALINE-TWIST_TYPE"),
+    ).toBe(5);
+    expect(
+      getContainerPackageRowMax(lines, "round-1", "pkg-ROUND_ALKALINE-TWIST_TYPE", 10),
+    ).toBe(5);
+    expect(
+      getContainerPackageRowMax(lines, "round-1", "pkg-ROUND_PURIFIED-PUSH_TYPE", 10),
+    ).toBe(4);
+    expect(
+      getContainerPackageRowMax(lines, "round-1", "pkg-ROUND_PURIFIED-PUSH_TYPE", 4),
+    ).toBe(0);
+    expect(
+      getContainerPackageRowMax(lines, "round-1", "pkg-ROUND_PURIFIED-PUSH_TYPE", null),
+    ).toBe(0);
+    expect(
+      getContainerPackageRowMax([], "round-1", "pkg-ROUND_PURIFIED-PUSH_TYPE", 750),
+    ).toBe(MAX_LINE_QTY);
+  });
+
+  it("formats stock-specific over-max messages and allows stale-cart reductions without allowing increases", () => {
+    expect(getContainerPackageOverMaxMessage(0, null)).toBe(
+      "Opening stock is not set for this option.",
+    );
+    expect(getContainerPackageOverMaxMessage(0, 0)).toBe(
+      "No remaining stock available for this option.",
+    );
+    expect(getContainerPackageOverMaxMessage(8, 10)).toBe("Only 8 available for this option.");
+    expect(getContainerPackageOverMaxMessage(MAX_LINE_QTY, 600)).toBeUndefined();
+
+    // Normal in-stock row
+    expect(canApplyContainerPackageQuantity(1, 8, 8)).toBe(true);
+    expect(canApplyContainerPackageQuantity(1, 9, 8)).toBe(false);
+
+    // Stale cart after stock dropped below currentQty (current=6, rowMax=4)
+    expect(canApplyContainerPackageQuantity(6, 5, 4)).toBe(true);
+    expect(canApplyContainerPackageQuantity(6, 4, 4)).toBe(true);
+    expect(canApplyContainerPackageQuantity(6, 0, 4)).toBe(true);
+    expect(canApplyContainerPackageQuantity(6, 7, 4)).toBe(false);
+  });
+
+  it("keeps pending over-limit drafts visible for explicit confirmation when stock frees up and clears unreachable disabled rows", () => {
+    const rejectedNine: QuantityEditState = {
+      draft: "9",
+      invalid: true,
+      errorMessage: "Only 8 available for this option.",
+      showError: true,
+    };
+
+    // Freeing stock from 8 -> 9 marks the draft as pending confirmation instead of discarding it.
+    const nowFits = syncContainerPackageQuantityEdit(rejectedNine, 1, 9, 10, true);
+    expect(nowFits).toEqual({
+      draft: "9",
+      invalid: true,
+      errorMessage: "9 now fits. Apply 9 or keep 1.",
+      showError: true,
+      pendingCommitValue: 9,
+    });
+
+    // Idempotent when called again with unchanged availability.
+    expect(syncContainerPackageQuantityEdit(nowFits!, 1, 9, 10, true)).toBe(nowFits);
+
+    // If stock tightens back to 8, pending confirmation clears and reverts to stock-limit message.
+    const tightAgain = syncContainerPackageQuantityEdit(nowFits!, 1, 8, 10, true);
+    expect(tightAgain).toEqual({
+      draft: "9",
+      invalid: true,
+      errorMessage: "Only 8 available for this option.",
+      showError: true,
+      pendingCommitValue: null,
+    });
+
+    // A fully unavailable unselected row clears its edit so it cannot block checkout.
+    expect(syncContainerPackageQuantityEdit(rejectedNine, 0, 0, 10, true)).toBeNull();
   });
 });

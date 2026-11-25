@@ -25,6 +25,7 @@ export interface QuantityStepperProps {
   increaseDisabled?: boolean;
   allowRestingZero?: boolean;
   max?: number;
+  overMaxMessage?: string;
   errorId?: string;
   inputRef?: (el: HTMLInputElement | null) => void;
 }
@@ -44,6 +45,7 @@ export function QuantityStepper({
   increaseDisabled = false,
   allowRestingZero = false,
   max = MAX_LINE_QTY,
+  overMaxMessage,
   errorId,
   inputRef,
 }: QuantityStepperProps) {
@@ -60,7 +62,7 @@ export function QuantityStepper({
   }
 
   function applyTextChange(raw: string) {
-    const { edit: nextEdit, validValue } = handleQuantityTextChange(raw, max);
+    const { edit: nextEdit, validValue } = handleQuantityTextChange(raw, max, overMaxMessage);
     if (validValue !== null) {
       const committed = onCommitValidValue(validValue);
       if (committed === false) {
@@ -153,6 +155,16 @@ export function QuantityStepper({
         onKeyDown={(event) => {
           if (event.key === "Enter") {
             event.preventDefault();
+            if (edit?.pendingCommitValue != null) {
+              const committed = onCommitValidValue(edit.pendingCommitValue);
+              if (committed === false) {
+                onEditChange(null);
+                return;
+              }
+              onEditChange(null);
+              blurInputWithoutReapplyingEdit(event.currentTarget);
+              return;
+            }
             const { nextEdit, shouldBlur } = handleQuantityEnter(edit);
             onEditChange(nextEdit);
             if (shouldBlur) {
