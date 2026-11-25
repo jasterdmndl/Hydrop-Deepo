@@ -1,6 +1,15 @@
 import { Link } from "react-router-dom";
-import { formatQuantityLabel, type InventoryItemView, type PosSectionView } from "../inventory/inventoryView";
-import { buildStocksSnapshot } from "./dashboardView";
+import {
+  formatQuantityLabel,
+  formatRecordedAtManila,
+  type InventoryItemView,
+  type PosSectionView,
+} from "../inventory/inventoryView";
+import {
+  buildStocksSnapshot,
+  type DashboardStockTrendResponse,
+  formatStockMovementTypeLabel,
+} from "./dashboardView";
 
 interface StocksViewProps {
   items: InventoryItemView[];
@@ -9,6 +18,108 @@ interface StocksViewProps {
   loading: boolean;
   error: string | null;
   onRetry: () => void;
+  selectedTrendItemKey: string | null;
+  onSelectTrendItem: (itemKey: string) => void;
+  stockTrend: DashboardStockTrendResponse | null;
+  stockTrendLoading: boolean;
+  stockTrendError: string | null;
+  onRetryTrend: () => void;
+}
+
+function getPickerItemKey(item: InventoryItemView): string {
+  return item.shape ?? item.id ?? item.code;
+}
+
+function StockTrendChart({ trend }: { trend: DashboardStockTrendResponse }) {
+  const points = trend.points;
+  if (points.length === 0) return null;
+
+  const balances = points.map((p) => p.balanceAfter);
+  const minVal = Math.min(0, ...balances);
+  const maxVal = Math.max(1, ...balances);
+  const range = Math.max(1, maxVal - minVal);
+
+  const width = 640;
+  const height = 180;
+  const padLeft = 44;
+  const padRight = 24;
+  const padTop = 20;
+  const padBottom = 28;
+  const innerW = width - padLeft - padRight;
+  const innerH = height - padTop - padBottom;
+
+  const coords = points.map((point, index) => {
+    const x =
+      points.length === 1
+        ? padLeft + innerW / 2
+        : padLeft + (index / (points.length - 1)) * innerW;
+    const y = padTop + innerH - ((point.balanceAfter - minVal) / range) * innerH;
+    return { x, y, point };
+  });
+
+  const polylinePoints = coords.map((c) => `${c.x.toFixed(1)},${c.y.toFixed(1)}`).join(" ");
+
+  return (
+    <div className="dash-stock-chart-wrap">
+      <svg
+        className="dash-stock-chart-svg"
+        viewBox={`0 0 ${width} ${height}`}
+        role="img"
+        aria-label={`Inventory trend for ${trend.item.name} in ${trend.item.unit}: starts at ${formatQuantityLabel(points[0]!.balanceAfter, trend.item.unit)} and ends at ${formatQuantityLabel(points[points.length - 1]!.balanceAfter, trend.item.unit)} across ${points.length} ${points.length === 1 ? "record" : "records"}`}
+      >
+        <line
+          x1={padLeft}
+          y1={padTop}
+          x2={padLeft}
+          y2={height - padBottom}
+          stroke="#cbd5e1"
+          strokeWidth="1.5"
+        />
+        <line
+          x1={padLeft}
+          y1={height - padBottom}
+          x2={width - padRight}
+          y2={height - padBottom}
+          stroke="#cbd5e1"
+          strokeWidth="1.5"
+        />
+        <text x={padLeft - 6} y={padTop + 4} textAnchor="end" className="dash-stock-chart-axis">
+          {maxVal}
+        </text>
+        <text
+          x={padLeft - 6}
+          y={height - padBottom + 4}
+          textAnchor="end"
+          className="dash-stock-chart-axis"
+        >
+          {minVal}
+        </text>
+        {coords.length > 1 && (
+          <polyline
+            fill="none"
+            stroke="#1d63dc"
+            strokeWidth="3"
+            strokeLinejoin="round"
+            strokeLinecap="round"
+            points={polylinePoints}
+          />
+        )}
+        {coords.map((c, idx) => (
+          <g key={c.point.movementId ?? `opening-${idx}`}>
+            <circle cx={c.x} cy={c.y} r="5" fill="#1d63dc" stroke="#ffffff" strokeWidth="2" />
+            <text
+              x={c.x}
+              y={Math.max(12, c.y - 9)}
+              textAnchor="middle"
+              className="dash-stock-chart-val"
+            >
+              {c.point.balanceAfter}
+            </text>
+          </g>
+        ))}
+      </svg>
+    </div>
+  );
 }
 
 export function StocksView({
@@ -18,6 +129,12 @@ export function StocksView({
   loading,
   error,
   onRetry,
+  selectedTrendItemKey,
+  onSelectTrendItem,
+  stockTrend,
+  stockTrendLoading,
+  stockTrendError,
+  onRetryTrend,
 }: StocksViewProps) {
   if (!hasLoaded && error) {
     return (
@@ -42,6 +159,7 @@ export function StocksView({
   }
 
   const snapshot = buildStocksSnapshot(items, posSections);
+  const activePickerItems = items.filter((item) => item.archivedAt === null || item.archivedAt === undefined);
 
   const radius = 56;
   const circumference = 2 * Math.PI * radius;
@@ -190,7 +308,7 @@ export function StocksView({
           <div className="dash-panel__header">
             <div>
               <h2 id="stock-alerts-heading">Stock Alerts</h2>
-              <p className="muted-sm">Out of Stock, Not Set, and reconciliation items</p>
+              <p className="muted-sm">Out of Stock, Low Stock, Not Set, and reconciliation items</p>
             </div>
             {snapshot.alerts.length > 0 && (
               <span className="pill pill--neutral">{snapshot.alerts.length}</span>
@@ -216,7 +334,7 @@ export function StocksView({
                     className={`pill ${
                       alert.severity === "OUT_OF_STOCK"
                         ? "pill--overdue"
-                        : alert.severity === "NEEDS_RECONCILIATION"
+                        : alert.severity === "NEEDS_RECONCILIATION" || alert.severity === "LOW_STOCK"
                           ? "pill--warning"
                           : "pill--neutral"
                     }`}
@@ -235,6 +353,150 @@ export function StocksView({
           </div>
         </section>
       </div>
+
+      <section className="card dash-panel" aria-labelledby="inventory-trend-heading">
+        <div className="dash-panel__header">
+          <div>
+            <h2 id="inventory-trend-heading">Inventory Trend</h2>
+            <p className="muted-sm">
+              Recorded balance history for one active product in its stock unit (from opening count)
+            </p>
+          </div>
+
+          {activePickerItems.length > 0 && (
+            <label className="dash-trend-picker" htmlFor="dash-stock-trend-select">
+              <span className="muted-sm">Product</span>
+              <select
+                id="dash-stock-trend-select"
+                aria-label="Select Inventory product for trend"
+                value={selectedTrendItemKey ?? ""}
+                onChange={(e) => onSelectTrendItem(e.target.value)}
+              >
+                {activePickerItems.map((item) => {
+                  const key = getPickerItemKey(item);
+                  return (
+                    <option key={key} value={key}>
+                      {item.name} ({item.unit})
+                    </option>
+                  );
+                })}
+              </select>
+            </label>
+          )}
+        </div>
+
+        {activePickerItems.length === 0 ? (
+          <p className="muted-sm">No active Inventory products to display.</p>
+        ) : stockTrendError ? (
+          <div className="alert alert--error dash-inline-alert" role="alert">
+            <span>{stockTrendError}</span>
+            <button type="button" className="button button--ghost button--sm" onClick={onRetryTrend}>
+              Retry
+            </button>
+          </div>
+        ) : stockTrendLoading && !stockTrend ? (
+          <p className="muted-sm" role="status">
+            Loading product stock trend…
+          </p>
+        ) : !stockTrend ? (
+          <p className="muted-sm">Select a product to view its recorded stock history.</p>
+        ) : (
+          <div className="dash-trend-body">
+            {stockTrendLoading && (
+              <div className="dash-refresh-note" role="status">
+                Updating product stock trend…
+              </div>
+            )}
+
+            <div className="dash-trend-meta-row">
+              <span className="pill pill--neutral">
+                Current balance:{" "}
+                {stockTrend.item.status === "NOT_SET"
+                  ? "Not Set"
+                  : formatQuantityLabel(stockTrend.item.currentQuantity, stockTrend.item.unit)}
+              </span>
+              <span className="muted-sm">Unit: {stockTrend.item.unit}</span>
+              {stockTrend.item.lowStockLevel !== null && (
+                <span className="muted-sm">
+                  Low stock alert: ≤ {formatQuantityLabel(stockTrend.item.lowStockLevel, stockTrend.item.unit)}
+                </span>
+              )}
+            </div>
+
+            {stockTrend.historyState === "NOT_SET" && (
+              <div className="dash-empty-box">
+                <p className="dash-empty-box__title">Not Set</p>
+                <p className="muted-sm">
+                  {stockTrend.historyMessage ?? "Opening count has not been recorded yet."}
+                </p>
+              </div>
+            )}
+
+            {stockTrend.historyState === "INCOMPLETE" && (
+              <div className="callout callout--warning" role="status">
+                <p className="callout__title">Stock history is incomplete</p>
+                <p className="callout__body">
+                  {stockTrend.historyMessage ??
+                    "Available history cannot be reconciled to the current recorded balance."}
+                </p>
+              </div>
+            )}
+
+            {stockTrend.historyState === "COMPLETE" && (
+              <>
+                <StockTrendChart trend={stockTrend} />
+
+                <div className="dash-table-wrap">
+                  <table className="dash-table">
+                    <thead>
+                      <tr>
+                        <th scope="col">Recorded At (Manila)</th>
+                        <th scope="col">Event</th>
+                        <th scope="col">Change</th>
+                        <th scope="col">Balance</th>
+                        <th scope="col">Details</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {stockTrend.points.map((point, idx) => (
+                        <tr key={point.movementId ?? `opening-${idx}`}>
+                          <td>{formatRecordedAtManila(point.recordedAt)}</td>
+                          <td>{formatStockMovementTypeLabel(point.movementType)}</td>
+                          <td>
+                            {point.pointKind === "OPENING" ? (
+                              "Opening"
+                            ) : (
+                              <span
+                                className={
+                                  point.quantityDelta > 0
+                                    ? "dash-delta--positive"
+                                    : "dash-delta--negative"
+                                }
+                              >
+                                {point.quantityDelta > 0
+                                  ? `+${formatQuantityLabel(point.quantityDelta, point.unit)}`
+                                  : `−${formatQuantityLabel(Math.abs(point.quantityDelta), point.unit)}`}
+                              </span>
+                            )}
+                          </td>
+                          <td>
+                            <strong>{formatQuantityLabel(point.balanceAfter, point.unit)}</strong>
+                          </td>
+                          <td>
+                            {[point.reference, point.note, `By ${point.actor}`]
+                              .filter(Boolean)
+                              .join(" · ")}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              </>
+            )}
+          </div>
+        )}
+      </section>
 
       <section className="card dash-panel" aria-labelledby="stock-by-category-heading">
         <div className="dash-panel__header">

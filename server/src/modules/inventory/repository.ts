@@ -3,6 +3,7 @@ import type { Database, Queryable } from "../../db/database.js";
 import {
   BUILT_IN_POS_SECTIONS,
   type ContainerShape,
+  type FaucetReportingType,
   formatManilaIso,
   type InventoryCategory,
   type InventoryItemView,
@@ -22,6 +23,8 @@ export interface InventoryItemDbRow {
   unitPriceCentavos: number | string | null;
   showInPos: boolean;
   posSection: PosSection | null;
+  lowStockLevel: number | string | null;
+  faucetReportingType: FaucetReportingType | null;
   currentQuantity: number | string | null;
   stockRevision: number | string;
   archivedAt: Date | string | null;
@@ -164,6 +167,8 @@ export function toInventoryItemView(row: InventoryItemDbRow): InventoryItemView 
     unitPriceCentavos: toOptionalInt(row.unitPriceCentavos),
     showInPos: Boolean(row.showInPos),
     posSection: row.posSection ?? null,
+    lowStockLevel: toOptionalInt(row.lowStockLevel),
+    faucetReportingType: row.faucetReportingType ?? null,
     status: openingStock ? "INITIALIZED" : "NOT_SET",
     currentQuantity: openingStock ? toOptionalInt(row.currentQuantity) : null,
     stockRevision: Number(row.stockRevision ?? 0),
@@ -187,6 +192,8 @@ const ITEM_SELECT = `
          i.unit_price_centavos AS "unitPriceCentavos",
          i.show_in_pos AS "showInPos",
          i.pos_section AS "posSection",
+         i.low_stock_level AS "lowStockLevel",
+         i.faucet_reporting_type AS "faucetReportingType",
          i.current_quantity AS "currentQuantity",
          i.stock_revision AS "stockRevision",
          i.archived_at AS "archivedAt",
@@ -262,7 +269,8 @@ export type UpdateMerchandiseResult =
   | { kind: "updated"; item: InventoryItemView }
   | { kind: "not-found" }
   | { kind: "archived" }
-  | { kind: "duplicate-name" };
+  | { kind: "duplicate-name" }
+  | { kind: "invalid-pos-visibility" };
 
 export type CreatePosSectionResult =
   | { kind: "created"; section: PosSectionView }
@@ -394,6 +402,8 @@ export const inventoryRepository = {
       unitPriceCentavos: number;
       showInPos: boolean;
       posSection: PosSection | null;
+      lowStockLevel: number | null;
+      faucetReportingType: FaucetReportingType | null;
       createdByUserId: string;
       createdAt: Date;
     },
@@ -403,10 +413,10 @@ export const inventoryRepository = {
       const { rows } = await db.query<{ id: string }>(
         `INSERT INTO inventory_items (
            code, name, category, container_shape, description, unit,
-           unit_price_centavos, show_in_pos, pos_section, current_quantity,
-           created_by_user_id, created_at
+           unit_price_centavos, show_in_pos, pos_section, low_stock_level,
+           faucet_reporting_type, current_quantity, created_by_user_id, created_at
          )
-         VALUES ($1, $2, 'MERCHANDISE', NULL, $3, $4, $5, $6, $7, NULL, $8, $9)
+         VALUES ($1, $2, 'MERCHANDISE', NULL, $3, $4, $5, $6, $7, $8, $9, NULL, $10, $11)
          RETURNING id`,
         [
           code,
@@ -416,6 +426,8 @@ export const inventoryRepository = {
           input.unitPriceCentavos,
           input.showInPos,
           input.posSection,
+          input.lowStockLevel,
+          input.faucetReportingType,
           input.createdByUserId,
           input.createdAt,
         ],
@@ -434,11 +446,13 @@ export const inventoryRepository = {
     db: Database,
     input: {
       id: string;
-      name: string;
-      description: string | null;
-      unitPriceCentavos: number;
-      showInPos: boolean;
-      posSection: PosSection | null;
+      name?: string;
+      description?: string | null;
+      unitPriceCentavos?: number;
+      showInPos?: boolean;
+      posSection?: PosSection | null;
+      lowStockLevel?: number | null;
+      faucetReportingType?: FaucetReportingType | null;
     },
   ): Promise<UpdateMerchandiseResult> {
     try {
@@ -446,9 +460,25 @@ export const inventoryRepository = {
         const { rows: lockedRows } = await tx.query<{
           id: string;
           category: InventoryCategory;
+          name: string;
+          description: string | null;
+          unitPriceCentavos: number | string | null;
+          showInPos: boolean;
+          posSection: PosSection | null;
+          lowStockLevel: number | string | null;
+          faucetReportingType: FaucetReportingType | null;
           archivedAt: Date | string | null;
         }>(
-          `SELECT id, category, archived_at AS "archivedAt"
+          `SELECT id,
+                  category,
+                  name,
+                  description,
+                  unit_price_centavos AS "unitPriceCentavos",
+                  show_in_pos AS "showInPos",
+                  pos_section AS "posSection",
+                  low_stock_level AS "lowStockLevel",
+                  faucet_reporting_type AS "faucetReportingType",
+                  archived_at AS "archivedAt"
              FROM inventory_items
             WHERE id = $1 AND category = 'MERCHANDISE'
             FOR UPDATE`,
@@ -462,21 +492,49 @@ export const inventoryRepository = {
           return { kind: "archived" as const };
         }
 
+        const nextName = input.name !== undefined ? input.name : locked.name;
+        const nextDescription =
+          input.description !== undefined ? input.description : locked.description;
+        const nextPrice =
+          input.unitPriceCentavos !== undefined
+            ? input.unitPriceCentavos
+            : toOptionalInt(locked.unitPriceCentavos);
+        const nextShowInPos =
+          input.showInPos !== undefined ? input.showInPos : Boolean(locked.showInPos);
+        const nextPosSection =
+          input.posSection !== undefined ? input.posSection : locked.posSection;
+        const nextLowStockLevel =
+          input.lowStockLevel !== undefined
+            ? input.lowStockLevel
+            : toOptionalInt(locked.lowStockLevel);
+        const nextFaucetReportingType =
+          input.faucetReportingType !== undefined
+            ? input.faucetReportingType
+            : locked.faucetReportingType;
+
+        if (nextShowInPos && (!nextPosSection || nextPrice === null || nextPrice <= 0)) {
+          return { kind: "invalid-pos-visibility" as const };
+        }
+
         await tx.query(
           `UPDATE inventory_items
               SET name = $2,
                   description = $3,
                   unit_price_centavos = $4,
                   show_in_pos = $5,
-                  pos_section = $6
+                  pos_section = $6,
+                  low_stock_level = $7,
+                  faucet_reporting_type = $8
             WHERE id = $1`,
           [
             input.id,
-            input.name,
-            input.description,
-            input.unitPriceCentavos,
-            input.showInPos,
-            input.posSection,
+            nextName,
+            nextDescription,
+            nextPrice,
+            nextShowInPos,
+            nextPosSection,
+            nextLowStockLevel,
+            nextFaucetReportingType,
           ],
         );
         const updated = await findItemById(tx, input.id);
@@ -490,25 +548,55 @@ export const inventoryRepository = {
     }
   },
 
-  async updateContainerVisibility(
+  async updateContainerSettings(
     db: Database,
     input: {
       shape: ContainerShape;
-      showInPos: boolean;
+      showInPos?: boolean;
+      lowStockLevel?: number | null;
     },
   ): Promise<InventoryItemView | undefined> {
-    const { rows } = await db.query<{ id: string }>(
-      `UPDATE inventory_items
-          SET show_in_pos = $2,
-              pos_section = CASE WHEN $2 THEN $3 ELSE pos_section END
-        WHERE category = 'CONTAINER'
-          AND container_shape = $1
-          AND archived_at IS NULL
-        RETURNING id`,
-      [input.shape, input.showInPos, BUILT_IN_POS_SECTIONS.CONTAINERS],
-    );
-    if (!rows[0]) return undefined;
-    return findItemById(db, rows[0].id);
+    return db.transaction(async (tx) => {
+      const { rows: lockedRows } = await tx.query<{
+        id: string;
+        showInPos: boolean;
+        posSection: PosSection | null;
+        lowStockLevel: number | string | null;
+      }>(
+        `SELECT id,
+                show_in_pos AS "showInPos",
+                pos_section AS "posSection",
+                low_stock_level AS "lowStockLevel"
+           FROM inventory_items
+          WHERE category = 'CONTAINER'
+            AND container_shape = $1
+            AND archived_at IS NULL
+          FOR UPDATE`,
+        [input.shape],
+      );
+      const locked = lockedRows[0];
+      if (!locked) return undefined;
+
+      const nextShowInPos =
+        input.showInPos !== undefined ? input.showInPos : Boolean(locked.showInPos);
+      const nextPosSection = nextShowInPos
+        ? BUILT_IN_POS_SECTIONS.CONTAINERS
+        : locked.posSection;
+      const nextLowStockLevel =
+        input.lowStockLevel !== undefined
+          ? input.lowStockLevel
+          : toOptionalInt(locked.lowStockLevel);
+
+      await tx.query(
+        `UPDATE inventory_items
+            SET show_in_pos = $2,
+                pos_section = $3,
+                low_stock_level = $4
+          WHERE id = $1`,
+        [locked.id, nextShowInPos, nextPosSection, nextLowStockLevel],
+      );
+      return findItemById(tx, locked.id);
+    });
   },
 
   async archiveMerchandiseProduct(

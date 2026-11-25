@@ -615,6 +615,7 @@ export function posRoutes(db: Database): Router {
             unit: item.unit,
             unitPriceCentavos: item.unitPriceCentavos,
             posSection: item.posSection,
+            faucetReportingType: item.faucetReportingType,
             stockStatus:
               item.currentQuantity === null
                 ? "NOT_SET"

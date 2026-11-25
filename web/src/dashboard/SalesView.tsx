@@ -3,6 +3,7 @@ import { formatTime12h, type RemindersResponse } from "../calendar/calendarView"
 import { formatRecordedAtManila } from "../inventory/inventoryView";
 import {
   describeTrendLeader,
+  formatComparisonChangeSummary,
   formatDashboardPeso,
   formatDashboardPesoCompact,
   formatFullManilaDateLabel,
@@ -82,6 +83,19 @@ function dayStatusLabel(status: "OPEN" | "CLOSED" | "NO_RECORD"): string {
   }
 }
 
+function faucetLeaderPill(leader: "PUSH_TYPE" | "TWIST_TYPE" | "TIE" | null): string {
+  switch (leader) {
+    case "PUSH_TYPE":
+      return "Push-Type leads";
+    case "TWIST_TYPE":
+      return "Twist-Type leads";
+    case "TIE":
+      return "Tie";
+    default:
+      return "0 units";
+  }
+}
+
 export function SalesView({
   report,
   loading,
@@ -105,6 +119,12 @@ export function SalesView({
     (purifiedService?.waterVolumeMl ?? 0) + (alkalineService?.waterVolumeMl ?? 0);
   const compactAxis = (report?.trend.length ?? 0) > 14;
   const trendLeaderCaption = report ? describeTrendLeader(report.trend) : null;
+  const comparisonSummary = report ? formatComparisonChangeSummary(report.comparison) : null;
+
+  const pushFaucet = report?.faucetSales.items.find((i) => i.type === "PUSH_TYPE");
+  const twistFaucet = report?.faucetSales.items.find((i) => i.type === "TWIST_TYPE");
+  const roundContainers = report?.containerSales.items.filter((i) => i.shape === "ROUND") ?? [];
+  const slimContainers = report?.containerSales.items.filter((i) => i.shape === "SLIM") ?? [];
 
   return (
     <div className="dash-view-stack">
@@ -152,7 +172,19 @@ export function SalesView({
                 </span>
               </div>
               <p className="dash-kpi-card__value">{formatDashboardPeso(report.totals.salesCentavos)}</p>
-              <p className="dash-kpi-card__caption">Active POS sales · cash payments</p>
+              {comparisonSummary && (
+                <div className="dash-kpi-diff">
+                  <span
+                    className={`dash-kpi-diff__badge dash-kpi-diff__badge--${comparisonSummary.tone}`}
+                  >
+                    {comparisonSummary.headline}
+                  </span>
+                  <span className="dash-kpi-diff__range">{comparisonSummary.rangeSummary}</span>
+                  {!report.comparison.available && report.comparison.unavailableMessage && (
+                    <span className="dash-kpi-diff__reason">{report.comparison.unavailableMessage}</span>
+                  )}
+                </div>
+              )}
             </article>
 
             <article className="card dash-kpi-card">
@@ -237,16 +269,14 @@ export function SalesView({
                         key={point.businessDate}
                         role="listitem"
                         className="dash-trend-col"
-                        aria-label={`${formatFullManilaDateLabel(point.businessDate)}: ${
-                          point.hasBusinessDay && amount !== null
+                        aria-label={`${formatFullManilaDateLabel(point.businessDate)}: ${point.hasBusinessDay && amount !== null
                             ? `${formatDashboardPeso(amount)} (${dayStatusLabel(point.dayStatus)})`
                             : "No record"
-                        }`}
+                          }`}
                       >
                         <span
-                          className={`dash-trend-col__value ${
-                            point.hasBusinessDay ? "" : "dash-trend-col__value--missing"
-                          }`}
+                          className={`dash-trend-col__value ${point.hasBusinessDay ? "" : "dash-trend-col__value--missing"
+                            }`}
                         >
                           {point.hasBusinessDay && amount !== null
                             ? formatDashboardPesoCompact(amount)
@@ -256,9 +286,8 @@ export function SalesView({
                         <div className="dash-trend-col__track">
                           {point.hasBusinessDay ? (
                             <div
-                              className={`dash-trend-col__bar ${
-                                isToday ? "dash-trend-col__bar--today" : ""
-                              } ${amount === 0 ? "dash-trend-col__bar--zero" : ""}`}
+                              className={`dash-trend-col__bar ${isToday ? "dash-trend-col__bar--today" : ""
+                                } ${amount === 0 ? "dash-trend-col__bar--zero" : ""}`}
                               style={{ height: amount === 0 ? "4px" : `${heightPct}%` }}
                             />
                           ) : (
@@ -267,9 +296,8 @@ export function SalesView({
                         </div>
 
                         <span
-                          className={`dash-trend-col__date ${
-                            isToday ? "dash-trend-col__date--today" : ""
-                          }`}
+                          className={`dash-trend-col__date ${isToday ? "dash-trend-col__date--today" : ""
+                            }`}
                         >
                           {formatTrendAxisLabel(point.businessDate, compactAxis)}
                         </span>
@@ -301,13 +329,12 @@ export function SalesView({
                           <td>{formatFullManilaDateLabel(point.businessDate)}</td>
                           <td>
                             <span
-                              className={`pill ${
-                                point.dayStatus === "NO_RECORD"
+                              className={`pill ${point.dayStatus === "NO_RECORD"
                                   ? "pill--neutral"
                                   : point.dayStatus === "OPEN"
                                     ? "pill--scheduled"
                                     : "pill--completed"
-                              }`}
+                                }`}
                             >
                               {dayStatusLabel(point.dayStatus)}
                             </span>
@@ -336,9 +363,8 @@ export function SalesView({
                   <h2 id="refills-service-heading">Refills by Service</h2>
                   <p className="muted-sm">
                     {report.totals.containersRefilled > 0
-                      ? `${report.totals.containersRefilled.toLocaleString("en-US")} standalone ${
-                          report.totals.containersRefilled === 1 ? "refill" : "refills"
-                        } · ${formatWaterLiters(totalRefillVolumeMl)}`
+                      ? `${report.totals.containersRefilled.toLocaleString("en-US")} standalone ${report.totals.containersRefilled === 1 ? "refill" : "refills"
+                      } · ${formatWaterLiters(totalRefillVolumeMl)}`
                       : "Standalone customer-owned refills"}
                   </p>
                 </div>
@@ -377,11 +403,10 @@ export function SalesView({
                         <div className="dash-service-row__meta">
                           <span className="dash-service-row__title">
                             <span
-                              className={`dash-dot ${
-                                item.waterType === "PURIFIED"
+                              className={`dash-dot ${item.waterType === "PURIFIED"
                                   ? "dash-dot--purified"
                                   : "dash-dot--alkaline"
-                              }`}
+                                }`}
                               aria-hidden="true"
                             />
                             <strong>
@@ -402,6 +427,133 @@ export function SalesView({
                     ))}
                   </ul>
                 </>
+              )}
+            </section>
+          </div>
+
+          <div className="dash-sales-breakdowns-grid">
+            <section className="card dash-panel" aria-labelledby="faucet-sales-heading">
+              <div className="dash-panel__header">
+                <div>
+                  <h2 id="faucet-sales-heading">Faucet Sales</h2>
+                  <p className="muted-sm">
+                    Standalone Push-Type &amp; Twist-Type purchases (excludes included package gripo)
+                  </p>
+                </div>
+                <span className="pill pill--neutral">
+                  {faucetLeaderPill(report.faucetSales.leader)}
+                </span>
+              </div>
+
+              {report.faucetSales.totalUnits === 0 ? (
+                <div className="dash-empty-box">
+                  <p className="dash-empty-box__title">
+                    No typed standalone faucet sales recorded in this period.
+                  </p>
+                </div>
+              ) : (
+                <>
+                  <div className="dash-service-bar" role="presentation" aria-hidden="true">
+                    {pushFaucet && pushFaucet.units > 0 && (
+                      <div
+                        className="dash-faucet-bar__push"
+                        style={{ width: `${pushFaucet.sharePercent ?? 0}%` }}
+                      />
+                    )}
+                    {twistFaucet && twistFaucet.units > 0 && (
+                      <div
+                        className="dash-faucet-bar__twist"
+                        style={{ width: `${twistFaucet.sharePercent ?? 0}%` }}
+                      />
+                    )}
+                  </div>
+
+                  <ul className="dash-service-list">
+                    {report.faucetSales.items.map((item) => (
+                      <li key={item.type} className="dash-service-row">
+                        <div className="dash-service-row__meta">
+                          <span className="dash-service-row__title">
+                            <span
+                              className={`dash-dot ${item.type === "PUSH_TYPE" ? "dash-dot--push" : "dash-dot--twist"
+                                }`}
+                              aria-hidden="true"
+                            />
+                            <strong>{item.label}</strong>
+                          </span>
+                          <span className="muted-sm">
+                            {item.units.toLocaleString("en-US")}{" "}
+                            {item.units === 1 ? "unit" : "units"} ·{" "}
+                            {item.sharePercent !== null ? `${item.sharePercent}%` : "0%"}
+                          </span>
+                        </div>
+                        <span className="dash-service-row__amount">
+                          {formatDashboardPeso(item.salesCentavos)}
+                        </span>
+                      </li>
+                    ))}
+                  </ul>
+                </>
+              )}
+
+              {report.faucetSales.unclassifiedUnits > 0 && (
+                <p className="dash-panel__footnote" role="status">
+                  {report.faucetSales.unclassifiedUnits.toLocaleString("en-US")} standalone{" "}
+                  {report.faucetSales.unclassifiedUnits === 1 ? "faucet unit" : "faucet units"} (
+                  {formatDashboardPeso(report.faucetSales.unclassifiedSalesCentavos)}) had no saved
+                  Push/Twist classification and remain in Total Sales only.
+                </p>
+              )}
+            </section>
+
+            <section className="card dash-panel" aria-labelledby="container-sales-heading">
+              <div className="dash-panel__header">
+                <div>
+                  <h2 id="container-sales-heading">Container Sales</h2>
+                  <p className="muted-sm">New container packages with full saved package price</p>
+                </div>
+                <span className="dash-total-pill">
+                  {report.containerSales.totalUnits.toLocaleString("en-US")}{" "}
+                  {report.containerSales.totalUnits === 1 ? "unit" : "units"} ·{" "}
+                  {formatDashboardPesoCompact(report.containerSales.totalSalesCentavos)}
+                </span>
+              </div>
+
+              {report.containerSales.totalUnits === 0 ? (
+                <div className="dash-empty-box">
+                  <p className="dash-empty-box__title">
+                    No container package sales recorded in this period.
+                  </p>
+                </div>
+              ) : (
+                <div className="dash-container-groups">
+                  {[
+                    { title: "Round Containers", items: roundContainers },
+                    { title: "Slim Containers", items: slimContainers },
+                  ].map((group) => (
+                    <div key={group.title} className="dash-container-group">
+                      <h3 className="dash-container-group__title">{group.title}</h3>
+                      <ul className="dash-service-list">
+                        {group.items.map((item) => (
+                          <li key={item.packageCode} className="dash-service-row">
+                            <div className="dash-service-row__meta">
+                              <strong>{item.label}</strong>
+                              <span className="muted-sm">
+                                {item.units.toLocaleString("en-US")}{" "}
+                                {item.units === 1 ? "package" : "packages"}
+                                {item.waterVolumeMl > 0
+                                  ? ` · ${formatWaterLiters(item.waterVolumeMl)}`
+                                  : ""}
+                              </span>
+                            </div>
+                            <span className="dash-service-row__amount">
+                              {formatDashboardPeso(item.salesCentavos)}
+                            </span>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  ))}
+                </div>
               )}
             </section>
           </div>
@@ -445,79 +597,113 @@ export function SalesView({
         </>
       )}
 
-      <section className="card dash-panel" aria-labelledby="station-reminders-heading">
-        <div className="dash-panel__header">
-          <div>
-            <h2 id="station-reminders-heading">Station Reminders</h2>
-            <p className="muted-sm">Live Calendar reminder window (overdue first, unaffected by sales dates)</p>
-          </div>
-          <span className="dash-kpi-card__icon" aria-hidden="true">
-            <CalendarCardIcon />
-          </span>
-        </div>
-
-        {remindersError ? (
-          <div className="alert alert--error dash-inline-alert" role="alert">
-            <span>{remindersError}</span>
-            <button type="button" className="button button--ghost button--sm" onClick={onRetryReminders}>
-              Retry
-            </button>
-          </div>
-        ) : remindersLoading && !reminders ? (
-          <p className="muted-sm" role="status">
-            Checking station reminders…
-          </p>
-        ) : reminders && reminders.items.length === 0 ? (
-          <p className="muted-sm">No overdue or upcoming activities in the next 7 days.</p>
-        ) : (
-          <div className="dash-reminders-body">
-            {reminders && (
-              <div className="dash-reminders-counts">
-                <span className={`pill ${reminders.overdueCount > 0 ? "pill--overdue" : "pill--neutral"}`}>
-                  {reminders.overdueCount} overdue
-                </span>
-                <span className="pill pill--scheduled">{reminders.upcomingCount} upcoming</span>
+      <div className="dash-sales-bottom-grid">
+        {report && (
+          <section className="card dash-panel" aria-labelledby="recommendations-heading">
+            <div className="dash-panel__header">
+              <div>
+                <h2 id="recommendations-heading">What the Numbers Tell You</h2>
+                <p className="muted-sm">Rule-based observations from current station records</p>
               </div>
+              <span className="pill pill--neutral">{report.recommendations.length}</span>
+            </div>
+
+            {report.recommendations.length === 0 ? (
+              <div className="dash-empty-box">
+                <p className="dash-empty-box__title">
+                  No Recommendations Available for the Current Data
+                </p>
+              </div>
+            ) : (
+              <ul className="dash-rec-list">
+                {report.recommendations.map((rec) => (
+                  <li key={rec.id} className="dash-rec-item">
+                    <strong className="dash-rec-item__title">{rec.title}</strong>
+                    <p className="muted-sm">
+                      <strong>Observation:</strong> {rec.observation}
+                    </p>
+                    <p className="muted-sm">
+                      <strong>Suggested action:</strong> {rec.suggestedAction}
+                    </p>
+                  </li>
+                ))}
+              </ul>
             )}
-            <ul className="dash-reminder-list">
-              {visibleReminders.map((item) => (
-                <li
-                  key={item.reference}
-                  className={`dash-reminder-item ${
-                    item.status === "OVERDUE" ? "dash-reminder-item--overdue" : ""
-                  }`}
-                >
-                  <div className="dash-reminder-item__main">
-                    <span
-                      className={`pill ${
-                        item.status === "OVERDUE" ? "pill--overdue" : "pill--scheduled"
-                      }`}
-                    >
-                      {item.status === "OVERDUE" ? "Overdue" : "Upcoming"}
-                    </span>
-                    <strong>{item.name}</strong>
-                  </div>
-                  <span className="muted-sm">
-                    {formatFullManilaDateLabel(item.scheduledDate)} · {formatTime12h(item.scheduledTime)}
-                  </span>
-                </li>
-              ))}
-            </ul>
-            {extraReminderCount > 0 && (
-              <p className="muted-sm">
-                +{extraReminderCount} more {extraReminderCount === 1 ? "activity" : "activities"} in Activity
-                Calendar.
-              </p>
-            )}
-          </div>
+          </section>
         )}
 
-        <div className="dash-panel__footer-link">
-          <Link to="/calendar" className="dash-card-link">
-            View Activity Calendar →
-          </Link>
-        </div>
-      </section>
+        <section className="card dash-panel" aria-labelledby="station-reminders-heading">
+          <div className="dash-panel__header">
+            <div>
+              <h2 id="station-reminders-heading">Station Reminders</h2>
+              <p className="muted-sm">Live Calendar reminder window (overdue first, unaffected by sales dates)</p>
+            </div>
+            <span className="dash-kpi-card__icon" aria-hidden="true">
+              <CalendarCardIcon />
+            </span>
+          </div>
+
+          {remindersError ? (
+            <div className="alert alert--error dash-inline-alert" role="alert">
+              <span>{remindersError}</span>
+              <button type="button" className="button button--ghost button--sm" onClick={onRetryReminders}>
+                Retry
+              </button>
+            </div>
+          ) : remindersLoading && !reminders ? (
+            <p className="muted-sm" role="status">
+              Checking station reminders…
+            </p>
+          ) : reminders && reminders.items.length === 0 ? (
+            <p className="muted-sm">No overdue or upcoming activities in the next 7 days.</p>
+          ) : (
+            <div className="dash-reminders-body">
+              {reminders && (
+                <div className="dash-reminders-counts">
+                  <span className={`pill ${reminders.overdueCount > 0 ? "pill--overdue" : "pill--neutral"}`}>
+                    {reminders.overdueCount} overdue
+                  </span>
+                  <span className="pill pill--scheduled">{reminders.upcomingCount} upcoming</span>
+                </div>
+              )}
+              <ul className="dash-reminder-list">
+                {visibleReminders.map((item) => (
+                  <li
+                    key={item.reference}
+                    className={`dash-reminder-item ${item.status === "OVERDUE" ? "dash-reminder-item--overdue" : ""
+                      }`}
+                  >
+                    <div className="dash-reminder-item__main">
+                      <span
+                        className={`pill ${item.status === "OVERDUE" ? "pill--overdue" : "pill--scheduled"
+                          }`}
+                      >
+                        {item.status === "OVERDUE" ? "Overdue" : "Upcoming"}
+                      </span>
+                      <strong>{item.name}</strong>
+                    </div>
+                    <span className="muted-sm">
+                      {formatFullManilaDateLabel(item.scheduledDate)} · {formatTime12h(item.scheduledTime)}
+                    </span>
+                  </li>
+                ))}
+              </ul>
+              {extraReminderCount > 0 && (
+                <p className="muted-sm">
+                  +{extraReminderCount} more {extraReminderCount === 1 ? "activity" : "activities"} in Activity
+                  Calendar.
+                </p>
+              )}
+            </div>
+          )}
+
+          <div className="dash-panel__footer-link">
+            <Link to="/calendar" className="dash-card-link">
+              View Activity Calendar →
+            </Link>
+          </div>
+        </section>
+      </div>
     </div>
   );
 }

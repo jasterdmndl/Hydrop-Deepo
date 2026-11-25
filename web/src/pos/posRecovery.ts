@@ -5,6 +5,7 @@ export type ItemKind = "STANDARD" | "CUSTOM" | "MERCHANDISE" | "CONTAINER_PACKAG
 export type PosSection = string;
 export type ContainerShape = "ROUND" | "SLIM";
 export type IncludedGripoType = "PUSH_TYPE" | "TWIST_TYPE";
+export type FaucetReportingType = "PUSH_TYPE" | "TWIST_TYPE";
 export type ContainerPackageCode =
   | "ROUND_EMPTY"
   | "ROUND_PURIFIED"
@@ -74,6 +75,7 @@ export interface PosMerchandiseItem {
   unit: string;
   unitPriceCentavos: number;
   posSection: PosSection;
+  faucetReportingType?: FaucetReportingType | null;
   stockStatus: "NOT_SET" | "OUT_OF_STOCK" | "IN_STOCK";
   currentQuantity: number | null;
   availableQuantity: number | null;
@@ -113,6 +115,7 @@ export interface QuoteLineItem {
   stockUnit?: string | null;
   posSection?: PosSection | null;
   includedGripo?: IncludedGripoType | null;
+  faucetReportingType?: FaucetReportingType | null;
   displayLabel: string;
   unitVolumeMl: number;
   unitVolumeLiters: number;

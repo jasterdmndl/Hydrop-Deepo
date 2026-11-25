@@ -8,6 +8,7 @@ import { type InventoryItemsResponse, type InventoryItemView, type PosSectionVie
 import {
   type DashboardPeriod,
   type DashboardSalesReport,
+  type DashboardStockTrendResponse,
   type DashboardViewMode,
   formatCutoffClock,
   formatManilaDateRange,
@@ -65,9 +66,21 @@ export function DashboardPage() {
   const [stocksLoading, setStocksLoading] = useState(false);
   const [stocksError, setStocksError] = useState<string | null>(null);
 
+  const [selectedTrendItemKey, setSelectedTrendItemKey] = useState<string | null>(null);
+  const [stockTrendState, setStockTrendState] = useState<{
+    key: string;
+    trend: DashboardStockTrendResponse;
+  } | null>(null);
+  const [stockTrendErrorState, setStockTrendErrorState] = useState<{
+    key: string;
+    message: string;
+  } | null>(null);
+  const [stockTrendLoadingKey, setStockTrendLoadingKey] = useState<string | null>(null);
+
   const salesTrackerRef = useRef(createRequestTracker());
   const remindersTrackerRef = useRef(createRequestTracker());
   const stocksTrackerRef = useRef(createRequestTracker());
+  const stockTrendTrackerRef = useRef(createRequestTracker());
 
   useEffect(() => {
     const previousTitle = document.title;
@@ -148,6 +161,11 @@ export function DashboardPage() {
       setStockItems(next.items);
       setStockSections(next.posSections ?? []);
       setStocksHasLoaded(true);
+      const activeKeys = next.items.map((item) => item.shape ?? item.id ?? item.code);
+      setSelectedTrendItemKey((prev) => {
+        if (prev && activeKeys.includes(prev)) return prev;
+        return activeKeys[0] ?? null;
+      });
     } catch (err) {
       if (!stocksTrackerRef.current.isCurrent(requestId)) return;
       setStocksError(
@@ -159,6 +177,34 @@ export function DashboardPage() {
       }
     }
   }, [user.role]);
+
+  const loadStockTrend = useCallback(
+    async (itemKey: string) => {
+      if (user.role !== "OWNER" || !itemKey) return;
+      const requestId = stockTrendTrackerRef.current.next();
+      setStockTrendLoadingKey(itemKey);
+      setStockTrendErrorState((prev) => (prev?.key === itemKey ? null : prev));
+      try {
+        const next = await api<DashboardStockTrendResponse>(
+          `/api/dashboard/stocks/${encodeURIComponent(itemKey)}/trend`,
+        );
+        if (!stockTrendTrackerRef.current.isCurrent(requestId)) return;
+        setStockTrendState({ key: itemKey, trend: next });
+        setStockTrendErrorState(null);
+      } catch (err) {
+        if (!stockTrendTrackerRef.current.isCurrent(requestId)) return;
+        setStockTrendErrorState({
+          key: itemKey,
+          message: err instanceof ApiError ? err.message : "Could not load product stock trend.",
+        });
+      } finally {
+        if (stockTrendTrackerRef.current.isCurrent(requestId)) {
+          setStockTrendLoadingKey((current) => (current === itemKey ? null : current));
+        }
+      }
+    },
+    [user.role],
+  );
 
   useEffect(() => {
     if (user.role !== "OWNER") return;
@@ -175,6 +221,11 @@ export function DashboardPage() {
     void loadStocks();
   }, [user.role, viewMode, loadStocks]);
 
+  useEffect(() => {
+    if (user.role !== "OWNER" || viewMode !== "stocks" || !selectedTrendItemKey) return;
+    void loadStockTrend(selectedTrendItemKey);
+  }, [user.role, viewMode, selectedTrendItemKey, loadStockTrend]);
+
   if (user.role !== "OWNER") {
     return <Navigate to="/" replace />;
   }
@@ -185,6 +236,17 @@ export function DashboardPage() {
     salesErrorState?.key === activeSalesKey ? salesErrorState.message : null;
   const visibleSalesLoading = salesLoadingKey === activeSalesKey;
   const serverToday = salesReportState?.report.range.todayDate ?? initialToday;
+
+  const visibleStockTrend =
+    selectedTrendItemKey && stockTrendState?.key === selectedTrendItemKey
+      ? stockTrendState.trend
+      : null;
+  const visibleStockTrendError =
+    selectedTrendItemKey && stockTrendErrorState?.key === selectedTrendItemKey
+      ? stockTrendErrorState.message
+      : null;
+  const visibleStockTrendLoading =
+    Boolean(selectedTrendItemKey && stockTrendLoadingKey === selectedTrendItemKey);
 
   function selectSalesPeriod(nextPeriod: DashboardPeriod) {
     setViewMode("sales");
@@ -390,7 +452,18 @@ export function DashboardPage() {
           hasLoaded={stocksHasLoaded}
           loading={stocksLoading}
           error={stocksError}
-          onRetry={() => void loadStocks()}
+          onRetry={() => {
+            void loadStocks();
+            if (selectedTrendItemKey) void loadStockTrend(selectedTrendItemKey);
+          }}
+          selectedTrendItemKey={selectedTrendItemKey}
+          onSelectTrendItem={(itemKey) => setSelectedTrendItemKey(itemKey)}
+          stockTrend={visibleStockTrend}
+          stockTrendLoading={visibleStockTrendLoading}
+          stockTrendError={visibleStockTrendError}
+          onRetryTrend={() => {
+            if (selectedTrendItemKey) void loadStockTrend(selectedTrendItemKey);
+          }}
         />
       )}
     </AppShell>

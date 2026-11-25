@@ -3410,6 +3410,7 @@ describe("POS station day and refill sales", () => {
           "0010_pos_container_included_gripo.sql",
           "0011_pos_legacy_pending_container_gripo.sql",
           "0012_pos_prior_day_merchandise_settlement.sql",
+          "0013_dashboard_final_settings.sql",
         ]);
 
         const cashierAfter = await signIn(upgradeApp, "upcashier", upCashier.password);
@@ -3515,6 +3516,7 @@ describe("POS station day and refill sales", () => {
           "0010_pos_container_included_gripo.sql",
           "0011_pos_legacy_pending_container_gripo.sql",
           "0012_pos_prior_day_merchandise_settlement.sql",
+          "0013_dashboard_final_settings.sql",
         ]);
       } finally {
         await revisedDb.close();
@@ -3640,6 +3642,7 @@ describe("POS station day and refill sales", () => {
           "0010_pos_container_included_gripo.sql",
           "0011_pos_legacy_pending_container_gripo.sql",
           "0012_pos_prior_day_merchandise_settlement.sql",
+          "0013_dashboard_final_settings.sql",
         ]);
 
         const cashier = await signIn(upgradeApp, "f6cashier", upCashier.password);
@@ -3880,6 +3883,7 @@ describe("POS station day and refill sales", () => {
           "0010_pos_container_included_gripo.sql",
           "0011_pos_legacy_pending_container_gripo.sql",
           "0012_pos_prior_day_merchandise_settlement.sql",
+          "0013_dashboard_final_settings.sql",
         ]);
 
         const cashier = await signIn(upgradeApp, "f7cashier", upCashier.password);
@@ -4114,6 +4118,7 @@ describe("POS station day and refill sales", () => {
           "0010_pos_container_included_gripo.sql",
           "0011_pos_legacy_pending_container_gripo.sql",
           "0012_pos_prior_day_merchandise_settlement.sql",
+          "0013_dashboard_final_settings.sql",
         ]);
 
         // Cross Asia/Manila midnight with cash collection never started on draftRef
@@ -4908,6 +4913,192 @@ describe("POS station day and refill sales", () => {
         .set("Cookie", cashier.cookie);
       expect(oldSessionRes.status).toBe(401);
       expect(oldSessionRes.body.error.code).toBe("SESSION_REPLACED");
+    });
+  });
+
+  describe("faucet reporting type snapshots and legacy quote compatibility (DEC-093)", () => {
+    it("snapshots explicit typed and deliberately untyped merchandise choices while confirming legacy quotes and same-reference retries", async () => {
+      // Create typed faucet and untyped accessory
+      const typedRes = await request(ctx.app)
+        .post("/api/inventory/products")
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          name: "Push-Type Faucet",
+          unit: "pcs",
+          unitConfirmed: true,
+          unitPriceCentavos: 4000,
+          showInPos: true,
+          posSection: "CHANGE_OF_GRIPO",
+          faucetReportingType: "PUSH_TYPE",
+        });
+      expect(typedRes.status).toBe(201);
+      const typedId = typedRes.body.item.id as string;
+
+      const untypedRes = await request(ctx.app)
+        .post("/api/inventory/products")
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          name: "Blue Cap",
+          unit: "pcs",
+          unitConfirmed: true,
+          unitPriceCentavos: 1500,
+          showInPos: true,
+          posSection: "TAKIP_ACCESSORIES",
+          faucetReportingType: null,
+        });
+      expect(untypedRes.status).toBe(201);
+      const untypedId = untypedRes.body.item.id as string;
+
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/inventory/items/${encodeURIComponent(typedId)}/opening-stock`)
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({ quantity: 10 })
+        ).status,
+      ).toBe(201);
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/inventory/items/${encodeURIComponent(untypedId)}/opening-stock`)
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({ quantity: 10 })
+        ).status,
+      ).toBe(201);
+
+      expect((await startDay(ctx, owner, { requestKey: "faucet-snap-day" })).status).toBe(201);
+
+      // Prepare typed + deliberately untyped quote
+      const prep = await prepareCheckout(ctx, cashier, {
+        prepareKey: "faucet-snap-prep-1",
+        items: [
+          { kind: "MERCHANDISE", productId: typedId, quantity: 2 },
+          { kind: "MERCHANDISE", productId: untypedId, quantity: 1 },
+        ],
+      });
+      expect(prep.status).toBe(201);
+      const ref1 = prep.body.checkout.reference as string;
+      expect(prep.body.checkout.items[0].faucetReportingType).toBe("PUSH_TYPE");
+      expect(prep.body.checkout.items[1].faucetReportingType).toBeNull();
+
+      // Owner renames, reprices, re-tags to TWIST_TYPE, and moves section after quote preparation
+      expect(
+        (
+          await request(ctx.app)
+            .patch(`/api/inventory/products/${encodeURIComponent(typedId)}`)
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({
+              name: "Renamed Twist Gripo",
+              unitPriceCentavos: 9900,
+              posSection: "TAKIP_ACCESSORIES",
+              faucetReportingType: "TWIST_TYPE",
+            })
+        ).status,
+      ).toBe(200);
+
+      // Begin payment, then archive product; confirm original ref1 -> preserves PUSH_TYPE, Push-Type Faucet, ₱40.00, and NONE for untyped
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/checkouts/${encodeURIComponent(ref1)}/begin-payment`)
+            .set("Cookie", cashier.cookie)
+            .set("X-CSRF-Token", cashier.csrfToken)
+            .send({})
+        ).status,
+      ).toBe(200);
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/inventory/products/${encodeURIComponent(typedId)}/archive`)
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({})
+        ).status,
+      ).toBe(200);
+      const confirm1 = await confirmCheckout(ctx.app, cashier, ref1, {
+        cashReceivedCentavos: 10000,
+        items: [
+          { kind: "MERCHANDISE", productId: typedId, quantity: 2 },
+          { kind: "MERCHANDISE", productId: untypedId, quantity: 1 },
+        ],
+      });
+      expect(confirm1.status).toBe(201);
+      expect(confirm1.body.sale.items[0]).toMatchObject({
+        displayLabel: "Push-Type Faucet",
+        unitPriceCentavos: 4000,
+        faucetReportingType: "PUSH_TYPE",
+      });
+      expect(confirm1.body.sale.items[1]).toMatchObject({
+        displayLabel: "Blue Cap",
+      });
+      expect(confirm1.body.sale.items[1].faucetReportingType).toBeUndefined();
+
+      const { rows: savedDbTypes } = await ctx.db.query<{
+        line_index: number;
+        faucet_reporting_type: string | null;
+      }>(
+        `SELECT psi.line_index, psi.faucet_reporting_type
+           FROM pos_sale_items psi
+           JOIN pos_sales ps ON ps.id = psi.sale_id
+          WHERE ps.reference = $1
+          ORDER BY psi.line_index ASC`,
+        [ref1],
+      );
+      expect(savedDbTypes).toEqual([
+        { line_index: 0, faucet_reporting_type: "PUSH_TYPE" },
+        { line_index: 1, faucet_reporting_type: "NONE" },
+      ]);
+
+      // Same-reference retry replays cleanly without duplicate sale or stock deduction
+      const retry1 = await confirmCheckout(ctx.app, cashier, ref1, {
+        cashReceivedCentavos: 10000,
+      });
+      expect(retry1.status).toBe(200);
+      expect(retry1.body.replayed).toBe(true);
+
+      // Legacy quote snapshot (without faucetReportingType property) confirms with DB NULL
+      const legacyPrep = await prepareCheckout(ctx, cashier, {
+        prepareKey: "faucet-legacy-prep",
+        items: [{ kind: "MERCHANDISE", productId: untypedId, quantity: 1 }],
+      });
+      expect(legacyPrep.status).toBe(201);
+      const legacyRef = legacyPrep.body.checkout.reference as string;
+      // Strip faucetReportingType from quote_snapshot to simulate a pre-0013 prepared quote
+      await ctx.db.query(
+        `UPDATE pos_checkouts
+            SET quote_snapshot = (
+              SELECT jsonb_agg(elem - 'faucetReportingType')
+                FROM jsonb_array_elements(quote_snapshot) AS elem
+            )
+          WHERE reference = $1`,
+        [legacyRef],
+      );
+      const legacyConfirm = await confirmCheckout(ctx.app, cashier, legacyRef, {
+        cashReceivedCentavos: 2000,
+        items: [{ kind: "MERCHANDISE", productId: untypedId, quantity: 1 }],
+      });
+      expect(legacyConfirm.status).toBe(201);
+      expect("faucetReportingType" in legacyConfirm.body.sale.items[0]).toBe(false);
+
+      const { rows: legacyDbTypes } = await ctx.db.query<{ faucet_reporting_type: string | null }>(
+        `SELECT psi.faucet_reporting_type
+           FROM pos_sale_items psi
+           JOIN pos_sales ps ON ps.id = psi.sale_id
+          WHERE ps.reference = $1`,
+        [legacyRef],
+      );
+      expect(legacyDbTypes).toEqual([{ faucet_reporting_type: null }]);
+
+      const legacyRetry = await confirmCheckout(ctx.app, cashier, legacyRef, {
+        cashReceivedCentavos: 2000,
+      });
+      expect(legacyRetry.status).toBe(200);
+      expect(legacyRetry.body.replayed).toBe(true);
     });
   });
 });

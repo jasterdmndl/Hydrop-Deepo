@@ -8,6 +8,7 @@ import {
   type ContainerShape,
   type DaySummaryView,
   type DayView,
+  type FaucetReportingType,
   formatManilaIso,
   formatSaleReference,
   type IncludedGripoType,
@@ -41,6 +42,7 @@ export interface MerchandiseCatalogDbRow {
   unit: string;
   unitPriceCentavos: number | string;
   posSection: PosSection;
+  faucetReportingType: FaucetReportingType | null;
   currentQuantity: number | string | null;
   activeCommitted: number | string;
 }
@@ -56,6 +58,7 @@ export interface LockedMerchandiseItem {
   unitPriceCentavos: number | null;
   showInPos: boolean;
   posSection: PosSection | null;
+  faucetReportingType: FaucetReportingType | null;
   currentQuantity: number | null;
   archivedAt: string | null;
   otherActiveCommitted: number;
@@ -136,6 +139,7 @@ interface SaleItemDbRow {
   stockUnit: string | null;
   posSection: PosSection | null;
   includedGripo: IncludedGripoType | null;
+  faucetReportingType: FaucetReportingType | "NONE" | null;
   displayLabel: string;
   unitVolumeMl: number | string;
   unitPriceCentavos: number | string;
@@ -444,6 +448,7 @@ async function loadSaleViews(
               stock_unit AS "stockUnit",
               pos_section AS "posSection",
               included_gripo AS "includedGripo",
+              faucet_reporting_type AS "faucetReportingType",
               display_label AS "displayLabel",
               unit_volume_ml AS "unitVolumeMl",
               unit_price_centavos AS "unitPriceCentavos",
@@ -483,6 +488,10 @@ async function loadSaleViews(
             productId: row.productId,
             stockUnit: row.stockUnit,
             posSection: row.posSection,
+            ...(row.itemKind === "MERCHANDISE" &&
+            (row.faucetReportingType === "PUSH_TYPE" || row.faucetReportingType === "TWIST_TYPE")
+              ? { faucetReportingType: row.faucetReportingType }
+              : {}),
             ...(row.itemKind === "CONTAINER_PACKAGE"
               ? { includedGripo: row.includedGripo }
               : {}),
@@ -670,6 +679,7 @@ export const posRepository = {
               i.unit,
               i.unit_price_centavos AS "unitPriceCentavos",
               i.pos_section AS "posSection",
+              i.faucet_reporting_type AS "faucetReportingType",
               i.current_quantity AS "currentQuantity",
               COALESCE(c.committed_qty, 0) AS "activeCommitted"
          FROM inventory_items i
@@ -711,6 +721,7 @@ export const posRepository = {
       unitPriceCentavos: number | string | null;
       showInPos: boolean;
       posSection: PosSection | null;
+      faucetReportingType: FaucetReportingType | null;
       currentQuantity: number | string | null;
       archivedAt: Date | string | null;
     }>(
@@ -724,6 +735,7 @@ export const posRepository = {
               unit_price_centavos AS "unitPriceCentavos",
               show_in_pos AS "showInPos",
               pos_section AS "posSection",
+              faucet_reporting_type AS "faucetReportingType",
               current_quantity AS "currentQuantity",
               archived_at AS "archivedAt"
          FROM inventory_items
@@ -770,6 +782,7 @@ export const posRepository = {
         unitPriceCentavos: row.unitPriceCentavos === null ? null : Number(row.unitPriceCentavos),
         showInPos: Boolean(row.showInPos),
         posSection: row.posSection ?? null,
+        faucetReportingType: row.faucetReportingType ?? null,
         currentQuantity: row.currentQuantity === null ? null : Number(row.currentQuantity),
         archivedAt: row.archivedAt ? formatManilaIso(toDate(row.archivedAt)) : null,
         otherActiveCommitted: committedByItem.get(row.id) ?? 0,
@@ -1267,13 +1280,23 @@ export const posRepository = {
     const saleId = saleInserted[0]!.id;
 
     for (const item of input.items) {
+      const dbFaucetReportingType =
+        item.kind !== "MERCHANDISE"
+          ? null
+          : item.faucetReportingType === "PUSH_TYPE" || item.faucetReportingType === "TWIST_TYPE"
+            ? item.faucetReportingType
+            : "faucetReportingType" in item
+              ? "NONE"
+              : null;
+
       await tx.query(
         `INSERT INTO pos_sale_items (
            sale_id, line_index, item_kind, catalog_code, water_type,
-           inventory_item_id, stock_unit, pos_section, included_gripo, display_label,
-           unit_volume_ml, unit_price_centavos, quantity, line_total_centavos, line_volume_ml
+           inventory_item_id, stock_unit, pos_section, included_gripo, faucet_reporting_type,
+           display_label, unit_volume_ml, unit_price_centavos, quantity,
+           line_total_centavos, line_volume_ml
          )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
         [
           saleId,
           item.lineIndex,
@@ -1284,6 +1307,7 @@ export const posRepository = {
           item.stockUnit ?? null,
           item.posSection ?? null,
           item.includedGripo ?? null,
+          dbFaucetReportingType,
           item.displayLabel,
           item.unitVolumeMl,
           item.unitPriceCentavos,
