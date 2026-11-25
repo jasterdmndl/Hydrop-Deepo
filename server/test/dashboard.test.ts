@@ -2,6 +2,7 @@ import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "../src/app.js";
 import type { Database } from "../src/db/database.js";
+import { classifyStandaloneMerchandiseFaucet } from "../src/modules/dashboard/salesReport.js";
 import { ManualClock } from "../src/shared/clock.js";
 import {
   activatedAccount,
@@ -762,5 +763,1143 @@ describe("Dashboard sales report and authorization (DEC-076)", () => {
       salesCentavos: 2500,
       sharePercent: 100,
     });
+  });
+});
+
+describe("Final Dashboard Sales comparison, breakdowns, and recommendations (DEC-086..088, DEC-091..093)", () => {
+  let ctx: TestContext;
+  let owner: Activated;
+  let cashier: Activated;
+
+  beforeEach(async () => {
+    ctx = await createTestContext({ clock: new ManualClock("2026-11-04T08:00:00+08:00") });
+    owner = await activatedAccount(ctx, "owner1", "OWNER");
+    cashier = await activatedAccount(ctx, "cashier1", "CASHIER");
+  });
+
+  afterEach(async () => {
+    await ctx.close();
+  });
+
+  it("enforces matched Manila comparison windows, partial-day cutoffs, full day-record coverage, short months, verified zero, and exact 10% decline", async () => {
+    // Open & run previous week Mon Nov 2, Tue Nov 3, Wed Nov 4
+    ctx.clock.set("2026-11-02T08:00:00+08:00");
+    owner = await reauth(ctx, "owner1", owner);
+    expect((await startDay(ctx, owner, "w1-mon")).status).toBe(201);
+    await sellCart(ctx, owner, [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 2 }], 5000, "w1-mon-s1"); // 5000
+    expect((await endDay(ctx, owner, "w1-mon-end")).status).toBe(200);
+
+    ctx.clock.set("2026-11-03T08:00:00+08:00");
+    owner = await reauth(ctx, "owner1", owner);
+    expect((await startDay(ctx, owner, "w1-tue")).status).toBe(201);
+    // Zero valid sales on Tue Nov 3 (verified ₱0)
+    expect((await endDay(ctx, owner, "w1-tue-end")).status).toBe(200);
+
+    // Wed Nov 4 starts at 15:00 (after 14:00 cutoff) initially to test coverage rejection, plus a sale at 15:10
+    ctx.clock.set("2026-11-04T15:00:00+08:00");
+    owner = await reauth(ctx, "owner1", owner);
+    expect((await startDay(ctx, owner, "w1-wed")).status).toBe(201);
+    ctx.clock.set("2026-11-04T15:10:00+08:00");
+    await sellCart(ctx, owner, [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 2 }], 5000, "w1-wed-late"); // 5000
+    expect((await endDay(ctx, owner, "w1-wed-end")).status).toBe(200);
+
+    // Current week Mon Nov 9, Tue Nov 10, Wed Nov 11
+    ctx.clock.set("2026-11-09T08:00:00+08:00");
+    owner = await reauth(ctx, "owner1", owner);
+    expect((await startDay(ctx, owner, "w2-mon")).status).toBe(201);
+    await sellCart(ctx, owner, [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 2 }], 5000, "w2-mon-s1"); // 5000
+    expect((await endDay(ctx, owner, "w2-mon-end")).status).toBe(200);
+
+    ctx.clock.set("2026-11-10T08:00:00+08:00");
+    owner = await reauth(ctx, "owner1", owner);
+    expect((await startDay(ctx, owner, "w2-tue")).status).toBe(201);
+    await sellCart(ctx, owner, [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 1 }], 5000, "w2-tue-s1"); // 2500
+    expect((await endDay(ctx, owner, "w2-tue-end")).status).toBe(200);
+
+    ctx.clock.set("2026-11-11T08:00:00+08:00");
+    owner = await reauth(ctx, "owner1", owner);
+    expect((await startDay(ctx, owner, "w2-wed")).status).toBe(201);
+
+    // Query This Week at Wed Nov 11 14:00 -> prev Wed Nov 4 started at 15:00, so prev Wed lacks coverage by 14:00 cutoff!
+    ctx.clock.set("2026-11-11T14:00:00+08:00");
+    owner = await reauth(ctx, "owner1", owner);
+    const missingCutoffWeek = await request(ctx.app)
+      .get("/api/dashboard/sales?period=week")
+      .set("Cookie", owner.cookie);
+    expect(missingCutoffWeek.status).toBe(200);
+    expect(missingCutoffWeek.body.totals.salesCentavos).toBe(7500);
+    expect(missingCutoffWeek.body.comparison).toMatchObject({
+      available: false,
+      unavailableReason: "MISSING_STATION_DAY",
+      currentRange: { from: "2026-11-09", to: "2026-11-11" },
+      previousRange: { from: "2026-11-02", to: "2026-11-04" },
+      amountChangeCentavos: null,
+      percentChange: null,
+    });
+
+    // Update Wed Nov 4 started_at to 08:00 so coverage exists, while its 15:10 sale remains after 14:00 cutoff
+    await ctx.db.query(
+      `UPDATE pos_business_days SET started_at = '2026-11-04T08:00:00+08:00' WHERE business_date = '2026-11-04'`,
+    );
+    const coveredAt1400 = await request(ctx.app)
+      .get("/api/dashboard/sales?period=week")
+      .set("Cookie", owner.cookie);
+    expect(coveredAt1400.status).toBe(200);
+    expect(coveredAt1400.body.comparison).toMatchObject({
+      available: true,
+      currentTotalSalesCentavos: 7500,
+      previousTotalSalesCentavos: 5000, // 15:10 sale on Nov 4 is excluded by 14:00 cutoff
+      amountChangeCentavos: 2500,
+      percentChange: 50,
+    });
+
+    // At 15:30 on Wed Nov 11, the 15:10 receipt on Nov 4 is now included (5000 + 5000 = 10000) -> 7500 vs 10000 = -25%
+    ctx.clock.set("2026-11-11T15:30:00+08:00");
+    owner = await reauth(ctx, "owner1", owner);
+    const coveredAt1530 = await request(ctx.app)
+      .get("/api/dashboard/sales?period=week")
+      .set("Cookie", owner.cookie);
+    expect(coveredAt1530.status).toBe(200);
+    expect(coveredAt1530.body.comparison).toMatchObject({
+      available: true,
+      currentTotalSalesCentavos: 7500,
+      previousTotalSalesCentavos: 10000,
+      amountChangeCentavos: -2500,
+      percentChange: -25,
+    });
+
+    // Today comparison at 15:30 on Nov 11 (0) vs Nov 10 through 15:30 (2500) -> -2500 (-100%)
+    const todayComp = await request(ctx.app)
+      .get("/api/dashboard/sales?period=today")
+      .set("Cookie", owner.cookie);
+    expect(todayComp.status).toBe(200);
+    expect(todayComp.body.comparison).toMatchObject({
+      available: true,
+      currentTotalSalesCentavos: 0,
+      previousTotalSalesCentavos: 2500,
+      amountChangeCentavos: -2500,
+      percentChange: -100,
+    });
+
+    // Verified ₱0 previous period: Custom Nov 4 (whole day) vs Nov 3 (whole day) uses selected end date, not refresh clock
+    const zeroPrevCustom = await request(ctx.app)
+      .get("/api/dashboard/sales?period=custom&from=2026-11-04&to=2026-11-04")
+      .set("Cookie", owner.cookie);
+    expect(zeroPrevCustom.status).toBe(200);
+    expect(zeroPrevCustom.body.comparison).toMatchObject({
+      available: true,
+      currentRange: {
+        from: "2026-11-04",
+        to: "2026-11-04",
+        isPartialEndDay: false,
+        cutoffAt: "2026-11-04T23:59:59+08:00",
+      },
+      previousRange: {
+        from: "2026-11-03",
+        to: "2026-11-03",
+        isPartialEndDay: false,
+        cutoffAt: "2026-11-03T23:59:59+08:00",
+      },
+      currentTotalSalesCentavos: 5000,
+      previousTotalSalesCentavos: 0,
+      amountChangeCentavos: 5000,
+      percentChange: null,
+    });
+
+    // Custom partial end day ending today (Nov 10-11 vs Nov 8-9): missing Nov 8 -> Comparison Unavailable
+    const missingCurrentOrPrevCustom = await request(ctx.app)
+      .get("/api/dashboard/sales?period=custom&from=2026-11-10&to=2026-11-11")
+      .set("Cookie", owner.cookie);
+    expect(missingCurrentOrPrevCustom.status).toBe(200);
+    expect(missingCurrentOrPrevCustom.body.comparison).toMatchObject({
+      available: false,
+      unavailableReason: "MISSING_STATION_DAY",
+      previousRange: { from: "2026-11-08", to: "2026-11-09" },
+    });
+
+    // Exact 10% decline vs 9.9% decline on Custom Nov 10 (curr) vs Nov 9 (prev)
+    // Set Nov 9 = 10000 and Nov 10 = 9000 -> -10% (triggers SALES_DECLINE).
+    await ctx.db.query(
+      `UPDATE pos_sales
+          SET total_centavos = 10000,
+              cash_received_centavos = 15000,
+              change_centavos = 5000
+        WHERE business_date = '2026-11-09' AND status = 'ACTIVE'`,
+    );
+    await ctx.db.query(
+      `UPDATE pos_sales
+          SET total_centavos = 9000,
+              cash_received_centavos = 15000,
+              change_centavos = 6000
+        WHERE business_date = '2026-11-10' AND status = 'ACTIVE'`,
+    );
+    const exact10 = await request(ctx.app)
+      .get("/api/dashboard/sales?period=custom&from=2026-11-10&to=2026-11-10")
+      .set("Cookie", owner.cookie);
+    expect(exact10.status).toBe(200);
+    expect(exact10.body.comparison).toMatchObject({
+      available: true,
+      currentTotalSalesCentavos: 9000,
+      previousTotalSalesCentavos: 10000,
+      amountChangeCentavos: -1000,
+      percentChange: -10,
+    });
+    expect(exact10.body.recommendations.some((r: { type: string }) => r.type === "SALES_DECLINE")).toBe(
+      true,
+    );
+
+    await ctx.db.query(
+      `UPDATE pos_sales
+          SET total_centavos = 9010,
+              cash_received_centavos = 15000,
+              change_centavos = 5990
+        WHERE business_date = '2026-11-10' AND status = 'ACTIVE'`,
+    );
+    const below10 = await request(ctx.app)
+      .get("/api/dashboard/sales?period=custom&from=2026-11-10&to=2026-11-10")
+      .set("Cookie", owner.cookie);
+    expect(below10.status).toBe(200);
+    expect(below10.body.comparison).toMatchObject({
+      available: true,
+      currentTotalSalesCentavos: 9010,
+      previousTotalSalesCentavos: 10000,
+      amountChangeCentavos: -990,
+      percentChange: -9.9,
+    });
+    expect(below10.body.recommendations.some((r: { type: string }) => r.type === "SALES_DECLINE")).toBe(
+      false,
+    );
+
+    // Short prior month (Mar 31 -> Feb has no 31st)
+    ctx.clock.set("2026-03-31T10:00:00+08:00");
+    owner = await reauth(ctx, "owner1", owner);
+    const marMonth = await request(ctx.app)
+      .get("/api/dashboard/sales?period=month")
+      .set("Cookie", owner.cookie);
+    expect(marMonth.status).toBe(200);
+    expect(marMonth.body.comparison).toMatchObject({
+      available: false,
+      unavailableReason: "NO_EQUIVALENT_PREVIOUS_MONTH_DATE",
+      previousRange: null,
+    });
+  });
+
+  it("reconciles Container Sales (₱925 example), Faucet Sales (explicit, legacy, untyped NONE, ties), and excludes included gripo", async () => {
+    ctx.clock.set("2026-11-16T09:00:00+08:00");
+    owner = await reauth(ctx, "owner1", owner);
+    cashier = await reauth(ctx, "cashier1", cashier);
+
+    // Setup Round & Slim containers
+    for (const shape of ["ROUND", "SLIM"]) {
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/inventory/items/${shape}/opening-stock`)
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({ quantity: 20 })
+        ).status,
+      ).toBe(201);
+      expect(
+        (
+          await request(ctx.app)
+            .patch(`/api/inventory/containers/${shape}`)
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({ showInPos: true })
+        ).status,
+      ).toBe(200);
+    }
+
+    // Create standalone Push faucet, Twist faucet, and deliberately untyped accessory
+    const createProd = async (payload: Record<string, unknown>) => {
+      const res = await request(ctx.app)
+        .post("/api/inventory/products")
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send(payload);
+      expect(res.status).toBe(201);
+      const id = res.body.item.id as string;
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/inventory/items/${encodeURIComponent(id)}/opening-stock`)
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({ quantity: 20 })
+        ).status,
+      ).toBe(201);
+      return id;
+    };
+
+    const pushId = await createProd({
+      name: "Push Faucet",
+      unit: "pcs",
+      unitConfirmed: true,
+      unitPriceCentavos: 4000,
+      showInPos: true,
+      posSection: "CHANGE_OF_GRIPO",
+      faucetReportingType: "PUSH_TYPE",
+    });
+    const twistId = await createProd({
+      name: "Twist Faucet",
+      unit: "pcs",
+      unitConfirmed: true,
+      unitPriceCentavos: 5000,
+      showInPos: true,
+      posSection: "CHANGE_OF_GRIPO",
+      faucetReportingType: "TWIST_TYPE",
+    });
+    const capId = await createProd({
+      name: "Blue Cap",
+      unit: "pcs",
+      unitConfirmed: true,
+      unitPriceCentavos: 1500,
+      showInPos: true,
+      posSection: "TAKIP_ACCESSORIES",
+      faucetReportingType: null,
+    });
+
+    expect((await startDay(ctx, owner, "breakdowns-day")).status).toBe(201);
+
+    // 1) Design ₱925 Container Sales example:
+    //    3 Empty Round @ ₱175 (52500) + 2 Purified-filled Slim @ ₱200 (40000) with TWIST_TYPE included gripo
+    await sellCart(
+      ctx,
+      cashier,
+      [
+        {
+          kind: "CONTAINER_PACKAGE",
+          packageCode: "ROUND_EMPTY",
+          includedGripo: "PUSH_TYPE",
+          quantity: 3,
+        },
+        {
+          kind: "CONTAINER_PACKAGE",
+          packageCode: "SLIM_PURIFIED",
+          includedGripo: "TWIST_TYPE",
+          quantity: 2,
+        },
+      ],
+      100000,
+      "pkg-925-example",
+    );
+
+    const pkgReport = await request(ctx.app)
+      .get("/api/dashboard/sales?period=today")
+      .set("Cookie", owner.cookie);
+    expect(pkgReport.status).toBe(200);
+    expect(pkgReport.body.totals).toEqual({
+      salesCentavos: 92500,
+      containersRefilled: 0,
+      waterVolumeMl: 50000,
+      transactions: 1,
+    });
+    expect(pkgReport.body.containerSales).toEqual({
+      totalUnits: 5,
+      totalSalesCentavos: 92500,
+      items: [
+        {
+          packageCode: "ROUND_EMPTY",
+          shape: "ROUND",
+          fillType: "EMPTY",
+          label: "Empty Round",
+          units: 3,
+          salesCentavos: 52500,
+          waterVolumeMl: 0,
+        },
+        {
+          packageCode: "ROUND_PURIFIED",
+          shape: "ROUND",
+          fillType: "PURIFIED",
+          label: "Purified Round",
+          units: 0,
+          salesCentavos: 0,
+          waterVolumeMl: 0,
+        },
+        {
+          packageCode: "ROUND_ALKALINE",
+          shape: "ROUND",
+          fillType: "ALKALINE",
+          label: "Alkaline Round",
+          units: 0,
+          salesCentavos: 0,
+          waterVolumeMl: 0,
+        },
+        {
+          packageCode: "SLIM_EMPTY",
+          shape: "SLIM",
+          fillType: "EMPTY",
+          label: "Empty Slim",
+          units: 0,
+          salesCentavos: 0,
+          waterVolumeMl: 0,
+        },
+        {
+          packageCode: "SLIM_PURIFIED",
+          shape: "SLIM",
+          fillType: "PURIFIED",
+          label: "Purified Slim",
+          units: 2,
+          salesCentavos: 40000,
+          waterVolumeMl: 50000,
+        },
+        {
+          packageCode: "SLIM_ALKALINE",
+          shape: "SLIM",
+          fillType: "ALKALINE",
+          label: "Alkaline Slim",
+          units: 0,
+          salesCentavos: 0,
+          waterVolumeMl: 0,
+        },
+      ],
+    });
+    // Included gripo on container packages must NOT appear in standalone Faucet Sales
+    expect(pkgReport.body.faucetSales).toEqual({
+      totalUnits: 0,
+      totalSalesCentavos: 0,
+      leader: null,
+      unclassifiedUnits: 0,
+      unclassifiedSalesCentavos: 0,
+      items: [
+        { type: "PUSH_TYPE", label: "Push-Type Faucet", units: 0, salesCentavos: 0, sharePercent: null },
+        { type: "TWIST_TYPE", label: "Twist-Type Faucet", units: 0, salesCentavos: 0, sharePercent: null },
+      ],
+    });
+
+    // 2) Sell 2 Push Faucets, 2 Twist Faucets (a tie!), and 1 deliberately untyped Blue Cap (NONE)
+    await sellCart(
+      ctx,
+      cashier,
+      [
+        { kind: "MERCHANDISE", productId: pushId, quantity: 2 },
+        { kind: "MERCHANDISE", productId: twistId, quantity: 2 },
+        { kind: "MERCHANDISE", productId: capId, quantity: 1 },
+      ],
+      25000,
+      "faucets-tie-and-cap",
+    );
+
+    // Edit & archive Push Faucet afterward: saved sale must retain Push-Type classification
+    expect(
+      (
+        await request(ctx.app)
+          .patch(`/api/inventory/products/${encodeURIComponent(pushId)}`)
+          .set("Cookie", owner.cookie)
+          .set("X-CSRF-Token", owner.csrfToken)
+          .send({ name: "Renamed", faucetReportingType: "TWIST_TYPE" })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await request(ctx.app)
+          .post(`/api/inventory/products/${encodeURIComponent(pushId)}/archive`)
+          .set("Cookie", owner.cookie)
+          .set("X-CSRF-Token", owner.csrfToken)
+          .send({})
+      ).status,
+    ).toBe(200);
+
+    const tiedReport = await request(ctx.app)
+      .get("/api/dashboard/sales?period=today")
+      .set("Cookie", owner.cookie);
+    expect(tiedReport.status).toBe(200);
+    expect(tiedReport.body.faucetSales).toEqual({
+      totalUnits: 4,
+      totalSalesCentavos: 18000,
+      leader: "TIE",
+      unclassifiedUnits: 0,
+      unclassifiedSalesCentavos: 0,
+      items: [
+        { type: "PUSH_TYPE", label: "Push-Type Faucet", units: 2, salesCentavos: 8000, sharePercent: 50 },
+        { type: "TWIST_TYPE", label: "Twist-Type Faucet", units: 2, salesCentavos: 10000, sharePercent: 50 },
+      ],
+    });
+
+    // 3) Legacy lines (faucet_reporting_type IS NULL):
+    //    - Clear legacy label "Push-Type Gripo" -> recognized as PUSH_TYPE (breaks tie -> 3 vs 2, 60% vs 40%)
+    //    - Ambiguous legacy label "Gripo Special" in CHANGE_OF_GRIPO -> flagged in unclassifiedUnits
+    await ctx.db.query(
+      `UPDATE pos_sale_items
+          SET faucet_reporting_type = NULL,
+              display_label = 'Push-Type Gripo'
+        WHERE inventory_item_id = $1`,
+      [pushId],
+    );
+    const legacySale = await sellCart(
+      ctx,
+      cashier,
+      [{ kind: "MERCHANDISE", productId: capId, quantity: 1 }],
+      5000,
+      "legacy-unclear-faucet",
+    );
+    await ctx.db.query(
+      `UPDATE pos_sale_items psi
+          SET faucet_reporting_type = NULL,
+              pos_section = 'CHANGE_OF_GRIPO',
+              display_label = 'Special Replacement Valve'
+         FROM pos_sales ps
+        WHERE ps.id = psi.sale_id AND ps.reference = $1`,
+      [legacySale.reference],
+    );
+
+    const legacyCheck = await request(ctx.app)
+      .get("/api/dashboard/sales?period=today")
+      .set("Cookie", owner.cookie);
+    expect(legacyCheck.status).toBe(200);
+    expect(legacyCheck.body.faucetSales).toMatchObject({
+      totalUnits: 4,
+      leader: "TIE",
+      unclassifiedUnits: 1,
+      unclassifiedSalesCentavos: 1500,
+    });
+
+    // Finding 1 regressions:
+    // A) New standalone "Push-Type Faucet" sold BEFORE Owner sets its type (saved as NONE)
+    //    stays out of typed PUSH_TYPE, enters unclassifiedUnits coverage, and stays in Total Sales.
+    // B) Accessory "Faucet Seal for Push-Type" (legacy NULL or NONE) is excluded from BOTH
+    //    typed PUSH_TYPE and unclassifiedUnits while remaining in Total Sales.
+    const untypedPushFaucetId = await createProd({
+      name: "Push-Type Faucet",
+      unit: "pcs",
+      unitConfirmed: true,
+      unitPriceCentavos: 4000,
+      showInPos: true,
+      posSection: "CHANGE_OF_GRIPO",
+      faucetReportingType: null,
+    });
+    const sealId = await createProd({
+      name: "Faucet Seal for Push-Type",
+      unit: "pcs",
+      unitConfirmed: true,
+      unitPriceCentavos: 1000,
+      showInPos: true,
+      posSection: "TAKIP_ACCESSORIES",
+      faucetReportingType: null,
+    });
+    const regressionSale = await sellCart(
+      ctx,
+      cashier,
+      [
+        { kind: "MERCHANDISE", productId: untypedPushFaucetId, quantity: 1 }, // 4000 (NONE, faucet)
+        { kind: "MERCHANDISE", productId: sealId, quantity: 2 }, // 2000 (NONE, non-faucet seal)
+      ],
+      10000,
+      "faucet-finding1-reg",
+    );
+    const legacySealSale = await sellCart(
+      ctx,
+      cashier,
+      [{ kind: "MERCHANDISE", productId: sealId, quantity: 1 }], // 1000 (legacy NULL, non-faucet seal)
+      2000,
+      "faucet-finding1-legacy-seal",
+    );
+    await ctx.db.query(
+      `UPDATE pos_sale_items psi
+          SET faucet_reporting_type = NULL
+         FROM pos_sales ps
+        WHERE ps.id = psi.sale_id AND ps.reference = $1`,
+      [legacySealSale.reference],
+    );
+
+    const finding1Report = await request(ctx.app)
+      .get("/api/dashboard/sales?period=today")
+      .set("Cookie", owner.cookie);
+    expect(finding1Report.status).toBe(200);
+    // Total Sales includes everything:
+    // 92500 + 19500 + 1500 (legacy valve) + 6000 (untyped faucet + 2 seals) + 1000 (legacy seal) = 120500
+    expect(finding1Report.body.totals.salesCentavos).toBe(120500);
+    expect(finding1Report.body.faucetSales).toMatchObject({
+      totalUnits: 4,
+      totalSalesCentavos: 18000,
+      leader: "TIE",
+      unclassifiedUnits: 2, // 1 legacy Special Replacement Valve (1500) + 1 untyped Push-Type Faucet (4000)
+      unclassifiedSalesCentavos: 5500,
+    });
+    expect(regressionSale.totalCentavos).toBe(6000);
+
+    // Retest follow-up regressions:
+    // C) Legacy NULL "Push-Type Faucet for Slim Container" (4000) -> recognized as PUSH_TYPE
+    // D) Legacy NULL "Push-Type Faucet Wrench" in CHANGE_OF_GRIPO (3500) -> NOT_FAUCET, preserved in Total Sales
+    const legacyFitFaucetId = await createProd({
+      name: "Push-Type Faucet for Slim Container",
+      unit: "pcs",
+      unitConfirmed: true,
+      unitPriceCentavos: 4000,
+      showInPos: true,
+      posSection: "CHANGE_OF_GRIPO",
+      faucetReportingType: null,
+    });
+    const legacyWrenchId = await createProd({
+      name: "Push-Type Faucet Wrench",
+      unit: "pcs",
+      unitConfirmed: true,
+      unitPriceCentavos: 3500,
+      showInPos: true,
+      posSection: "CHANGE_OF_GRIPO",
+      faucetReportingType: null,
+    });
+    const retestSale = await sellCart(
+      ctx,
+      cashier,
+      [
+        { kind: "MERCHANDISE", productId: legacyFitFaucetId, quantity: 1 }, // 4000
+        { kind: "MERCHANDISE", productId: legacyWrenchId, quantity: 1 }, // 3500
+      ],
+      10000,
+      "faucet-finding1-retest-reg",
+    );
+    await ctx.db.query(
+      `UPDATE pos_sale_items psi
+          SET faucet_reporting_type = NULL
+         FROM pos_sales ps
+        WHERE ps.id = psi.sale_id AND ps.reference = $1`,
+      [retestSale.reference],
+    );
+
+    const finding1RetestReport = await request(ctx.app)
+      .get("/api/dashboard/sales?period=today")
+      .set("Cookie", owner.cookie);
+    expect(finding1RetestReport.status).toBe(200);
+    // 120500 + 4000 + 3500 = 128000
+    expect(finding1RetestReport.body.totals.salesCentavos).toBe(128000);
+    expect(finding1RetestReport.body.faucetSales).toMatchObject({
+      totalUnits: 5,
+      totalSalesCentavos: 22000,
+      leader: "PUSH_TYPE",
+      unclassifiedUnits: 2,
+      unclassifiedSalesCentavos: 5500,
+      items: [
+        { type: "PUSH_TYPE", units: 3, salesCentavos: 12000 },
+        { type: "TWIST_TYPE", units: 2, salesCentavos: 10000 },
+      ],
+    });
+  });
+
+  it("classifies standalone faucets vs parts/tools and respects fit descriptions and explicit types", () => {
+    expect(
+      classifyStandaloneMerchandiseFaucet({
+        itemKind: "MERCHANDISE",
+        faucetReportingType: null,
+        posSection: "CHANGE_OF_GRIPO",
+        displayLabel: "Push-Type Faucet for Slim Container",
+      }),
+    ).toEqual({ kind: "TYPED", type: "PUSH_TYPE" });
+
+    expect(
+      classifyStandaloneMerchandiseFaucet({
+        itemKind: "MERCHANDISE",
+        faucetReportingType: null,
+        posSection: "CHANGE_OF_GRIPO",
+        displayLabel: "Twist-Type Gripo for Round Gallon",
+      }),
+    ).toEqual({ kind: "TYPED", type: "TWIST_TYPE" });
+
+    expect(
+      classifyStandaloneMerchandiseFaucet({
+        itemKind: "MERCHANDISE",
+        faucetReportingType: null,
+        posSection: "CHANGE_OF_GRIPO",
+        displayLabel: "Faucet for Slim Container",
+      }),
+    ).toEqual({ kind: "UNCLASSIFIED_FAUCET" });
+
+    expect(
+      classifyStandaloneMerchandiseFaucet({
+        itemKind: "MERCHANDISE",
+        faucetReportingType: null,
+        posSection: "CHANGE_OF_GRIPO",
+        displayLabel: "Faucet for Push-Type Dispenser",
+      }),
+    ).toEqual({ kind: "UNCLASSIFIED_FAUCET" });
+
+    for (const faucetReportingType of [null, "NONE"] as const) {
+      for (const posSection of ["TAKIP_ACCESSORIES", "CHANGE_OF_GRIPO"] as const) {
+        expect(
+          classifyStandaloneMerchandiseFaucet({
+            itemKind: "MERCHANDISE",
+            faucetReportingType,
+            posSection,
+            displayLabel: "Push-Type Faucet Wrench",
+          }),
+        ).toEqual({ kind: "NOT_FAUCET" });
+
+        expect(
+          classifyStandaloneMerchandiseFaucet({
+            itemKind: "MERCHANDISE",
+            faucetReportingType,
+            posSection,
+            displayLabel: "Faucet Seal for Push-Type",
+          }),
+        ).toEqual({ kind: "NOT_FAUCET" });
+      }
+    }
+
+    expect(
+      classifyStandaloneMerchandiseFaucet({
+        itemKind: "MERCHANDISE",
+        faucetReportingType: null,
+        posSection: "CHANGE_OF_GRIPO",
+        displayLabel: "Slim Container with Push-Type Faucet",
+      }),
+    ).toEqual({ kind: "NOT_FAUCET" });
+
+    expect(
+      classifyStandaloneMerchandiseFaucet({
+        itemKind: "MERCHANDISE",
+        faucetReportingType: "NONE",
+        posSection: "CHANGE_OF_GRIPO",
+        displayLabel: "Push-Type Faucet for Slim Container",
+      }),
+    ).toEqual({ kind: "UNCLASSIFIED_FAUCET" });
+
+    expect(
+      classifyStandaloneMerchandiseFaucet({
+        itemKind: "MERCHANDISE",
+        faucetReportingType: "TWIST_TYPE",
+        posSection: "TAKIP_ACCESSORIES",
+        displayLabel: "Push-Type Faucet Wrench",
+      }),
+    ).toEqual({ kind: "TYPED", type: "TWIST_TYPE" });
+  });
+
+  it("orders recommendations by Overdue, Sales Decline, Refill Leader, Faucet Leader (max 3) and isolates Calendar failures", async () => {
+    // Day 1 (Nov 15): 10000 centavos
+    ctx.clock.set("2026-11-15T09:00:00+08:00");
+    owner = await reauth(ctx, "owner1", owner);
+    expect((await startDay(ctx, owner, "rec-day1")).status).toBe(201);
+    await sellCart(ctx, owner, [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 4 }], 10000, "rec-d1-s1");
+    expect((await endDay(ctx, owner, "rec-day1-end")).status).toBe(200);
+
+    // Day 2 (Nov 16): Purified refill leader + Push faucet leader, total 6500 (35% decline vs 10000)
+    ctx.clock.set("2026-11-16T09:00:00+08:00");
+    owner = await reauth(ctx, "owner1", owner);
+    const pushRes = await request(ctx.app)
+      .post("/api/inventory/products")
+      .set("Cookie", owner.cookie)
+      .set("X-CSRF-Token", owner.csrfToken)
+      .send({
+        name: "Push Faucet",
+        unit: "pcs",
+        unitConfirmed: true,
+        unitPriceCentavos: 4000,
+        showInPos: true,
+        posSection: "CHANGE_OF_GRIPO",
+        faucetReportingType: "PUSH_TYPE",
+      });
+    const pushId = pushRes.body.item.id as string;
+    await request(ctx.app)
+      .post(`/api/inventory/items/${encodeURIComponent(pushId)}/opening-stock`)
+      .set("Cookie", owner.cookie)
+      .set("X-CSRF-Token", owner.csrfToken)
+      .send({ quantity: 10 });
+
+    // Schedule an activity at 08:00 (already overdue at 09:00)
+    const sched = await request(ctx.app)
+      .post("/api/calendar/activities")
+      .set("Cookie", owner.cookie)
+      .set("X-CSRF-Token", owner.csrfToken)
+      .send({
+        name: "Backwash Filter",
+        scheduledDate: "2026-11-16",
+        scheduledTime: "08:00",
+        requestKey: "rec-overdue-1",
+      });
+    expect(sched.status).toBe(201);
+
+    expect((await startDay(ctx, owner, "rec-day2")).status).toBe(201);
+    await sellCart(
+      ctx,
+      owner,
+      [
+        { kind: "STANDARD", waterType: "PURIFIED", quantity: 1 }, // 2500
+        { kind: "MERCHANDISE", productId: pushId, quantity: 1 }, // 4000
+      ],
+      10000,
+      "rec-d2-s1",
+    );
+
+    const fourQualifying = await request(ctx.app)
+      .get("/api/dashboard/sales?period=today")
+      .set("Cookie", owner.cookie);
+    expect(fourQualifying.status).toBe(200);
+    expect(fourQualifying.body.recommendations).toHaveLength(3);
+    expect(fourQualifying.body.recommendations.map((r: { type: string }) => r.type)).toEqual([
+      "OVERDUE_ACTIVITIES",
+      "SALES_DECLINE",
+      "REFILL_LEADER",
+    ]);
+
+    // Calendar source failure leaves sales recommendations intact (decline, refill leader, faucet leader)
+    const failingCalendarDb: Database = {
+      query(sql, params) {
+        if (sql.includes("calendar_occurrences")) {
+          return Promise.reject(new Error("calendar read unavailable"));
+        }
+        return ctx.db.query(sql, params);
+      },
+      exec(sql) {
+        return ctx.db.exec(sql);
+      },
+      transaction(fn) {
+        return ctx.db.transaction(fn);
+      },
+      close() {
+        return ctx.db.close();
+      },
+    };
+    const isolatedApp = createApp({ db: failingCalendarDb, clock: ctx.clock });
+    const isolatedRes = await request(isolatedApp)
+      .get("/api/dashboard/sales?period=today")
+      .set("Cookie", owner.cookie);
+    expect(isolatedRes.status).toBe(200);
+    expect(isolatedRes.body.recommendations.map((r: { type: string }) => r.type)).toEqual([
+      "SALES_DECLINE",
+      "REFILL_LEADER",
+      "FAUCET_LEADER",
+    ]);
+  });
+
+  it("enforces Owner-only stock trend access and builds verified history for opening counts, sales, settlements, reconciliations, same-time ties, and gaps (DEC-089)", async () => {
+    ctx.clock.set("2026-11-16T08:00:00+08:00");
+    owner = await reauth(ctx, "owner1", owner);
+    cashier = await reauth(ctx, "cashier1", cashier);
+
+    // Auth & validation guards
+    expect((await request(ctx.app).get("/api/dashboard/stocks/ROUND/trend")).status).toBe(401);
+    expect(
+      (await request(ctx.app).get("/api/dashboard/stocks/ROUND/trend").set("Cookie", cashier.cookie))
+        .status,
+    ).toBe(403);
+    expect(
+      (await request(ctx.app).get("/api/dashboard/stocks/bad-key/trend").set("Cookie", owner.cookie))
+        .status,
+    ).toBe(400);
+    expect(
+      (
+        await request(ctx.app)
+          .get("/api/dashboard/stocks/00000000-0000-4000-8000-000000000000/trend")
+          .set("Cookie", owner.cookie)
+      ).status,
+    ).toBe(404);
+
+    // Uninitialized item -> NOT_SET
+    const notSetTrend = await request(ctx.app)
+      .get("/api/dashboard/stocks/ROUND/trend")
+      .set("Cookie", owner.cookie);
+    expect(notSetTrend.status).toBe(200);
+    expect(notSetTrend.body).toMatchObject({
+      item: { code: "ROUND", unit: "containers", status: "NOT_SET", currentQuantity: null },
+      historyState: "NOT_SET",
+      points: [],
+    });
+
+    // Zero opening count on SLIM -> COMPLETE with 1 opening point at 0
+    expect(
+      (
+        await request(ctx.app)
+          .post("/api/inventory/items/SLIM/opening-stock")
+          .set("Cookie", owner.cookie)
+          .set("X-CSRF-Token", owner.csrfToken)
+          .send({ quantity: 0 })
+      ).status,
+    ).toBe(201);
+    const slimZeroTrend = await request(ctx.app)
+      .get("/api/dashboard/stocks/SLIM/trend")
+      .set("Cookie", owner.cookie);
+    expect(slimZeroTrend.status).toBe(200);
+    expect(slimZeroTrend.body.historyState).toBe("COMPLETE");
+    expect(slimZeroTrend.body.points).toHaveLength(1);
+    expect(slimZeroTrend.body.points[0]).toMatchObject({
+      pointKind: "OPENING",
+      balanceAfter: 0,
+      unit: "containers",
+    });
+
+    // ROUND opening count 10, publish, sell 3 -> 10 then 7; reconcile to 9 -> 10, 7, 9
+    expect(
+      (
+        await request(ctx.app)
+          .post("/api/inventory/items/ROUND/opening-stock")
+          .set("Cookie", owner.cookie)
+          .set("X-CSRF-Token", owner.csrfToken)
+          .send({ quantity: 10 })
+      ).status,
+    ).toBe(201);
+    expect(
+      (
+        await request(ctx.app)
+          .patch("/api/inventory/containers/ROUND")
+          .set("Cookie", owner.cookie)
+          .set("X-CSRF-Token", owner.csrfToken)
+          .send({ showInPos: true })
+      ).status,
+    ).toBe(200);
+
+    // Hidden active merchandise product (showInPos: false) still loads by UUID
+    const hiddenProd = await request(ctx.app)
+      .post("/api/inventory/products")
+      .set("Cookie", owner.cookie)
+      .set("X-CSRF-Token", owner.csrfToken)
+      .send({
+        name: "Hidden Salt",
+        unit: "sacks",
+        unitConfirmed: true,
+        unitPriceCentavos: 30000,
+        showInPos: false,
+      });
+    const hiddenId = hiddenProd.body.item.id as string;
+    expect(
+      (
+        await request(ctx.app)
+          .post(`/api/inventory/items/${encodeURIComponent(hiddenId)}/opening-stock`)
+          .set("Cookie", owner.cookie)
+          .set("X-CSRF-Token", owner.csrfToken)
+          .send({ quantity: 4 })
+      ).status,
+    ).toBe(201);
+    const hiddenTrend = await request(ctx.app)
+      .get(`/api/dashboard/stocks/${encodeURIComponent(hiddenId)}/trend`)
+      .set("Cookie", owner.cookie);
+    expect(hiddenTrend.status).toBe(200);
+    expect(hiddenTrend.body.item).toMatchObject({
+      id: hiddenId,
+      unit: "sacks",
+      showInPos: false,
+      currentQuantity: 4,
+    });
+
+    // Archived product returns 404 from active trend picker endpoint
+    expect(
+      (
+        await request(ctx.app)
+          .post(`/api/inventory/products/${encodeURIComponent(hiddenId)}/archive`)
+          .set("Cookie", owner.cookie)
+          .set("X-CSRF-Token", owner.csrfToken)
+          .send({})
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await request(ctx.app)
+          .get(`/api/dashboard/stocks/${encodeURIComponent(hiddenId)}/trend`)
+          .set("Cookie", owner.cookie)
+      ).status,
+    ).toBe(404);
+
+    // Day 1: sell 3 Round (10 -> 7) and prepare a PAYMENT_PENDING checkout for 2 Round
+    ctx.clock.set("2026-11-16T09:00:00+08:00");
+    owner = await reauth(ctx, "owner1", owner);
+    expect((await startDay(ctx, owner, "trend-d1")).status).toBe(201);
+    await sellCart(
+      ctx,
+      owner,
+      [
+        {
+          kind: "CONTAINER_PACKAGE",
+          packageCode: "ROUND_EMPTY",
+          includedGripo: "PUSH_TYPE",
+          quantity: 3,
+        },
+      ],
+      60000,
+      "trend-sale-3",
+    );
+
+    const pendingPkg = await request(ctx.app)
+      .post("/api/pos/checkouts")
+      .set("Cookie", owner.cookie)
+      .set("X-CSRF-Token", owner.csrfToken)
+      .send({
+        prepareKey: "trend-prior-pending",
+        items: [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_EMPTY",
+            includedGripo: "TWIST_TYPE",
+            quantity: 2,
+          },
+        ],
+      });
+    const pendingRef = pendingPkg.body.checkout.reference as string;
+    await request(ctx.app)
+      .post(`/api/pos/checkouts/${encodeURIComponent(pendingRef)}/begin-payment`)
+      .set("Cookie", owner.cookie)
+      .set("X-CSRF-Token", owner.csrfToken)
+      .send({});
+
+    // Next day: settle prior-day merchandise checkout (7 -> 5 at 2026-11-17T10:00:00+08:00)
+    // and then reconcile physical count to 9 (5 -> 9 at 2026-11-17T11:00:00+08:00)
+    ctx.clock.set("2026-11-17T10:00:00+08:00");
+    owner = await reauth(ctx, "owner1", owner);
+    const settleRes = await request(ctx.app)
+      .post(`/api/pos/checkouts/${encodeURIComponent(pendingRef)}/settle`)
+      .set("Cookie", owner.cookie)
+      .set("X-CSRF-Token", owner.csrfToken)
+      .send({
+        paymentKeptConfirmed: true,
+        itemsHandedOverConfirmed: true,
+        cashReceivedCentavos: 40000,
+      });
+    expect(settleRes.status).toBe(201);
+
+    ctx.clock.set("2026-11-17T11:00:00+08:00");
+    owner = await reauth(ctx, "owner1", owner);
+    const roundRow = (
+      await request(ctx.app).get("/api/inventory/items").set("Cookie", owner.cookie)
+    ).body.items.find((i: { shape: string }) => i.shape === "ROUND");
+    expect(
+      (
+        await request(ctx.app)
+          .post("/api/inventory/items/ROUND/reconciliations")
+          .set("Cookie", owner.cookie)
+          .set("X-CSRF-Token", owner.csrfToken)
+          .send({
+            physicalCount: 9,
+            reason: "Found 4 extra containers",
+            expectedRevision: roundRow.stockRevision,
+            expectedCurrentQuantity: 5,
+            requestKey: "trend-rec-9",
+          })
+      ).status,
+    ).toBe(201);
+
+    const roundTrend = await request(ctx.app)
+      .get("/api/dashboard/stocks/ROUND/trend")
+      .set("Cookie", owner.cookie);
+    expect(roundTrend.status).toBe(200);
+    expect(roundTrend.body.historyState).toBe("COMPLETE");
+    expect(
+      roundTrend.body.points.map(
+        (p: { movementType: string; balanceAfter: number; recordedAt: string }) => ({
+          movementType: p.movementType,
+          balanceAfter: p.balanceAfter,
+          recordedAt: p.recordedAt,
+        }),
+      ),
+    ).toEqual([
+      { movementType: "OPENING_COUNT", balanceAfter: 10, recordedAt: "2026-11-16T08:00:00+08:00" },
+      { movementType: "POS_SALE", balanceAfter: 7, recordedAt: "2026-11-16T09:00:00+08:00" },
+      {
+        movementType: "PRIOR_DAY_SETTLEMENT",
+        balanceAfter: 5,
+        recordedAt: "2026-11-17T10:00:00+08:00",
+      },
+      {
+        movementType: "PHYSICAL_COUNT_RECONCILIATION",
+        balanceAfter: 9,
+        recordedAt: "2026-11-17T11:00:00+08:00",
+      },
+    ]);
+
+    // Resolvable same-timestamp movements: force settlement & reconciliation to share timestamp 10:00:00
+    await ctx.db.query(
+      `UPDATE inventory_stock_movements
+          SET recorded_at = '2026-11-17T10:00:00+08:00'
+        WHERE item_id = $1 AND movement_type IN ('PRIOR_DAY_SETTLEMENT', 'PHYSICAL_COUNT_RECONCILIATION')`,
+      [roundRow.id],
+    );
+    const resolvableTie = await request(ctx.app)
+      .get("/api/dashboard/stocks/ROUND/trend")
+      .set("Cookie", owner.cookie);
+    expect(resolvableTie.status).toBe(200);
+    expect(resolvableTie.body.historyState).toBe("COMPLETE");
+    expect(
+      resolvableTie.body.points.map((p: { balanceAfter: number }) => p.balanceAfter),
+    ).toEqual([10, 7, 5, 9]);
+
+    // Ambiguous same-timestamp cycle (5 -> 9, 9 -> 5, 5 -> 9 all at 10:00:00) -> INCOMPLETE
+    await ctx.db.query(
+      `INSERT INTO inventory_stock_movements (
+         item_id, movement_type, quantity_delta, balance_before, balance_after,
+         unit, actor_user_id, recorded_at
+       )
+       VALUES
+         ($1, 'PHYSICAL_COUNT_RECONCILIATION', -4, 9, 5, 'containers',
+          (SELECT id FROM app_users WHERE username = 'owner1'), '2026-11-17T10:00:00+08:00'),
+         ($1, 'PHYSICAL_COUNT_RECONCILIATION', 4, 5, 9, 'containers',
+          (SELECT id FROM app_users WHERE username = 'owner1'), '2026-11-17T10:00:00+08:00')`,
+      [roundRow.id],
+    );
+    const ambiguousTie = await request(ctx.app)
+      .get("/api/dashboard/stocks/ROUND/trend")
+      .set("Cookie", owner.cookie);
+    expect(ambiguousTie.status).toBe(200);
+    expect(ambiguousTie.body.historyState).toBe("INCOMPLETE");
+    expect(ambiguousTie.body.points).toEqual([]);
+    expect(ambiguousTie.body.item.currentQuantity).toBe(9);
+
+    // Balance gap where current_quantity disagrees with last movement -> INCOMPLETE
+    await ctx.db.query(`UPDATE inventory_items SET current_quantity = 99 WHERE id = $1`, [
+      roundRow.id,
+    ]);
+    const gapTrend = await request(ctx.app)
+      .get("/api/dashboard/stocks/ROUND/trend")
+      .set("Cookie", owner.cookie);
+    expect(gapTrend.status).toBe(200);
+    expect(gapTrend.body.historyState).toBe("INCOMPLETE");
+    expect(gapTrend.body.points).toEqual([]);
+
+    // Finding 3 regression: four distinct sub-second movements within a single second
+    // (10 -> 9 -> 10 -> 8 -> 10) reconcile into COMPLETE trend rather than collapsing to 1 tie.
+    const capRes = await request(ctx.app)
+      .post("/api/inventory/products")
+      .set("Cookie", owner.cookie)
+      .set("X-CSRF-Token", owner.csrfToken)
+      .send({
+        name: "Subsecond Cap",
+        unit: "pcs",
+        unitConfirmed: true,
+        unitPriceCentavos: 1500,
+        showInPos: false,
+      });
+    expect(capRes.status).toBe(201);
+    const subId = capRes.body.item.id as string;
+    expect(
+      (
+        await request(ctx.app)
+          .post(`/api/inventory/items/${encodeURIComponent(subId)}/opening-stock`)
+          .set("Cookie", owner.cookie)
+          .set("X-CSRF-Token", owner.csrfToken)
+          .send({ quantity: 10 })
+      ).status,
+    ).toBe(201);
+
+    await ctx.db.query(
+      `INSERT INTO inventory_stock_movements (
+         item_id, movement_type, quantity_delta, balance_before, balance_after,
+         unit, actor_user_id, recorded_at
+       )
+       VALUES
+         ($1, 'PHYSICAL_COUNT_RECONCILIATION', -1, 10, 9, 'pcs',
+          (SELECT id FROM app_users WHERE username = 'owner1'), '2026-11-17T12:00:00.100+08:00'),
+         ($1, 'PHYSICAL_COUNT_RECONCILIATION', 1, 9, 10, 'pcs',
+          (SELECT id FROM app_users WHERE username = 'owner1'), '2026-11-17T12:00:00.200+08:00'),
+         ($1, 'PHYSICAL_COUNT_RECONCILIATION', -2, 10, 8, 'pcs',
+          (SELECT id FROM app_users WHERE username = 'owner1'), '2026-11-17T12:00:00.300+08:00'),
+         ($1, 'PHYSICAL_COUNT_RECONCILIATION', 2, 8, 10, 'pcs',
+          (SELECT id FROM app_users WHERE username = 'owner1'), '2026-11-17T12:00:00.400+08:00')`,
+      [subId],
+    );
+    await ctx.db.query(`UPDATE inventory_items SET current_quantity = 10 WHERE id = $1`, [subId]);
+
+    const subsecondTrend = await request(ctx.app)
+      .get(`/api/dashboard/stocks/${encodeURIComponent(subId)}/trend`)
+      .set("Cookie", owner.cookie);
+    expect(subsecondTrend.status).toBe(200);
+    expect(subsecondTrend.body.historyState).toBe("COMPLETE");
+    expect(
+      subsecondTrend.body.points.map((p: { balanceAfter: number; recordedAt: string }) => ({
+        balanceAfter: p.balanceAfter,
+        recordedAt: p.recordedAt,
+      })),
+    ).toEqual([
+      { balanceAfter: 10, recordedAt: "2026-11-17T11:00:00+08:00" },
+      { balanceAfter: 9, recordedAt: "2026-11-17T12:00:00.100+08:00" },
+      { balanceAfter: 10, recordedAt: "2026-11-17T12:00:00.200+08:00" },
+      { balanceAfter: 8, recordedAt: "2026-11-17T12:00:00.300+08:00" },
+      { balanceAfter: 10, recordedAt: "2026-11-17T12:00:00.400+08:00" },
+    ]);
   });
 });

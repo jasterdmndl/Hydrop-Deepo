@@ -4,6 +4,7 @@ import {
   DEFAULT_POS_SECTIONS,
   filterInventoryItems,
   formatAlreadySetNotice,
+  formatFaucetReportingTypeLabel,
   formatPesoCentavos,
   formatQuantityLabel,
   formatRecordedAtManila,
@@ -19,6 +20,7 @@ import {
   type InventoryItemView,
   MAX_OPENING_QUANTITY,
   mergeRefreshedInventoryItems,
+  parseLowStockLevelInput,
   parseOpeningQuantityInput,
   parsePesoPriceToCentavos,
   type PosSectionView,
@@ -420,5 +422,24 @@ describe("inventoryView helpers", () => {
       stockRevision: 1,
     };
     expect(mergeRefreshedInventoryItems([sponge], [staleSponge])).toEqual([sponge]);
+  });
+
+  it("parses optional low stock alert levels and formats faucet reporting type labels", () => {
+    expect(parseLowStockLevelInput("", "pcs")).toEqual({ ok: true, value: null });
+    expect(parseLowStockLevelInput("   ", "containers")).toEqual({ ok: true, value: null });
+    expect(parseLowStockLevelInput("5", "containers")).toEqual({ ok: true, value: 5 });
+    expect(parseLowStockLevelInput(String(MAX_OPENING_QUANTITY), "pcs")).toEqual({
+      ok: true,
+      value: MAX_OPENING_QUANTITY,
+    });
+    expect(parseLowStockLevelInput("0", "pcs").ok).toBe(false);
+    expect(parseLowStockLevelInput("-3", "pcs").ok).toBe(false);
+    expect(parseLowStockLevelInput("2.5", "pcs").ok).toBe(false);
+    expect(parseLowStockLevelInput("abc", "pcs").ok).toBe(false);
+    expect(parseLowStockLevelInput(String(MAX_OPENING_QUANTITY + 1), "pcs").ok).toBe(false);
+
+    expect(formatFaucetReportingTypeLabel("PUSH_TYPE")).toBe("Push-Type Faucet");
+    expect(formatFaucetReportingTypeLabel("TWIST_TYPE")).toBe("Twist-Type Faucet");
+    expect(formatFaucetReportingTypeLabel(null)).toBe("Not classified");
   });
 });

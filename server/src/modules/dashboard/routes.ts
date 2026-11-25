@@ -2,8 +2,24 @@ import { Router } from "express";
 import type { Database } from "../../db/database.js";
 import { sendError } from "../../shared/http.js";
 import { requireRole } from "../auth/guards.js";
+import { manilaReminderWindow } from "../calendar/calendar.js";
+import { calendarRepository } from "../calendar/repository.js";
+import { isUuid, parseContainerShape } from "../inventory/inventory.js";
+import type { OpeningStockTarget } from "../inventory/repository.js";
 import { dashboardRepository as repo } from "./repository.js";
 import { assembleSalesReport, resolveSalesReportRange } from "./salesReport.js";
+import { buildDashboardStockTrend } from "./stockTrend.js";
+
+function resolveDashboardItemTarget(rawKey: string): OpeningStockTarget | null {
+  const shape = parseContainerShape(rawKey);
+  if (shape) {
+    return { kind: "shape", shape };
+  }
+  if (isUuid(rawKey)) {
+    return { kind: "id", id: rawKey };
+  }
+  return null;
+}
 
 /**
  * Dashboard HTTP endpoints, mounted at /api/dashboard behind the shared
@@ -27,19 +43,66 @@ export function dashboardRoutes(db: Database): Router {
       return;
     }
 
-    const data = await repo.loadSalesInputs(db, {
-      from: resolved.range.from,
-      to: resolved.range.to,
-      todayDate: resolved.range.todayDate,
-      cutoffDate: resolved.range.cutoffDate,
-    });
+    const comp = resolved.range.comparisonTarget;
+
+    const [data, calendarOverdueCount] = await Promise.all([
+      repo.loadSalesInputs(db, {
+        from: resolved.range.from,
+        to: resolved.range.to,
+        isPartialEndDay: resolved.range.isPartialEndDay,
+        cutoffDate: resolved.range.cutoffDate,
+        requestNow: req.now,
+        comparisonFrom: comp?.from ?? null,
+        comparisonTo: comp?.to ?? null,
+        comparisonIsPartialEndDay: comp?.isPartialEndDay ?? false,
+        comparisonCutoffDate: comp?.endCutoffDate ?? null,
+      }),
+      (async (): Promise<number | null> => {
+        try {
+          const { nowUtc, upcomingCutoffUtc } = manilaReminderWindow(req.now);
+          const unfinished = await calendarRepository.listUnfinishedBeforeCutoff(
+            db,
+            upcomingCutoffUtc,
+          );
+          let overdue = 0;
+          for (const row of unfinished) {
+            const scheduledAt =
+              row.scheduledAt instanceof Date ? row.scheduledAt : new Date(row.scheduledAt);
+            if (scheduledAt.getTime() < nowUtc.getTime()) {
+              overdue += 1;
+            }
+          }
+          return overdue;
+        } catch {
+          return null;
+        }
+      })(),
+    ]);
 
     res.json(
       assembleSalesReport({
         range: resolved.range,
         ...data,
+        calendarOverdueCount,
       }),
     );
+  });
+
+  router.get("/stocks/:itemKey/trend", async (req, res) => {
+    const rawKey = typeof req.params.itemKey === "string" ? req.params.itemKey.trim() : "";
+    const target = resolveDashboardItemTarget(rawKey);
+    if (!target) {
+      sendError(res, 400, "VALIDATION_FAILED", "Choose a valid Inventory item.");
+      return;
+    }
+
+    const data = await repo.loadStockTrendInputs(db, target);
+    if (!data) {
+      sendError(res, 404, "NOT_FOUND", "Inventory item not found.");
+      return;
+    }
+
+    res.json(buildDashboardStockTrend(data));
   });
 
   return router;

@@ -4,9 +4,11 @@ import type { InventoryItemView, PosSectionView } from "../inventory/inventoryVi
 import {
   buildStocksSnapshot,
   describeTrendLeader,
+  formatComparisonChangeSummary,
   formatDashboardPeso,
   formatDashboardPesoCompact,
   formatManilaDateRange,
+  formatStockMovementTypeLabel,
   formatWaterLiters,
   sortStationReminders,
   validateCustomRange,
@@ -281,4 +283,160 @@ describe("dashboardView helpers", () => {
       { productName: "Slim Container", severity: "NOT_SET", quantity: null },
     ]);
   });
-});
+
+  it("derives Low Stock alerts for positive initialized quantities at or below lowStockLevel while keeping them in In Stock (DEC-090)", () => {
+    const level = 5;
+    const above = makeItem({ id: "a6", code: "A6", name: "Item Six", currentQuantity: 6, lowStockLevel: level });
+    const atLevel = makeItem({ id: "a5", code: "A5", name: "Item Five", currentQuantity: 5, lowStockLevel: level });
+    const oneLeft = makeItem({ id: "a1", code: "A1", name: "Item One", currentQuantity: 1, lowStockLevel: level });
+    const zeroLeft = makeItem({ id: "a0", code: "A0", name: "Item Zero", currentQuantity: 0, lowStockLevel: level });
+    const notSet = makeItem({
+      id: "anull",
+      code: "ANULL",
+      name: "Item Unset",
+      status: "NOT_SET",
+      currentQuantity: null,
+      openingStock: null,
+      lowStockLevel: level,
+    });
+
+    const snapshot = buildStocksSnapshot([above, atLevel, oneLeft, zeroLeft, notSet]);
+    expect(snapshot.counts).toEqual({
+      totalProducts: 5,
+      inStock: 3, // 6, 5, and 1 are all positive and remain in In Stock
+      outOfStock: 1,
+      notSet: 1,
+      needsReconciliation: 0,
+    });
+    expect(snapshot.alerts.map((a) => ({ productName: a.productName, severity: a.severity, badgeLabel: a.badgeLabel }))).toEqual([
+      { productName: "Item Zero", severity: "OUT_OF_STOCK", badgeLabel: "Out of Stock" },
+      { productName: "Item Five", severity: "LOW_STOCK", badgeLabel: "Low Stock" },
+      { productName: "Item One", severity: "LOW_STOCK", badgeLabel: "Low Stock" },
+      { productName: "Item Unset", severity: "NOT_SET", badgeLabel: "Not Set" },
+    ]);
+
+    // Clearing the lowStockLevel removes Low Stock alerts for 5 and 1
+    const cleared = buildStocksSnapshot([
+      above,
+      { ...atLevel, lowStockLevel: null },
+      { ...oneLeft, lowStockLevel: null },
+    ]);
+    expect(cleared.alerts).toEqual([]);
+  });
+
+    it("formats comparison summaries with matched clock cutoffs vs whole-day labels and stock movement labels cleanly", () => {
+      expect(
+        formatComparisonChangeSummary({
+          available: true,
+          unavailableReason: null,
+          unavailableMessage: null,
+          currentRange: {
+            from: "2026-11-09",
+            to: "2026-11-11",
+            isPartialEndDay: true,
+            cutoffAt: "2026-11-11T14:00:00+08:00",
+          },
+          previousRange: {
+            from: "2026-11-02",
+            to: "2026-11-04",
+            isPartialEndDay: true,
+            cutoffAt: "2026-11-04T14:00:00+08:00",
+          },
+          currentTotalSalesCentavos: 9000,
+          previousTotalSalesCentavos: 10000,
+          amountChangeCentavos: -1000,
+          percentChange: -10,
+        }),
+      ).toEqual({
+        tone: "negative",
+        headline: "−₱10 (−10%)",
+        rangeSummary: "Nov 9 – 11, 2026 (through 2:00 PM) vs Nov 2 – 4, 2026 (through 2:00 PM)",
+      });
+
+      expect(
+        formatComparisonChangeSummary({
+          available: true,
+          unavailableReason: null,
+          unavailableMessage: null,
+          currentRange: {
+            from: "2026-11-04",
+            to: "2026-11-04",
+            isPartialEndDay: false,
+            cutoffAt: "2026-11-04T23:59:59+08:00",
+          },
+          previousRange: {
+            from: "2026-11-03",
+            to: "2026-11-03",
+            isPartialEndDay: false,
+            cutoffAt: "2026-11-03T23:59:59+08:00",
+          },
+          currentTotalSalesCentavos: 5000,
+          previousTotalSalesCentavos: 0,
+          amountChangeCentavos: 5000,
+          percentChange: null,
+        }),
+      ).toEqual({
+        tone: "positive",
+        headline: "+₱50 (vs ₱0)",
+        rangeSummary: "Nov 4, 2026 (full day) vs Nov 3, 2026 (full day)",
+      });
+
+      expect(
+        formatComparisonChangeSummary({
+          available: true,
+          unavailableReason: null,
+          unavailableMessage: null,
+          currentRange: {
+            from: "2026-11-09",
+            to: "2026-11-10",
+            isPartialEndDay: false,
+            cutoffAt: "2026-11-10T23:59:59+08:00",
+          },
+          previousRange: {
+            from: "2026-11-07",
+            to: "2026-11-08",
+            isPartialEndDay: false,
+            cutoffAt: "2026-11-08T23:59:59+08:00",
+          },
+          currentTotalSalesCentavos: 10000,
+          previousTotalSalesCentavos: 10000,
+          amountChangeCentavos: 0,
+          percentChange: 0,
+        }),
+      ).toEqual({
+        tone: "neutral",
+        headline: "₱0 (0%)",
+        rangeSummary: "Nov 9 – 10, 2026 (full days) vs Nov 7 – 8, 2026 (full days)",
+      });
+
+      expect(
+        formatComparisonChangeSummary({
+          available: false,
+          unavailableReason: "MISSING_STATION_DAY",
+          unavailableMessage: "Comparison Unavailable",
+          currentRange: {
+            from: "2026-11-09",
+            to: "2026-11-11",
+            isPartialEndDay: true,
+            cutoffAt: "2026-11-11T14:00:00+08:00",
+          },
+          previousRange: {
+            from: "2026-11-02",
+            to: "2026-11-04",
+            isPartialEndDay: true,
+            cutoffAt: "2026-11-04T14:00:00+08:00",
+          },
+          currentTotalSalesCentavos: 7500,
+          previousTotalSalesCentavos: null,
+          amountChangeCentavos: null,
+          percentChange: null,
+        }),
+      ).toEqual({
+        tone: "unavailable",
+        headline: "Comparison Unavailable",
+        rangeSummary: "Nov 9 – 11, 2026 (through 2:00 PM) vs Nov 2 – 4, 2026 (through 2:00 PM)",
+      });
+
+      expect(formatStockMovementTypeLabel("PRIOR_DAY_SETTLEMENT")).toBe("Prior-Day Settlement");
+    });
+  });

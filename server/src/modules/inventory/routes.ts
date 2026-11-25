@@ -4,10 +4,13 @@ import { sendError } from "../../shared/http.js";
 import { requireRole } from "../auth/guards.js";
 import {
   BUILT_IN_POS_SECTIONS,
+  type FaucetReportingType,
   inventoryPermissions,
   isUuid,
   MAX_OPENING_QUANTITY,
   parseContainerShape,
+  parseFaucetReportingType,
+  parseLowStockLevel,
   parseOpeningQuantity,
   parsePhysicalCount,
   parsePosSectionCode,
@@ -17,6 +20,7 @@ import {
   parseReconciliationReason,
   parseStockUnit,
   parseUnitPriceCentavos,
+  type PosSection,
 } from "./inventory.js";
 import { inventoryRepository as repo, type OpeningStockTarget } from "./repository.js";
 
@@ -28,6 +32,8 @@ const CREATE_PRODUCT_KEYS = new Set([
   "unitPriceCentavos",
   "showInPos",
   "posSection",
+  "lowStockLevel",
+  "faucetReportingType",
 ]);
 
 const UPDATE_PRODUCT_KEYS = new Set([
@@ -36,10 +42,12 @@ const UPDATE_PRODUCT_KEYS = new Set([
   "unitPriceCentavos",
   "showInPos",
   "posSection",
+  "lowStockLevel",
+  "faucetReportingType",
 ]);
 
 const CREATE_SECTION_KEYS = new Set(["name"]);
-const CONTAINER_VISIBILITY_KEYS = new Set(["showInPos"]);
+const CONTAINER_SETTINGS_KEYS = new Set(["showInPos", "lowStockLevel"]);
 const RECONCILE_KEYS = new Set([
   "physicalCount",
   "reason",
@@ -201,6 +209,36 @@ export function inventoryRoutes(db: Database): Router {
       return;
     }
 
+    let lowStockLevel: number | null = null;
+    if (body.lowStockLevel !== undefined) {
+      const lowStockResult = parseLowStockLevel(body.lowStockLevel);
+      if (!lowStockResult.ok) {
+        sendError(
+          res,
+          400,
+          "VALIDATION_FAILED",
+          "Low stock alert level must be a positive whole number (1 to 1,000,000), or cleared.",
+        );
+        return;
+      }
+      lowStockLevel = lowStockResult.value;
+    }
+
+    let faucetReportingType: FaucetReportingType | null = null;
+    if (body.faucetReportingType !== undefined) {
+      const faucetResult = parseFaucetReportingType(body.faucetReportingType);
+      if (!faucetResult.ok) {
+        sendError(
+          res,
+          400,
+          "VALIDATION_FAILED",
+          "Choose Push-Type, Twist-Type, or Not classified for faucet reporting type.",
+        );
+        return;
+      }
+      faucetReportingType = faucetResult.value;
+    }
+
     const outcome = await repo.createMerchandiseProduct(db, {
       name,
       description: descResult.value,
@@ -208,6 +246,8 @@ export function inventoryRoutes(db: Database): Router {
       unitPriceCentavos,
       showInPos,
       posSection: validatedSection,
+      lowStockLevel,
+      faucetReportingType,
       createdByUserId: req.auth!.user.id,
       createdAt: req.now,
     });
@@ -254,46 +294,52 @@ export function inventoryRoutes(db: Database): Router {
       return;
     }
 
-    let nextName = existing.name;
+    const patch: {
+      id: string;
+      name?: string;
+      description?: string | null;
+      unitPriceCentavos?: number;
+      showInPos?: boolean;
+      posSection?: PosSection | null;
+      lowStockLevel?: number | null;
+      faucetReportingType?: FaucetReportingType | null;
+    } = { id };
+
     if ("name" in body) {
       const parsedName = parseProductName(body.name);
       if (!parsedName) {
         sendError(res, 400, "VALIDATION_FAILED", "Enter a product name (1 to 80 characters).");
         return;
       }
-      nextName = parsedName;
+      patch.name = parsedName;
     }
 
-    let nextDescription = existing.description;
     if ("description" in body) {
       const parsedDesc = parseProductDescription(body.description);
       if (!parsedDesc.ok) {
         sendError(res, 400, "VALIDATION_FAILED", "Description must be 160 characters or fewer.");
         return;
       }
-      nextDescription = parsedDesc.value;
+      patch.description = parsedDesc.value;
     }
 
-    let nextPrice = existing.unitPriceCentavos;
     if ("unitPriceCentavos" in body) {
       const parsedPrice = parseUnitPriceCentavos(body.unitPriceCentavos);
       if (parsedPrice === null) {
         sendError(res, 400, "VALIDATION_FAILED", "Enter a valid positive selling price.");
         return;
       }
-      nextPrice = parsedPrice;
+      patch.unitPriceCentavos = parsedPrice;
     }
 
-    let nextShowInPos = existing.showInPos;
     if ("showInPos" in body) {
       if (typeof body.showInPos !== "boolean") {
         sendError(res, 400, "VALIDATION_FAILED", "Show in POS must be checked or unchecked.");
         return;
       }
-      nextShowInPos = body.showInPos;
+      patch.showInPos = body.showInPos;
     }
 
-    let nextPosSection = existing.posSection;
     if ("posSection" in body) {
       const parsedSection = parsePosSectionCode(body.posSection);
       if (!parsedSection.ok) {
@@ -301,7 +347,7 @@ export function inventoryRoutes(db: Database): Router {
         return;
       }
       if (parsedSection.value === null) {
-        nextPosSection = null;
+        patch.posSection = null;
       } else {
         if (parsedSection.value === BUILT_IN_POS_SECTIONS.CONTAINERS) {
           sendError(
@@ -317,28 +363,39 @@ export function inventoryRoutes(db: Database): Router {
           sendError(res, 400, "VALIDATION_FAILED", "Choose a valid POS section for this product.");
           return;
         }
-        nextPosSection = foundSection.code;
+        patch.posSection = foundSection.code;
       }
     }
 
-    if (nextShowInPos && (!nextPosSection || nextPrice === null || nextPrice <= 0)) {
-      sendError(
-        res,
-        400,
-        "VALIDATION_FAILED",
-        "Choose a valid POS section and selling price before showing this product in POS.",
-      );
-      return;
+    if ("lowStockLevel" in body) {
+      const lowStockResult = parseLowStockLevel(body.lowStockLevel);
+      if (!lowStockResult.ok) {
+        sendError(
+          res,
+          400,
+          "VALIDATION_FAILED",
+          "Low stock alert level must be a positive whole number (1 to 1,000,000), or cleared.",
+        );
+        return;
+      }
+      patch.lowStockLevel = lowStockResult.value;
     }
 
-    const outcome = await repo.updateMerchandiseProduct(db, {
-      id,
-      name: nextName,
-      description: nextDescription,
-      unitPriceCentavos: nextPrice!,
-      showInPos: nextShowInPos,
-      posSection: nextPosSection,
-    });
+    if ("faucetReportingType" in body) {
+      const faucetResult = parseFaucetReportingType(body.faucetReportingType);
+      if (!faucetResult.ok) {
+        sendError(
+          res,
+          400,
+          "VALIDATION_FAILED",
+          "Choose Push-Type, Twist-Type, or Not classified for faucet reporting type.",
+        );
+        return;
+      }
+      patch.faucetReportingType = faucetResult.value;
+    }
+
+    const outcome = await repo.updateMerchandiseProduct(db, patch);
 
     if (outcome.kind === "not-found") {
       sendError(res, 404, "NOT_FOUND", "Merchandise product not found.");
@@ -353,12 +410,21 @@ export function inventoryRoutes(db: Database): Router {
       );
       return;
     }
+    if (outcome.kind === "invalid-pos-visibility") {
+      sendError(
+        res,
+        400,
+        "VALIDATION_FAILED",
+        "Choose a valid POS section and selling price before showing this product in POS.",
+      );
+      return;
+    }
     if (outcome.kind === "duplicate-name") {
       sendError(
         res,
         409,
         "PRODUCT_ALREADY_EXISTS",
-        `A product named "${nextName}" already exists.`,
+        `A product named "${patch.name ?? existing.name}" already exists.`,
       );
       return;
     }
@@ -376,24 +442,45 @@ export function inventoryRoutes(db: Database): Router {
 
     const body = req.body as Record<string, unknown> | null | undefined;
     if (!body || typeof body !== "object" || Array.isArray(body)) {
-      sendError(res, 400, "VALIDATION_FAILED", "Provide Show in POS setting.");
+      sendError(res, 400, "VALIDATION_FAILED", "Provide valid container settings.");
       return;
     }
 
     const keys = Object.keys(body);
-    if (
-      keys.length === 0 ||
-      keys.some((key) => !CONTAINER_VISIBILITY_KEYS.has(key)) ||
-      typeof body.showInPos !== "boolean"
-    ) {
-      sendError(res, 400, "VALIDATION_FAILED", "Show in POS must be checked or unchecked.");
+    if (keys.length === 0 || keys.some((key) => !CONTAINER_SETTINGS_KEYS.has(key))) {
+      sendError(res, 400, "VALIDATION_FAILED", "Provide valid container settings.");
       return;
     }
 
-    const updated = await repo.updateContainerVisibility(db, {
-      shape,
-      showInPos: body.showInPos,
-    });
+    const containerPatch: {
+      shape: typeof shape;
+      showInPos?: boolean;
+      lowStockLevel?: number | null;
+    } = { shape };
+
+    if ("showInPos" in body) {
+      if (typeof body.showInPos !== "boolean") {
+        sendError(res, 400, "VALIDATION_FAILED", "Show in POS must be checked or unchecked.");
+        return;
+      }
+      containerPatch.showInPos = body.showInPos;
+    }
+
+    if ("lowStockLevel" in body) {
+      const lowStockResult = parseLowStockLevel(body.lowStockLevel);
+      if (!lowStockResult.ok) {
+        sendError(
+          res,
+          400,
+          "VALIDATION_FAILED",
+          "Low stock alert level must be a positive whole number (1 to 1,000,000), or cleared.",
+        );
+        return;
+      }
+      containerPatch.lowStockLevel = lowStockResult.value;
+    }
+
+    const updated = await repo.updateContainerSettings(db, containerPatch);
     if (!updated) {
       sendError(res, 404, "NOT_FOUND", "Container product not found.");
       return;

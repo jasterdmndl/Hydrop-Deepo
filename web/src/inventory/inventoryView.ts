@@ -3,6 +3,7 @@
 export type ContainerShape = "ROUND" | "SLIM";
 export type InventoryCategory = "CONTAINER" | "MERCHANDISE";
 export type PosSection = string;
+export type FaucetReportingType = "PUSH_TYPE" | "TWIST_TYPE";
 export type OpeningStockStatus = "NOT_SET" | "INITIALIZED";
 export type InventoryCategoryFilter = string;
 export type StockStatusTone = "unset" | "out" | "in";
@@ -53,6 +54,8 @@ export interface InventoryItemView {
   unitPriceCentavos?: number | null;
   showInPos?: boolean;
   posSection?: PosSection | null;
+  lowStockLevel?: number | null;
+  faucetReportingType?: FaucetReportingType | null;
   status: OpeningStockStatus;
   currentQuantity: number | null;
   stockRevision?: number;
@@ -112,6 +115,43 @@ export function parsePhysicalCountInput(
   unit = "containers",
 ): { ok: true; quantity: number } | { ok: false; message: string } {
   return parseOpeningQuantityInput(raw, unit);
+}
+
+export function parseLowStockLevelInput(
+  raw: string,
+  unit = "units",
+): { ok: true; value: number | null } | { ok: false; message: string } {
+  const trimmed = raw.trim();
+  if (!trimmed) {
+    return { ok: true, value: null };
+  }
+  if (!/^\d+$/.test(trimmed)) {
+    return {
+      ok: false,
+      message: `Enter a positive whole number of ${unit} (1 or more), or leave blank to clear.`,
+    };
+  }
+  const value = Number(trimmed);
+  if (!Number.isSafeInteger(value) || value < 1 || value > MAX_OPENING_QUANTITY) {
+    return {
+      ok: false,
+      message: `Enter a whole number from 1 to ${MAX_OPENING_QUANTITY.toLocaleString("en-US")}, or leave blank to clear.`,
+    };
+  }
+  return { ok: true, value };
+}
+
+export function formatFaucetReportingTypeLabel(
+  faucetType: FaucetReportingType | null | undefined,
+): string {
+  switch (faucetType) {
+    case "PUSH_TYPE":
+      return "Push-Type Faucet";
+    case "TWIST_TYPE":
+      return "Twist-Type Faucet";
+    default:
+      return "Not classified";
+  }
 }
 
 export function computeReconciliationPreview(

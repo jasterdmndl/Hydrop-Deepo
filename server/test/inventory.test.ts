@@ -969,4 +969,122 @@ describe("Inventory Round/Slim opening stock and merchandise products (DEC-065, 
     });
     expect(reusedName.status).toBe(201);
   });
+
+  it("lets Owner set and clear Low Stock levels and standalone faucet reporting types without altering balances or movements (DEC-090, DEC-093)", async () => {
+    // Initialize Round container stock at 12
+    const roundOpen = await postOpeningStock(ctx, owner, "ROUND", { quantity: 12 });
+    expect(roundOpen.status).toBe(201);
+    const revBefore = roundOpen.body.item.stockRevision as number;
+
+    // Set Low Stock level of 5 on Round container and keep current balance/revision unchanged
+    const roundLow = await patchContainer(ctx, owner, "ROUND", { lowStockLevel: 5 });
+    expect(roundLow.status).toBe(200);
+    expect(roundLow.body.item).toMatchObject({
+      shape: "ROUND",
+      currentQuantity: 12,
+      stockRevision: revBefore,
+      lowStockLevel: 5,
+      faucetReportingType: null,
+    });
+
+    // Omitting lowStockLevel on showInPos edit preserves lowStockLevel: 5
+    const roundShow = await patchContainer(ctx, owner, "ROUND", { showInPos: true });
+    expect(roundShow.status).toBe(200);
+    expect(roundShow.body.item).toMatchObject({
+      shape: "ROUND",
+      showInPos: true,
+      lowStockLevel: 5,
+    });
+
+    // Clear Round lowStockLevel with null
+    const roundClear = await patchContainer(ctx, owner, "ROUND", { lowStockLevel: null });
+    expect(roundClear.status).toBe(200);
+    expect(roundClear.body.item.lowStockLevel).toBeNull();
+
+    // Slim can also set lowStockLevel; container faucetReportingType edits are rejected
+    const slimLow = await patchContainer(ctx, owner, "SLIM", { lowStockLevel: 3 });
+    expect(slimLow.status).toBe(200);
+    expect(slimLow.body.item.lowStockLevel).toBe(3);
+
+    const invalidContainerFaucet = await patchContainer(ctx, owner, "ROUND", {
+      faucetReportingType: "PUSH_TYPE",
+    });
+    expect(invalidContainerFaucet.status).toBe(400);
+    expect(invalidContainerFaucet.body.error.code).toBe("VALIDATION_FAILED");
+
+    // Reject malformed lowStockLevel values on container and standalone merchandise
+    for (const badLevel of [0, -1, 2.5, "5", true, 1_000_001]) {
+      const res = await patchContainer(ctx, owner, "ROUND", { lowStockLevel: badLevel });
+      expect(res.status).toBe(400);
+      expect(res.body.error.code).toBe("VALIDATION_FAILED");
+    }
+
+    // Create standalone merchandise with lowStockLevel and faucetReportingType
+    const createdFaucet = await postProduct(ctx, owner, {
+      name: "Push Gripo Pro",
+      unit: "pcs",
+      unitConfirmed: true,
+      unitPriceCentavos: 4500,
+      showInPos: true,
+      posSection: "CHANGE_OF_GRIPO",
+      lowStockLevel: 5,
+      faucetReportingType: "PUSH_TYPE",
+    });
+    expect(createdFaucet.status).toBe(201);
+    expect(createdFaucet.body.item).toMatchObject({
+      name: "Push Gripo Pro",
+      lowStockLevel: 5,
+      faucetReportingType: "PUSH_TYPE",
+    });
+    const faucetId = createdFaucet.body.item.id as string;
+
+    expect((await postOpeningStock(ctx, owner, faucetId, { quantity: 10 })).status).toBe(201);
+
+    // Omitting settings on unrelated name edit preserves both lowStockLevel and faucetReportingType
+    const renameOnly = await patchProduct(ctx, owner, faucetId, { name: "Push Gripo Deluxe" });
+    expect(renameOnly.status).toBe(200);
+    expect(renameOnly.body.item).toMatchObject({
+      name: "Push Gripo Deluxe",
+      currentQuantity: 10,
+      lowStockLevel: 5,
+      faucetReportingType: "PUSH_TYPE",
+    });
+
+    // Clear lowStockLevel and change faucetReportingType to TWIST_TYPE then null
+    const updatedTypes = await patchProduct(ctx, owner, faucetId, {
+      lowStockLevel: null,
+      faucetReportingType: "TWIST_TYPE",
+    });
+    expect(updatedTypes.status).toBe(200);
+    expect(updatedTypes.body.item).toMatchObject({
+      lowStockLevel: null,
+      faucetReportingType: "TWIST_TYPE",
+    });
+
+    const clearedFaucetType = await patchProduct(ctx, owner, faucetId, {
+      faucetReportingType: null,
+    });
+    expect(clearedFaucetType.status).toBe(200);
+    expect(clearedFaucetType.body.item.faucetReportingType).toBeNull();
+
+    // Reject invalid faucetReportingType and Cashier edits
+    const badFaucetType = await patchProduct(ctx, owner, faucetId, {
+      faucetReportingType: "LEVER_TYPE",
+    });
+    expect(badFaucetType.status).toBe(400);
+
+    const cashierContainerEdit = await patchContainer(ctx, cashier, "ROUND", { lowStockLevel: 4 });
+    expect(cashierContainerEdit.status).toBe(403);
+    expect(cashierContainerEdit.body.error.code).toBe("FORBIDDEN");
+
+    const cashierProductEdit = await patchProduct(ctx, cashier, faucetId, { lowStockLevel: 4 });
+    expect(cashierProductEdit.status).toBe(403);
+    expect(cashierProductEdit.body.error.code).toBe("FORBIDDEN");
+
+    // Verify zero stock movements were created by setting/clearing lowStockLevel
+    const { rows: movRows } = await ctx.db.query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count FROM inventory_stock_movements`,
+    );
+    expect(movRows[0]!.count).toBe("0");
+  });
 });

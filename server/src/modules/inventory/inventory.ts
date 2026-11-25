@@ -8,8 +8,10 @@ import type { Role } from "../auth/policy.js";
 export type ContainerShape = "ROUND" | "SLIM";
 export type InventoryCategory = "CONTAINER" | "MERCHANDISE";
 export type PosSection = string;
+export type FaucetReportingType = "PUSH_TYPE" | "TWIST_TYPE";
 
 export const CONTAINER_SHAPES: readonly ContainerShape[] = ["ROUND", "SLIM"] as const;
+export const FAUCET_REPORTING_TYPES: readonly FaucetReportingType[] = ["PUSH_TYPE", "TWIST_TYPE"] as const;
 export const BUILT_IN_POS_SECTIONS = {
   CONTAINERS: "CONTAINERS",
   TAKIP_ACCESSORIES: "TAKIP_ACCESSORIES",
@@ -85,6 +87,8 @@ export interface InventoryItemView {
   unitPriceCentavos: number | null;
   showInPos: boolean;
   posSection: PosSection | null;
+  lowStockLevel: number | null;
+  faucetReportingType: FaucetReportingType | null;
   status: OpeningStockStatus;
   currentQuantity: number | null;
   stockRevision: number;
@@ -188,6 +192,37 @@ export function parseReconciliationReason(raw: unknown): string | null {
   const trimmed = raw.trim().replace(/\s+/g, " ");
   if (!trimmed || trimmed.length > MAX_RECONCILIATION_REASON_LENGTH) return null;
   return trimmed;
+}
+
+export function parseLowStockLevel(
+  raw: unknown,
+): { ok: true; value: number | null } | { ok: false } {
+  if (raw === null) {
+    return { ok: true, value: null };
+  }
+  if (typeof raw !== "number" || !Number.isInteger(raw)) {
+    return { ok: false };
+  }
+  if (raw < 1 || raw > MAX_OPENING_QUANTITY) {
+    return { ok: false };
+  }
+  return { ok: true, value: raw };
+}
+
+export function parseFaucetReportingType(
+  raw: unknown,
+): { ok: true; value: FaucetReportingType | null } | { ok: false } {
+  if (raw === null) {
+    return { ok: true, value: null };
+  }
+  if (typeof raw !== "string") {
+    return { ok: false };
+  }
+  const normalized = raw.trim().toUpperCase();
+  if (normalized === "PUSH_TYPE" || normalized === "TWIST_TYPE") {
+    return { ok: true, value: normalized };
+  }
+  return { ok: false };
 }
 
 // Asia/Manila is fixed UTC+08:00 with no daylight saving transitions.

@@ -13,9 +13,11 @@ import {
   computeReconciliationPreview,
   type ContainerShape,
   DEFAULT_POS_SECTIONS,
+  type FaucetReportingType,
   filterInventoryItems,
   formatAlreadySetNotice,
   formatCentavosInputValue,
+  formatFaucetReportingTypeLabel,
   formatPesoCentavos,
   formatQuantityLabel,
   formatRecordedAtManila,
@@ -34,6 +36,7 @@ import {
   type InventoryItemView,
   type InventoryPermissions,
   mergeRefreshedInventoryItems,
+  parseLowStockLevelInput,
   parseOpeningQuantityInput,
   parsePesoPriceToCentavos,
   parsePhysicalCountInput,
@@ -253,6 +256,8 @@ export function InventoryPage() {
   const [productPriceInput, setProductPriceInput] = useState("");
   const [productShowInPos, setProductShowInPos] = useState(false);
   const [productPosSection, setProductPosSection] = useState<string>("");
+  const [productLowStockInput, setProductLowStockInput] = useState("");
+  const [productFaucetType, setProductFaucetType] = useState<"" | FaucetReportingType>("");
   const [creatingProduct, setCreatingProduct] = useState(false);
   const [addProductError, setAddProductError] = useState<string | null>(null);
 
@@ -262,8 +267,15 @@ export function InventoryPage() {
   const [editPriceInput, setEditPriceInput] = useState("");
   const [editShowInPos, setEditShowInPos] = useState(false);
   const [editPosSection, setEditPosSection] = useState("");
+  const [editLowStockInput, setEditLowStockInput] = useState("");
+  const [editFaucetType, setEditFaucetType] = useState<"" | FaucetReportingType>("");
   const [savingEdit, setSavingEdit] = useState(false);
   const [editError, setEditError] = useState<string | null>(null);
+
+  const [editContainerAlertItem, setEditContainerAlertItem] = useState<InventoryItemView | null>(null);
+  const [containerLowStockInput, setContainerLowStockInput] = useState("");
+  const [savingContainerAlert, setSavingContainerAlert] = useState(false);
+  const [containerAlertError, setContainerAlertError] = useState<string | null>(null);
 
   const [archiveItem, setArchiveItem] = useState<InventoryItemView | null>(null);
   const [archiving, setArchiving] = useState(false);
@@ -291,6 +303,7 @@ export function InventoryPage() {
   const inputRefs = useRef<Record<string, HTMLInputElement | null>>({});
   const addNameInputRef = useRef<HTMLInputElement | null>(null);
   const editNameInputRef = useRef<HTMLInputElement | null>(null);
+  const containerAlertInputRef = useRef<HTMLInputElement | null>(null);
   const reconcileCountInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
@@ -342,11 +355,12 @@ export function InventoryPage() {
   }, [loadItems]);
 
   useEffect(() => {
-    if (!addProductOpen && !editProductItem && !archiveItem && !reconcileItem) return;
+    if (!addProductOpen && !editProductItem && !editContainerAlertItem && !archiveItem && !reconcileItem) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.defaultPrevented || event.key !== "Escape") return;
       if (addProductOpen && !creatingProduct) setAddProductOpen(false);
       if (editProductItem && !savingEdit) setEditProductItem(null);
+      if (editContainerAlertItem && !savingContainerAlert) setEditContainerAlertItem(null);
       if (archiveItem && !archiving) setArchiveItem(null);
       if (reconcileItem && !reconciling) setReconcileItem(null);
     };
@@ -357,6 +371,8 @@ export function InventoryPage() {
     creatingProduct,
     editProductItem,
     savingEdit,
+    editContainerAlertItem,
+    savingContainerAlert,
     archiveItem,
     archiving,
     reconcileItem,
@@ -371,6 +387,8 @@ export function InventoryPage() {
     setProductPriceInput("");
     setProductShowInPos(false);
     setProductPosSection("");
+    setProductLowStockInput("");
+    setProductFaucetType("");
     setAddProductError(null);
     setAddProductOpen(true);
     setTimeout(() => addNameInputRef.current?.focus(), 0);
@@ -386,8 +404,18 @@ export function InventoryPage() {
     );
     setEditShowInPos(Boolean(item.showInPos));
     setEditPosSection(item.posSection ?? "");
+    setEditLowStockInput(item.lowStockLevel != null ? String(item.lowStockLevel) : "");
+    setEditFaucetType(item.faucetReportingType ?? "");
     setEditError(null);
     setTimeout(() => editNameInputRef.current?.focus(), 0);
+  }
+
+  function openContainerAlertModal(item: InventoryItemView) {
+    if (item.category !== "CONTAINER" || !item.shape) return;
+    setEditContainerAlertItem(item);
+    setContainerLowStockInput(item.lowStockLevel != null ? String(item.lowStockLevel) : "");
+    setContainerAlertError(null);
+    setTimeout(() => containerAlertInputRef.current?.focus(), 0);
   }
 
   function openArchiveModal(item: InventoryItemView) {
@@ -416,6 +444,7 @@ export function InventoryPage() {
     const trimmedDesc = productDescription.trim().replace(/\s+/g, " ");
     const trimmedUnit = productUnit.trim().replace(/\s+/g, " ");
     const parsedPriceCentavos = parsePesoPriceToCentavos(productPriceInput);
+    const parsedLowStock = parseLowStockLevelInput(productLowStockInput, trimmedUnit || "units");
 
     if (!trimmedName || trimmedName.length > 80) {
       setAddProductError("Enter a product name (1 to 80 characters).");
@@ -435,6 +464,10 @@ export function InventoryPage() {
     }
     if (parsedPriceCentavos === null) {
       setAddProductError("Enter a valid positive selling price in pesos (e.g. 40.00).");
+      return;
+    }
+    if (!parsedLowStock.ok) {
+      setAddProductError(parsedLowStock.message);
       return;
     }
     if (productShowInPos && !productPosSection) {
@@ -458,6 +491,8 @@ export function InventoryPage() {
           unitPriceCentavos: parsedPriceCentavos,
           showInPos: productShowInPos,
           posSection: productPosSection || null,
+          lowStockLevel: parsedLowStock.value,
+          faucetReportingType: productFaucetType || null,
         },
       });
       loadTrackerRef.current.next();
@@ -485,6 +520,7 @@ export function InventoryPage() {
     const trimmedName = editName.trim().replace(/\s+/g, " ");
     const trimmedDesc = editDescription.trim().replace(/\s+/g, " ");
     const parsedPriceCentavos = parsePesoPriceToCentavos(editPriceInput);
+    const parsedLowStock = parseLowStockLevelInput(editLowStockInput, editProductItem.unit);
 
     if (!trimmedName || trimmedName.length > 80) {
       setEditError("Enter a product name (1 to 80 characters).");
@@ -496,6 +532,10 @@ export function InventoryPage() {
     }
     if (parsedPriceCentavos === null) {
       setEditError("Enter a valid positive selling price in pesos (e.g. 40.00).");
+      return;
+    }
+    if (!parsedLowStock.ok) {
+      setEditError(parsedLowStock.message);
       return;
     }
     if (editShowInPos && !editPosSection) {
@@ -519,6 +559,8 @@ export function InventoryPage() {
             unitPriceCentavos: parsedPriceCentavos,
             showInPos: editShowInPos,
             posSection: editPosSection || null,
+            lowStockLevel: parsedLowStock.value,
+            faucetReportingType: editFaucetType || null,
           },
         },
       );
@@ -541,6 +583,61 @@ export function InventoryPage() {
       );
     } finally {
       setSavingEdit(false);
+    }
+  }
+
+  async function handleSaveContainerAlert(event: FormEvent) {
+    event.preventDefault();
+    if (!editContainerAlertItem?.shape || savingContainerAlert || !permissions?.canCreateProduct) return;
+
+    const parsedLowStock = parseLowStockLevelInput(
+      containerLowStockInput,
+      editContainerAlertItem.unit,
+    );
+    if (!parsedLowStock.ok) {
+      setContainerAlertError(parsedLowStock.message);
+      containerAlertInputRef.current?.focus();
+      return;
+    }
+
+    setSavingContainerAlert(true);
+    setContainerAlertError(null);
+    setSaveNotice(null);
+    loadTrackerRef.current.next();
+
+    try {
+      const response = await api<{ item: InventoryItemView }>(
+        `/api/inventory/containers/${encodeURIComponent(editContainerAlertItem.shape)}`,
+        {
+          method: "PATCH",
+          body: { lowStockLevel: parsedLowStock.value },
+        },
+      );
+      loadTrackerRef.current.next();
+      setItems((prev) =>
+        prev.map((entry) =>
+          getItemKey(entry) === getItemKey(response.item) ? response.item : entry,
+        ),
+      );
+      setEditContainerAlertItem(null);
+      setSaveNotice({
+        id: nextNoticeId(),
+        duration: "brief",
+        title:
+          response.item.lowStockLevel != null
+            ? "Low stock alert saved"
+            : "Low stock alert cleared",
+        body:
+          response.item.lowStockLevel != null
+            ? `${response.item.name} will show a Low Stock alert in Dashboard when balance is 1 to ${formatQuantityLabel(response.item.lowStockLevel, response.item.unit)}.`
+            : `${response.item.name} no longer has a Low Stock alert level.`,
+      });
+    } catch (err) {
+      setContainerAlertError(
+        err instanceof ApiError ? err.message : "Could not save Low Stock alert level.",
+      );
+    } finally {
+      setSavingContainerAlert(false);
     }
   }
 
@@ -1105,6 +1202,22 @@ export function InventoryPage() {
                               POS section: {getPosSectionLabel(item.posSection, posSections)}
                             </p>
                           )}
+                          {(item.lowStockLevel != null ||
+                            (isMerchandise && item.faucetReportingType != null)) && (
+                            <p className="inventory-item-card__section-tag">
+                              {item.lowStockLevel != null
+                                ? `Low stock alert: ≤ ${formatQuantityLabel(item.lowStockLevel, item.unit)}`
+                                : null}
+                              {item.lowStockLevel != null &&
+                              isMerchandise &&
+                              item.faucetReportingType != null
+                                ? " · "
+                                : null}
+                              {isMerchandise && item.faucetReportingType != null
+                                ? `Faucet type: ${formatFaucetReportingTypeLabel(item.faucetReportingType)}`
+                                : null}
+                            </p>
+                          )}
                         </div>
 
                         <div className="inventory-item-card__pos-row">
@@ -1119,20 +1232,30 @@ export function InventoryPage() {
                           {canCreateProduct && (
                             <div className="inventory-item-card__actions">
                               {isContainer && item.shape && (
-                                <button
-                                  type="button"
-                                  className="button button--ghost button--sm"
-                                  disabled={isToggling || submittingKey !== null}
-                                  onClick={() =>
-                                    void handleToggleContainerVisibility(item.shape!, !item.showInPos)
-                                  }
-                                >
-                                  {isToggling
-                                    ? "Updating…"
-                                    : item.showInPos
-                                      ? "Hide from POS"
-                                      : "Show in POS"}
-                                </button>
+                                <>
+                                  <button
+                                    type="button"
+                                    className="button button--ghost button--sm"
+                                    disabled={isToggling || submittingKey !== null}
+                                    onClick={() =>
+                                      void handleToggleContainerVisibility(item.shape!, !item.showInPos)
+                                    }
+                                  >
+                                    {isToggling
+                                      ? "Updating…"
+                                      : item.showInPos
+                                        ? "Hide from POS"
+                                        : "Show in POS"}
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="button button--ghost button--sm"
+                                    disabled={isToggling || submittingKey !== null}
+                                    onClick={() => openContainerAlertModal(item)}
+                                  >
+                                    Low stock alert
+                                  </button>
+                                </>
                               )}
 
                               {isMerchandise && item.id && (
@@ -1506,6 +1629,43 @@ export function InventoryPage() {
                 />
               </div>
 
+              <div className="field-row">
+                <label className="field">
+                  <span>Low stock alert level (optional)</span>
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    pattern="[0-9]*"
+                    placeholder="Leave blank for no alert"
+                    disabled={creatingProduct}
+                    value={productLowStockInput}
+                    onChange={(e) => {
+                      setProductLowStockInput(e.target.value);
+                      setAddProductError(null);
+                    }}
+                  />
+                  <small>Alerts in Dashboard when positive stock is at or below this count.</small>
+                </label>
+
+                <label className="field">
+                  <span>Faucet reporting type (optional)</span>
+                  <select
+                    aria-label="Faucet reporting type"
+                    disabled={creatingProduct}
+                    value={productFaucetType}
+                    onChange={(e) => {
+                      setProductFaucetType(e.target.value as "" | FaucetReportingType);
+                      setAddProductError(null);
+                    }}
+                  >
+                    <option value="">Not classified</option>
+                    <option value="PUSH_TYPE">Push-Type Faucet</option>
+                    <option value="TWIST_TYPE">Twist-Type Faucet</option>
+                  </select>
+                  <small>Set only for standalone Push-Type or Twist-Type faucets.</small>
+                </label>
+              </div>
+
               {addProductError && (
                 <div className="alert alert--error" role="alert">
                   {addProductError}
@@ -1630,6 +1790,43 @@ export function InventoryPage() {
                 />
               </div>
 
+              <div className="field-row">
+                <label className="field">
+                  <span>Low stock alert level (optional)</span>
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    pattern="[0-9]*"
+                    placeholder="Leave blank to clear"
+                    disabled={savingEdit}
+                    value={editLowStockInput}
+                    onChange={(e) => {
+                      setEditLowStockInput(e.target.value);
+                      setEditError(null);
+                    }}
+                  />
+                  <small>Positive count in {editProductItem.unit}. Leave blank to remove alert.</small>
+                </label>
+
+                <label className="field">
+                  <span>Faucet reporting type (optional)</span>
+                  <select
+                    aria-label="Edit faucet reporting type"
+                    disabled={savingEdit}
+                    value={editFaucetType}
+                    onChange={(e) => {
+                      setEditFaucetType(e.target.value as "" | FaucetReportingType);
+                      setEditError(null);
+                    }}
+                  >
+                    <option value="">Not classified</option>
+                    <option value="PUSH_TYPE">Push-Type Faucet</option>
+                    <option value="TWIST_TYPE">Twist-Type Faucet</option>
+                  </select>
+                  <small>Future POS sales snapshot this setting; saved sales stay unchanged.</small>
+                </label>
+              </div>
+
               {editError && (
                 <div className="alert alert--error" role="alert">
                   {editError}
@@ -1647,6 +1844,64 @@ export function InventoryPage() {
                 </button>
                 <button type="submit" className="button button--primary" disabled={savingEdit}>
                   {savingEdit ? "Saving changes…" : "Save Changes"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {editContainerAlertItem && canCreateProduct && (
+        <div className="modal-backdrop" role="presentation">
+          <div
+            className="modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="container-alert-title"
+          >
+            <h2 id="container-alert-title">Low stock alert · {editContainerAlertItem.name}</h2>
+            <p className="muted-sm">
+              Alert in Dashboard Stocks when positive balance is at or below this count (in{" "}
+              {editContainerAlertItem.unit}). Saving this setting does not change stock counts or
+              movements.
+            </p>
+
+            <form className="subview" onSubmit={(event) => void handleSaveContainerAlert(event)} noValidate>
+              <label className="field">
+                <span>Low stock alert level ({editContainerAlertItem.unit})</span>
+                <input
+                  ref={containerAlertInputRef}
+                  type="text"
+                  inputMode="numeric"
+                  pattern="[0-9]*"
+                  placeholder="Leave blank to clear"
+                  disabled={savingContainerAlert}
+                  value={containerLowStockInput}
+                  onChange={(e) => {
+                    setContainerLowStockInput(e.target.value);
+                    setContainerAlertError(null);
+                  }}
+                />
+                <small>Enter a positive whole number (1 or more), or leave blank to clear.</small>
+              </label>
+
+              {containerAlertError && (
+                <div className="alert alert--error" role="alert">
+                  {containerAlertError}
+                </div>
+              )}
+
+              <div className="modal__actions">
+                <button
+                  type="button"
+                  className="button button--ghost"
+                  disabled={savingContainerAlert}
+                  onClick={() => setEditContainerAlertItem(null)}
+                >
+                  Cancel
+                </button>
+                <button type="submit" className="button button--primary" disabled={savingContainerAlert}>
+                  {savingContainerAlert ? "Saving…" : "Save Alert Level"}
                 </button>
               </div>
             </form>

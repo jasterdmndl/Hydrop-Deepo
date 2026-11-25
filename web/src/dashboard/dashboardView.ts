@@ -3,19 +3,40 @@ import {
   formatQuantityLabel,
   getPosSectionLabel,
   groupInventoryItems,
+  type ContainerShape,
+  type InventoryCategory,
   type InventoryItemView,
   type PosSectionView,
 } from "../inventory/inventoryView";
-import type { WaterType } from "../pos/posRecovery";
+import type {
+  ContainerPackageCode,
+  FaucetReportingType,
+  WaterType,
+} from "../pos/posRecovery";
 
 /**
  * Pure formatting, custom date validation, trend interpretation, reminder ordering,
- * and Inventory-to-Stocks snapshot helpers for Dashboard v1 (DEC-076).
+ * and Inventory-to-Stocks snapshot helpers for Final Dashboard (DEC-076, DEC-086..094).
  */
 
 export type DashboardPeriod = "today" | "week" | "month" | "custom";
 export type DashboardViewMode = "sales" | "stocks";
 export type DashboardDayStatus = "OPEN" | "CLOSED" | "NO_RECORD";
+export type ComparisonUnavailableReason =
+  | "NO_EQUIVALENT_PREVIOUS_MONTH_DATE"
+  | "MISSING_STATION_DAY";
+export type ContainerFillType = "EMPTY" | "PURIFIED" | "ALKALINE";
+export type DashboardRecommendationType =
+  | "OVERDUE_ACTIVITIES"
+  | "SALES_DECLINE"
+  | "REFILL_LEADER"
+  | "FAUCET_LEADER";
+export type StockTrendHistoryState = "NOT_SET" | "COMPLETE" | "INCOMPLETE";
+export type StockTrendMovementType =
+  | "OPENING_COUNT"
+  | "POS_SALE"
+  | "PRIOR_DAY_SETTLEMENT"
+  | "PHYSICAL_COUNT_RECONCILIATION";
 
 export const MAX_CUSTOM_RANGE_DAYS = 366;
 
@@ -33,6 +54,66 @@ export interface DashboardServiceBreakdown {
   waterVolumeMl: number;
   salesCentavos: number;
   sharePercent: number | null;
+}
+
+export interface DashboardComparisonRange {
+  from: string;
+  to: string;
+  isPartialEndDay: boolean;
+  cutoffAt: string;
+}
+
+export interface DashboardSalesComparison {
+  available: boolean;
+  unavailableReason: ComparisonUnavailableReason | null;
+  unavailableMessage: string | null;
+  currentRange: DashboardComparisonRange;
+  previousRange: DashboardComparisonRange | null;
+  currentTotalSalesCentavos: number;
+  previousTotalSalesCentavos: number | null;
+  amountChangeCentavos: number | null;
+  percentChange: number | null;
+}
+
+export interface DashboardFaucetBreakdownItem {
+  type: FaucetReportingType;
+  label: "Push-Type Faucet" | "Twist-Type Faucet";
+  units: number;
+  salesCentavos: number;
+  sharePercent: number | null;
+}
+
+export interface DashboardFaucetSales {
+  totalUnits: number;
+  totalSalesCentavos: number;
+  leader: FaucetReportingType | "TIE" | null;
+  unclassifiedUnits: number;
+  unclassifiedSalesCentavos: number;
+  items: DashboardFaucetBreakdownItem[];
+}
+
+export interface DashboardContainerSalesItem {
+  packageCode: ContainerPackageCode;
+  shape: ContainerShape;
+  fillType: ContainerFillType;
+  label: string;
+  units: number;
+  salesCentavos: number;
+  waterVolumeMl: number;
+}
+
+export interface DashboardContainerSales {
+  totalUnits: number;
+  totalSalesCentavos: number;
+  items: DashboardContainerSalesItem[];
+}
+
+export interface DashboardRecommendation {
+  id: string;
+  type: DashboardRecommendationType;
+  title: string;
+  observation: string;
+  suggestedAction: string;
 }
 
 export interface DashboardPriorDaySettlement {
@@ -61,9 +142,49 @@ export interface DashboardSalesReport {
     waterVolumeMl: number;
     transactions: number;
   };
+  comparison: DashboardSalesComparison;
   trend: DashboardSalesTrendPoint[];
   service: DashboardServiceBreakdown[];
+  faucetSales: DashboardFaucetSales;
+  containerSales: DashboardContainerSales;
+  recommendations: DashboardRecommendation[];
   priorDaySettlements: DashboardPriorDaySettlement[];
+}
+
+export interface DashboardStockTrendResponse {
+  item: {
+    id: string;
+    code: string;
+    name: string;
+    category: InventoryCategory;
+    shape: ContainerShape | null;
+    unit: string;
+    showInPos: boolean;
+    lowStockLevel: number | null;
+    status: "NOT_SET" | "INITIALIZED";
+    currentQuantity: number | null;
+  };
+  historyState: StockTrendHistoryState;
+  historyMessage: string | null;
+  openingStock: {
+    quantity: number;
+    unit: string;
+    recordedBy: string;
+    recordedAt: string;
+  } | null;
+  points: Array<{
+    pointKind: "OPENING" | "MOVEMENT";
+    movementId: string | null;
+    movementType: StockTrendMovementType;
+    recordedAt: string;
+    quantityDelta: number;
+    balanceBefore: number | null;
+    balanceAfter: number;
+    unit: string;
+    reference: string | null;
+    note: string | null;
+    actor: string;
+  }>;
 }
 
 const MANILA_OFFSET_MS = 8 * 60 * 60 * 1000;
@@ -305,14 +426,18 @@ export interface StockCategoryUnitRow {
   hasNegative: boolean;
 }
 
-export type StockAlertSeverity = "NEEDS_RECONCILIATION" | "OUT_OF_STOCK" | "NOT_SET";
+export type StockAlertSeverity =
+  | "NEEDS_RECONCILIATION"
+  | "OUT_OF_STOCK"
+  | "LOW_STOCK"
+  | "NOT_SET";
 
 export interface StockAlertItem {
   key: string;
   productName: string;
   groupTitle: string;
   severity: StockAlertSeverity;
-  badgeLabel: "Needs reconciliation" | "Out of Stock" | "Not Set";
+  badgeLabel: "Needs reconciliation" | "Out of Stock" | "Low Stock" | "Not Set";
   detail: string;
   quantity: number | null;
   unit: string;
@@ -341,8 +466,10 @@ function alertSeverityRank(severity: StockAlertSeverity): number {
       return 0;
     case "OUT_OF_STOCK":
       return 1;
-    case "NOT_SET":
+    case "LOW_STOCK":
       return 2;
+    case "NOT_SET":
+      return 3;
   }
 }
 
@@ -501,6 +628,23 @@ export function buildStocksSnapshot(
         quantity: 0,
         unit: item.unit,
       });
+    } else if (
+      item.currentQuantity > 0 &&
+      item.lowStockLevel !== undefined &&
+      item.lowStockLevel !== null &&
+      item.lowStockLevel > 0 &&
+      item.currentQuantity <= item.lowStockLevel
+    ) {
+      alerts.push({
+        key,
+        productName: item.name,
+        groupTitle,
+        severity: "LOW_STOCK",
+        badgeLabel: "Low Stock",
+        detail: `Low stock · ${formatQuantityLabel(item.currentQuantity, item.unit)} remaining (alert at ≤ ${formatQuantityLabel(item.lowStockLevel, item.unit)})`,
+        quantity: item.currentQuantity,
+        unit: item.unit,
+      });
     }
   }
 
@@ -522,4 +666,68 @@ export function buildStocksSnapshot(
     categoryUnits,
     alerts,
   };
+}
+
+export function formatComparisonRangeLabel(range: DashboardComparisonRange): string {
+  const dateLabel = formatManilaDateRange(range.from, range.to);
+  if (range.isPartialEndDay) {
+    return `${dateLabel} (through ${formatCutoffClock(range.cutoffAt)})`;
+  }
+  return `${dateLabel} (${range.from === range.to ? "full day" : "full days"})`;
+}
+
+export function formatComparisonChangeSummary(comparison: DashboardSalesComparison): {
+  tone: "positive" | "negative" | "neutral" | "unavailable";
+  headline: string;
+  rangeSummary: string;
+} {
+  const currLabel = formatComparisonRangeLabel(comparison.currentRange);
+  if (!comparison.available || comparison.amountChangeCentavos === null) {
+    const prevLabel = comparison.previousRange
+        ? ` vs ${formatComparisonRangeLabel(comparison.previousRange)}`
+        : "";
+    return {
+      tone: "unavailable",
+      headline: "Comparison Unavailable",
+      rangeSummary: `${currLabel}${prevLabel}`,
+    };
+  }
+
+  const diff = comparison.amountChangeCentavos;
+  const sign = diff > 0 ? "+" : diff < 0 ? "−" : "";
+  const absFormatted = formatDashboardPesoCompact(Math.abs(diff));
+  const amountText = diff === 0 ? "₱0" : `${sign}${absFormatted}`;
+
+  let pctText = "";
+  if (comparison.percentChange !== null) {
+    const pct = comparison.percentChange;
+    const pctSign = pct > 0 ? "+" : pct < 0 ? "−" : "";
+    const pctAbs = Math.abs(pct).toFixed(1).replace(/\.0$/, "");
+    pctText = ` (${pct === 0 ? "0%" : `${pctSign}${pctAbs}%`})`;
+  } else if (comparison.previousTotalSalesCentavos === 0) {
+    pctText = " (vs ₱0)";
+  }
+
+  const prevLabel = comparison.previousRange
+      ? formatComparisonRangeLabel(comparison.previousRange)
+      : "";
+
+  return {
+    tone: diff > 0 ? "positive" : diff < 0 ? "negative" : "neutral",
+    headline: `${amountText}${pctText}`,
+    rangeSummary: prevLabel ? `${currLabel} vs ${prevLabel}` : currLabel,
+  };
+}
+
+export function formatStockMovementTypeLabel(type: StockTrendMovementType): string {
+  switch (type) {
+    case "OPENING_COUNT":
+      return "Opening Count";
+    case "POS_SALE":
+      return "POS Sale";
+    case "PRIOR_DAY_SETTLEMENT":
+      return "Prior-Day Settlement";
+    case "PHYSICAL_COUNT_RECONCILIATION":
+      return "Physical Count Correction";
+  }
 }
