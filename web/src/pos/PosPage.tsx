@@ -35,6 +35,7 @@ import {
   formatIncludedGripoLabel,
   formatLiters,
   formatManilaTimestamp,
+  formatRecoveryCheckFeedback,
   type IncludedGripoType,
   isPendingRecoveryStorageKey,
   isPriorDayMerchandiseOnly,
@@ -52,7 +53,9 @@ import {
   type PrepareCheckoutResponse,
   type PriorDaySettlementView,
   type QuoteLineItem,
+  reconcileRecoveryTodayDate,
   removePendingRecovery,
+  resolveRecoveryPresentation,
   savePendingRecovery,
   saveUnpaidCart,
   type SaleView,
@@ -256,6 +259,9 @@ export function PosPage() {
   const [activeConfirming, setActiveConfirming] = useState<PendingCheckoutRecovery | null>(null);
   const [checkingStatus, setCheckingStatus] = useState(false);
   const [retryingRecovery, setRetryingRecovery] = useState(false);
+  const [recoveryStatusNotice, setRecoveryStatusNotice] = useState<
+    NoticeEnvelope<{ reference: string; message: string }> | null
+  >(null);
   const [recoveryError, setRecoveryError] = useState<NoticeEnvelope<string> | null>(null);
 
   const [lastSavedSale, setLastSavedSale] = useState<NoticeEnvelope<SaleView> | null>(null);
@@ -300,6 +306,7 @@ export function PosPage() {
   const [cartHydratedUser, setCartHydratedUser] = useState<string | null>(null);
   const isCartHydrated = cartHydratedUser === user.username;
   const loadTrackerRef = useRef(createRequestTracker());
+  const dayStatusTrackerRef = useRef(createRequestTracker());
   const preparedCheckoutRef = useRef<CheckoutView | null>(null);
   preparedCheckoutRef.current = preparedCheckout;
   const activeConfirmingRef = useRef<PendingCheckoutRecovery | null>(null);
@@ -427,8 +434,19 @@ export function PosPage() {
     [clearAllQtyEdits, closeCustomizeModal],
   );
 
+  const refreshDayStatusInBackground = useCallback(() => {
+    const dayRequestId = dayStatusTrackerRef.current.next();
+    void api<PosDayResponse>("/api/pos/day", { background: true })
+      .then((freshDay) => {
+        if (!dayStatusTrackerRef.current.isCurrent(dayRequestId)) return;
+        applyServerDayStatus(freshDay);
+      })
+      .catch(() => undefined);
+  }, [applyServerDayStatus]);
+
   const loadPosState = useCallback(async () => {
     const requestId = loadTrackerRef.current.next();
+    const dayRequestId = dayStatusTrackerRef.current.next();
     setLoading(true);
     setPageError(null);
     try {
@@ -448,7 +466,9 @@ export function PosPage() {
       setMerchandise(catRes.merchandise ?? []);
       setContainerPackages(catRes.containerPackages ?? []);
       setPosSections(catRes.posSections ?? []);
-      applyServerDayStatus(dayRes);
+      if (dayStatusTrackerRef.current.isCurrent(dayRequestId)) {
+        applyServerDayStatus(dayRes);
+      }
     } catch (err) {
       if (!loadTrackerRef.current.isCurrent(requestId)) return;
       setPageError(err instanceof ApiError ? err.message : "Could not load Point of Sale.");
@@ -1098,6 +1118,7 @@ export function PosPage() {
         method: "POST",
         body: { requestKey: key },
       });
+      dayStatusTrackerRef.current.next();
       setDayStatus(started);
       notifyPosStateChanged("day-started");
       setStartRequestKey(null);
@@ -1118,8 +1139,10 @@ export function PosPage() {
     setCloseRequestKey(generateKey());
     setPendingRecoveries(loadPendingRecoveries());
     setEndDayOpen(true);
+    const dayRequestId = dayStatusTrackerRef.current.next();
     try {
       const freshDay = await api<PosDayResponse>("/api/pos/day", { background: true });
+      if (!dayStatusTrackerRef.current.isCurrent(dayRequestId)) return;
       applyServerDayStatus(freshDay);
     } catch {
       // Keep existing dayStatus and allow retry if refresh fails.
@@ -1207,6 +1230,7 @@ export function PosPage() {
     setPrepareSignature(signature);
 
     loadTrackerRef.current.next();
+    dayStatusTrackerRef.current.next();
     try {
       const res = await api<PrepareCheckoutResponse>("/api/pos/checkouts", {
         method: "POST",
@@ -1215,6 +1239,7 @@ export function PosPage() {
           items: toCartItemInputs(lines),
         },
       });
+      dayStatusTrackerRef.current.next();
       setDayStatus((prev) => {
         if (!prev) return prev;
         if (res.checkout.status === "PAYMENT_PENDING") {
@@ -1253,6 +1278,7 @@ export function PosPage() {
     setStartingPayment(true);
     setSaleError(null);
     loadTrackerRef.current.next();
+    dayStatusTrackerRef.current.next();
     try {
       const res = await api<BeginPaymentResponse>(
         `/api/pos/checkouts/${encodeURIComponent(preparedCheckout.reference)}/begin-payment`,
@@ -1261,6 +1287,7 @@ export function PosPage() {
           body: {},
         },
       );
+      dayStatusTrackerRef.current.next();
       setDayStatus((prev) =>
         prev
           ? {
@@ -1451,6 +1478,7 @@ export function PosPage() {
     clearUnpaidCart(user.username);
     setConfirmingSale(true);
     setSaleError(null);
+    setRecoveryStatusNotice(null);
     setRecoveryError(null);
 
     try {
@@ -1504,6 +1532,7 @@ export function PosPage() {
         const updated = persistReviewRequiredFromError(pendingRecord, err) ?? pendingRecord;
         setPendingRecoveries(loadPendingRecoveries());
         setSelectedRecoveryRef(updated.reference);
+        setRecoveryStatusNotice(null);
         setRecoveryError(wrapNotice(err.message));
         setPreparedCheckout(null);
         setLines([]);
@@ -1513,6 +1542,7 @@ export function PosPage() {
         setCashInput("");
         setConfirmNoCashChecked(false);
         setStep("select");
+        refreshDayStatusInBackground();
         return;
       }
 
@@ -1524,6 +1554,7 @@ export function PosPage() {
       savePendingRecovery({ ...pendingRecord, lastError: errorMsg });
       setPendingRecoveries(loadPendingRecoveries());
       setSelectedRecoveryRef(pendingRecord.reference);
+      setRecoveryStatusNotice(null);
       setRecoveryError(wrapNotice(errorMsg));
       setPreparedCheckout(null);
       setLines([]);
@@ -1544,6 +1575,7 @@ export function PosPage() {
     const target = activeRecovery;
     if (!target) return;
     setCheckingStatus(true);
+    setRecoveryStatusNotice(null);
     setRecoveryError(null);
     try {
       const lookup = await api<CheckoutLookupView>(
@@ -1557,6 +1589,21 @@ export function PosPage() {
       savePendingRecovery(updated);
       setPendingRecoveries(loadPendingRecoveries());
       setSelectedRecoveryRef(updated.reference);
+
+      const nextPresentation = resolveRecoveryPresentation(
+        updated,
+        user.username,
+        user.role,
+        reconcileRecoveryTodayDate(dayStatus?.todayDate, lookup.checkedAt),
+      );
+      setRecoveryStatusNotice(
+        wrapNotice({
+          reference: updated.reference,
+          message: formatRecoveryCheckFeedback(lookup, nextPresentation),
+        }),
+      );
+
+      refreshDayStatusInBackground();
     } catch (err) {
       setRecoveryError(
         wrapNotice(
@@ -1576,6 +1623,7 @@ export function PosPage() {
     activeConfirmingRef.current = target;
     setActiveConfirming(target);
     setRetryingRecovery(true);
+    setRecoveryStatusNotice(null);
     setRecoveryError(null);
     try {
       const confirmed = await api<ConfirmSaleResponse>(
@@ -1608,6 +1656,7 @@ export function PosPage() {
         setPendingRecoveries(loadPendingRecoveries());
         setSelectedRecoveryRef(target.reference);
         setRecoveryError(wrapNotice(err.message));
+        refreshDayStatusInBackground();
         return;
       }
       setRecoveryError(
@@ -1648,6 +1697,7 @@ export function PosPage() {
     const remaining = loadPendingRecoveries();
     setPendingRecoveries(remaining);
     setSelectedRecoveryRef(remaining[0]?.reference ?? null);
+    setRecoveryStatusNotice(null);
     setRecoveryError(null);
     setLastSavedSale(wrapNotice(sale));
     setLastSettledPriorDay(null);
@@ -1665,6 +1715,7 @@ export function PosPage() {
     setPendingRecoveries(remaining);
     setSelectedRecoveryRef(remaining[0]?.reference ?? null);
     setSettlementTarget(null);
+    setRecoveryStatusNotice(null);
     setRecoveryError(null);
     setLastSavedSale(null);
     setLastSettledPriorDay(null);
@@ -1679,6 +1730,7 @@ export function PosPage() {
   ) {
     setEndDayOpen(false);
     setDayActionError(null);
+    setRecoveryStatusNotice(null);
     setRecoveryError(null);
     setLastAlreadySavedPriorDay(null);
     setSettlementTarget({
@@ -1717,6 +1769,7 @@ export function PosPage() {
     setPendingRecoveries(remaining);
     setSelectedRecoveryRef(remaining[0]?.reference ?? null);
     setSettlementTarget(null);
+    setRecoveryStatusNotice(null);
     setRecoveryError(null);
     setLastSavedSale(null);
     setLastAlreadySavedPriorDay(null);
@@ -1733,6 +1786,7 @@ export function PosPage() {
     setPendingRecoveries(remaining);
     setSelectedRecoveryRef(remaining[0]?.reference ?? null);
     setSettlementTarget(null);
+    setRecoveryStatusNotice(null);
     setRecoveryError(null);
     setLastSavedSale(null);
     setLastAlreadySavedPriorDay(null);
@@ -1750,6 +1804,7 @@ export function PosPage() {
       setLastAlreadySavedPriorDay(null);
       setSaleError(null);
       setDayActionError(null);
+      setRecoveryStatusNotice(null);
       setRecoveryError(null);
       productScrollTopRef.current = 0;
       setMobilePane("products");
@@ -1939,13 +1994,24 @@ export function PosPage() {
                 allRecoveries={pendingRecoveries}
                 currentUsername={user.username}
                 currentUserRole={user.role}
-                todayDate={dayStatus?.todayDate}
+                todayDate={reconcileRecoveryTodayDate(
+                  dayStatus?.todayDate,
+                  activeRecovery.lastLookup?.checkedAt,
+                )}
                 checking={checkingStatus}
                 retrying={retryingRecovery}
+                statusNotice={
+                  recoveryStatusNotice &&
+                  recoveryStatusNotice.data.reference === activeRecovery.reference
+                    ? { id: recoveryStatusNotice.id, data: recoveryStatusNotice.data.message }
+                    : null
+                }
                 errorNotice={recoveryError}
+                onDismissStatusNotice={() => setRecoveryStatusNotice(null)}
                 onDismissError={() => setRecoveryError(null)}
                 onSelectReference={(ref) => {
                   setSelectedRecoveryRef(ref);
+                  setRecoveryStatusNotice(null);
                   setRecoveryError(null);
                 }}
                 onCheckStatus={() => void handleCheckRecoveryStatus()}
@@ -3471,7 +3537,12 @@ export function PosPage() {
       {settlementTarget && dayStatus && (
         <PriorDaySettlementModal
           checkout={settlementTarget.checkout}
-          todayDate={dayStatus.todayDate}
+          todayDate={
+            reconcileRecoveryTodayDate(
+              dayStatus.todayDate,
+              activeRecovery?.lastLookup?.checkedAt,
+            ) ?? dayStatus.todayDate
+          }
           localCashReceivedCentavos={settlementTarget.localCashReceivedCentavos}
           onClose={() => setSettlementTarget(null)}
           onSettled={(settlement) => void handlePriorDaySettled(settlement)}

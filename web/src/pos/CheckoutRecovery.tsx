@@ -4,8 +4,10 @@ import {
   formatCentavos,
   formatLiters,
   formatManilaTimestamp,
+  isPriorDayMerchandiseOnly,
   type PendingCheckoutRecovery,
   type PriorDaySettlementView,
+  reconcileRecoveryTodayDate,
   type RecoveryTone,
   resolveRecoveryPresentation,
   type SaleView,
@@ -19,7 +21,9 @@ export interface CheckoutRecoveryProps {
   todayDate?: string;
   checking: boolean;
   retrying: boolean;
+  statusNotice?: NoticeEnvelope<string> | null;
   errorNotice: NoticeEnvelope<string> | null;
+  onDismissStatusNotice?: () => void;
   onDismissError(): void;
   onSelectReference?: (reference: string) => void;
   onCheckStatus(): void;
@@ -97,7 +101,9 @@ export function CheckoutRecovery({
   todayDate,
   checking,
   retrying,
+  statusNotice,
   errorNotice,
+  onDismissStatusNotice,
   onDismissError,
   onSelectReference,
   onCheckStatus,
@@ -106,11 +112,12 @@ export function CheckoutRecovery({
   onOpenPriorDaySettle,
   onContinueSettled,
 }: CheckoutRecoveryProps) {
+  const effectiveTodayDate = reconcileRecoveryTodayDate(todayDate, record.lastLookup?.checkedAt);
   const presentation = resolveRecoveryPresentation(
     record,
     currentUsername,
     currentUserRole,
-    todayDate,
+    effectiveTodayDate,
   );
 
   return (
@@ -209,6 +216,19 @@ export function CheckoutRecovery({
             </div>
           </dl>
 
+          {statusNotice && (
+            <TemporaryNotice
+              occurrenceId={statusNotice.id}
+              duration="brief"
+              className="alert alert--info"
+              role="status"
+              closeLabel="Close status check result"
+              onDismiss={onDismissStatusNotice ?? (() => undefined)}
+            >
+              {statusNotice.data}
+            </TemporaryNotice>
+          )}
+
           {errorNotice && (
             <TemporaryNotice
               occurrenceId={errorNotice.id}
@@ -228,6 +248,7 @@ export function CheckoutRecovery({
                 <button
                   type="button"
                   className="button button--primary button--block"
+                  aria-busy={checking}
                   disabled={checking || retrying}
                   onClick={onCheckStatus}
                 >
@@ -264,6 +285,7 @@ export function CheckoutRecovery({
                 <button
                   type="button"
                   className="button button--ghost button--block"
+                  aria-busy={checking}
                   disabled={retrying || checking}
                   onClick={onCheckStatus}
                 >
@@ -281,20 +303,25 @@ export function CheckoutRecovery({
                     disabled={checking || retrying}
                     onClick={() => onOpenPriorDaySettle(record)}
                   >
-                    Review &amp; settle prior-day refill
+                    {isPriorDayMerchandiseOnly(presentation.amounts.items)
+                      ? "Review & settle prior-day merchandise"
+                      : "Review & settle prior-day refill"}
                   </button>
                 )}
                 <button
                   type="button"
                   className="button button--ghost button--block"
+                  aria-busy={checking}
                   disabled={checking}
                   onClick={onCheckStatus}
                 >
                   {checking ? "Checking status…" : "Check transaction status"}
                 </button>
                 <p className="muted-sm">
-                  {currentUserRole === "CASHIER" && todayDate && record.businessDate < todayDate
-                    ? "Keep this reference for Owner review. Only the Owner can settle a confirmed paid-and-delivered prior-day refill; other outcomes remain pending."
+                  {currentUserRole === "CASHIER" &&
+                  effectiveTodayDate &&
+                  record.businessDate < effectiveTodayDate
+                    ? "Keep this reference for Owner review. Only the Owner can settle a confirmed paid-and-delivered prior-day checkout; other outcomes remain pending."
                     : "Keep this reference for Owner review. Automated refunds and backdated sales are not performed in this version."}
                 </p>
               </>

@@ -6,6 +6,8 @@ import {
   computeCashSummary,
   evaluateEndDayGuard,
   formatCentavos,
+  formatManilaTimeWithSeconds,
+  formatRecoveryCheckFeedback,
   isPosSyncStorageKey,
   LEGACY_PENDING_RECOVERY_STORAGE_KEY,
   loadPendingRecoveries,
@@ -15,6 +17,7 @@ import {
   parseLitersInput,
   parsePesoInputToCentavos,
   POS_SYNC_STORAGE_KEY,
+  reconcileRecoveryTodayDate,
   removePendingRecovery,
   resolveRecoveryPresentation,
   savePendingRecovery,
@@ -1135,5 +1138,164 @@ describe("account-scoped unpaid cart and workstation recovery storage", () => {
     expect(
       resolveRecoveryPresentation(mixedPending, "owner1", "OWNER", "2026-11-10").canSettlePriorDay,
     ).toBe(false);
+  });
+
+  it("formats recovery check times with seconds, reconciles midnight dates, and builds visible check feedback", () => {
+    expect(formatManilaTimeWithSeconds("2026-11-25T00:00:15+08:00")).toBe("12:00:15 AM");
+    expect(formatManilaTimeWithSeconds("2026-11-25T00:00:05+08:00")).toBe("12:00:05 AM");
+
+    // Reconciles stale pre-midnight snapshot date with post-midnight lookup timestamp.
+    expect(reconcileRecoveryTodayDate("2026-11-24", "2026-11-25T00:00:15+08:00")).toBe("2026-11-25");
+    expect(reconcileRecoveryTodayDate("2026-11-24", "2026-11-24T23:59:55+08:00")).toBe("2026-11-24");
+
+    // Eligible Owner refill across midnight unlocks settlement even if dayStatus.todayDate is stale.
+    const refillAcrossMidnight = makePendingRecord({
+      reference: "HD-1124-001",
+      businessDate: "2026-11-24",
+      lastLookup: makeLookup({
+        recoveryState: "REVIEW_REQUIRED",
+        reason: "BUSINESS_DATE_CROSSED",
+        canRetry: false,
+        canSettlePriorDay: true,
+        checkedAt: "2026-11-25T00:00:15+08:00",
+        checkout: {
+          ...makeLookup({}).checkout,
+          reference: "HD-1124-001",
+          businessDate: "2026-11-24",
+          status: "REVIEW_REQUIRED",
+          resolutionReason: "BUSINESS_DATE_CROSSED",
+        },
+      }),
+    });
+
+    const ownerPresentation = resolveRecoveryPresentation(
+      refillAcrossMidnight,
+      "owner1",
+      "OWNER",
+      "2026-11-24",
+    );
+    expect(ownerPresentation.canSettlePriorDay).toBe(true);
+    expect(ownerPresentation.subline).toContain("12:00:15 AM");
+    expect(formatRecoveryCheckFeedback(refillAcrossMidnight.lastLookup!, ownerPresentation)).toBe(
+      "Status confirmed (12:00:15 AM) — still requires Owner review. Prior-day settlement is available below.",
+    );
+
+    // Cashier on the same crossed-midnight refill still cannot settle.
+    const cashierPresentation = resolveRecoveryPresentation(
+      refillAcrossMidnight,
+      "cashier1",
+      "CASHIER",
+      "2026-11-24",
+    );
+    expect(cashierPresentation.canSettlePriorDay).toBe(false);
+    expect(formatRecoveryCheckFeedback(refillAcrossMidnight.lastLookup!, cashierPresentation)).toBe(
+      "Status confirmed (12:00:15 AM) — still requires Owner review.",
+    );
+
+    // DEC-075 merchandise-only checkout across midnight unlocks settlement for Owner even with stale todayDate.
+    const merchAcrossMidnight = makePendingRecord({
+      reference: "HD-1124-002",
+      businessDate: "2026-11-24",
+      quoteItems: [
+        {
+          lineIndex: 0,
+          kind: "MERCHANDISE",
+          catalogCode: null,
+          waterType: null,
+          productId: "11111111-1111-4111-8111-111111111111",
+          stockUnit: "pcs",
+          posSection: "CHANGE_OF_GRIPO",
+          displayLabel: "Push-Type Faucet",
+          unitVolumeMl: 0,
+          unitVolumeLiters: 0,
+          unitPriceCentavos: 4000,
+          quantity: 1,
+          lineTotalCentavos: 4000,
+          lineVolumeMl: 0,
+          lineVolumeLiters: 0,
+        },
+      ],
+      lastLookup: makeLookup({
+        recoveryState: "REVIEW_REQUIRED",
+        reason: "BUSINESS_DATE_CROSSED",
+        canRetry: false,
+        canSettlePriorDay: true,
+        checkedAt: "2026-11-25T00:00:20+08:00",
+        checkout: {
+          ...makeLookup({}).checkout,
+          reference: "HD-1124-002",
+          businessDate: "2026-11-24",
+          status: "REVIEW_REQUIRED",
+          resolutionReason: "BUSINESS_DATE_CROSSED",
+          items: [
+            {
+              lineIndex: 0,
+              kind: "MERCHANDISE",
+              catalogCode: null,
+              waterType: null,
+              productId: "11111111-1111-4111-8111-111111111111",
+              stockUnit: "pcs",
+              posSection: "CHANGE_OF_GRIPO",
+              displayLabel: "Push-Type Faucet",
+              unitVolumeMl: 0,
+              unitVolumeLiters: 0,
+              unitPriceCentavos: 4000,
+              quantity: 1,
+              lineTotalCentavos: 4000,
+              lineVolumeMl: 0,
+              lineVolumeLiters: 0,
+            },
+          ],
+        },
+      }),
+    });
+    expect(
+      resolveRecoveryPresentation(merchAcrossMidnight, "owner1", "OWNER", "2026-11-24")
+        .canSettlePriorDay,
+    ).toBe(true);
+
+    // Other recovery states produce distinct, timestamped feedback messages.
+    const retryLookup = makeLookup({
+      recoveryState: "SAFE_TO_RETRY",
+      reason: "NOT_SAVED",
+      canRetry: true,
+      checkedAt: "2026-11-25T00:01:02+08:00",
+    });
+    const retryPresentation = resolveRecoveryPresentation(
+      makePendingRecord({ lastLookup: retryLookup }),
+      "cashier1",
+    );
+    expect(formatRecoveryCheckFeedback(retryLookup, retryPresentation)).toBe(
+      "Status confirmed (12:01:02 AM) — not saved yet. Safe to retry.",
+    );
+
+    const savedLookup = makeLookup({
+      recoveryState: "SAVED",
+      reason: null,
+      canRetry: false,
+      checkedAt: "2026-11-25T00:01:05+08:00",
+      sale: makeSale(),
+    });
+    const savedPresentation = resolveRecoveryPresentation(
+      makePendingRecord({ lastLookup: savedLookup }),
+      "cashier1",
+    );
+    expect(formatRecoveryCheckFeedback(savedLookup, savedPresentation)).toBe(
+      "Status confirmed (12:01:05 AM) — sale is already saved.",
+    );
+
+    const inFlightLookup = makeLookup({
+      recoveryState: "UNRESOLVED",
+      reason: "SAVE_IN_PROGRESS",
+      canRetry: false,
+      checkedAt: "2026-11-25T00:01:08+08:00",
+    });
+    const inFlightPresentation = resolveRecoveryPresentation(
+      makePendingRecord({ lastLookup: inFlightLookup }),
+      "cashier1",
+    );
+    expect(formatRecoveryCheckFeedback(inFlightLookup, inFlightPresentation)).toBe(
+      "Status confirmed (12:01:08 AM) — save is still in progress.",
+    );
   });
 });

@@ -442,6 +442,39 @@ export function formatManilaTimeOnly(iso: string): string {
   }).format(parsed);
 }
 
+export function formatManilaTimeWithSeconds(iso: string): string {
+  const parsed = Date.parse(iso);
+  if (Number.isNaN(parsed)) return iso;
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: "Asia/Manila",
+    hour: "numeric",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: true,
+  }).format(parsed);
+}
+
+export function manilaDateFromIso(iso: string): string | null {
+  const parsed = Date.parse(iso);
+  if (Number.isNaN(parsed)) return null;
+  return currentManilaIso(new Date(parsed)).slice(0, 10);
+}
+
+export function reconcileRecoveryTodayDate(
+  todayDate?: string | null,
+  checkedAt?: string | null,
+): string | undefined {
+  const cleanToday =
+    typeof todayDate === "string" && /^\d{4}-\d{2}-\d{2}$/.test(todayDate.trim())
+      ? todayDate.trim()
+      : undefined;
+  const checkedDate = checkedAt ? manilaDateFromIso(checkedAt) : null;
+  if (cleanToday && checkedDate) {
+    return checkedDate > cleanToday ? checkedDate : cleanToday;
+  }
+  return checkedDate ?? cleanToday;
+}
+
 export function formatCentavos(centavos: number): string {
   const truncated = Math.trunc(centavos);
   const sign = truncated < 0 ? "-" : "";
@@ -800,7 +833,7 @@ export function resolveRecoveryPresentation(
       statusPillLabel: "Saved · verified",
       statusPillTone: "success",
       headline: "This sale is already saved",
-      subline: `Transaction status checked at ${formatManilaTimeOnly(lookup.checkedAt)}.`,
+      subline: `Transaction status checked at ${formatManilaTimeWithSeconds(lookup.checkedAt)}.`,
       calloutTitle: "No duplicate sale was created",
       calloutBody: isDifferentAccount
         ? `The original transaction started by ${record.initiatedBy} is confirmed. Continue with the saved sale; do not collect cash again.`
@@ -838,7 +871,7 @@ export function resolveRecoveryPresentation(
       statusPillLabel: "Settled · prior day",
       statusPillTone: "success",
       headline: isMerchOnly ? "Prior-day merchandise settled" : "Prior-day refill settled",
-      subline: `Settlement recorded on ${settlement.settlementDate} · checked at ${formatManilaTimeOnly(lookup.checkedAt)}.`,
+      subline: `Settlement recorded on ${settlement.settlementDate} · checked at ${formatManilaTimeWithSeconds(lookup.checkedAt)}.`,
       calloutTitle: "No further payment collected",
       calloutBody: isMerchOnly
         ? `Confirmed paid and handed over from ${settlement.originalBusinessDate}. Recorded separately from today's sales.`
@@ -864,11 +897,10 @@ export function resolveRecoveryPresentation(
     const change = lookup.checkout.changeCentavos ?? cashReceived - serverTotal;
     const isDateCrossed = lookup.reason === "BUSINESS_DATE_CROSSED";
     const isDayClosed = lookup.reason === "DAY_CLOSED";
-    const isPriorDay = todayDate
-      ? lookup.checkout.businessDate < todayDate
-      : lookup.reason === "BUSINESS_DATE_CROSSED" ||
-      (lookup.checkedAt.length >= 10 &&
-        lookup.checkout.businessDate < lookup.checkedAt.slice(0, 10));
+    const effectiveTodayDate = reconcileRecoveryTodayDate(todayDate, lookup.checkedAt);
+    const isPriorDay = effectiveTodayDate
+      ? lookup.checkout.businessDate < effectiveTodayDate
+      : lookup.reason === "BUSINESS_DATE_CROSSED";
     const canSettlePriorDay =
       isPriorDaySettleableComposition(lookup.checkout.items) &&
       currentUserRole === "OWNER" &&
@@ -888,7 +920,7 @@ export function resolveRecoveryPresentation(
       statusPillLabel: "Review required",
       statusPillTone: "danger",
       headline: "Owner review required",
-      subline: `Transaction status checked at ${formatManilaTimeOnly(lookup.checkedAt)}.`,
+      subline: `Transaction status checked at ${formatManilaTimeWithSeconds(lookup.checkedAt)}.`,
       calloutTitle: isDateCrossed
         ? "Business date changed before save"
         : isDayClosed
@@ -926,7 +958,7 @@ export function resolveRecoveryPresentation(
       statusPillLabel: "Not saved · verified",
       statusPillTone: "neutral",
       headline: "Not saved. Safe to retry.",
-      subline: `Transaction status checked at ${formatManilaTimeOnly(lookup.checkedAt)}.`,
+      subline: `Transaction status checked at ${formatManilaTimeWithSeconds(lookup.checkedAt)}.`,
       calloutTitle: "No matching sale found",
       calloutBody:
         "A server check confirmed this transaction was not saved. Retry the same transaction without collecting cash again.",
@@ -977,7 +1009,7 @@ export function resolveRecoveryPresentation(
     statusPillTone: "warning",
     headline: isDifferentAccount ? "Pending checkout from another account" : "Check before retrying",
     subline: lookup
-      ? `Transaction status checked at ${formatManilaTimeOnly(lookup.checkedAt)}.`
+      ? `Transaction status checked at ${formatManilaTimeWithSeconds(lookup.checkedAt)}.`
       : "The connection was interrupted during saving.",
     calloutTitle: isDifferentAccount
       ? `Started by ${record.initiatedBy} — sign back into that account to retry`
@@ -993,6 +1025,36 @@ export function resolveRecoveryPresentation(
     sale: null,
     settlement: null,
   };
+}
+
+/** Formats a clear single-check outcome message for the recovery status alert. */
+export function formatRecoveryCheckFeedback(
+  lookup: CheckoutLookupView,
+  presentation: RecoveryPresentation,
+): string {
+  const checkedTime = formatManilaTimeWithSeconds(lookup.checkedAt);
+  switch (presentation.screen) {
+    case "SAVED":
+      return `Status confirmed (${checkedTime}) — sale is already saved.`;
+    case "SETTLED_PRIOR_DAY":
+      return `Status confirmed (${checkedTime}) — prior-day settlement is already recorded.`;
+    case "SAFE_TO_RETRY":
+      return `Status confirmed (${checkedTime}) — not saved yet. Safe to retry.`;
+    case "REVIEW_REQUIRED":
+      return presentation.canSettlePriorDay
+        ? `Status confirmed (${checkedTime}) — still requires Owner review. Prior-day settlement is available below.`
+        : `Status confirmed (${checkedTime}) — still requires Owner review.`;
+    case "UNKNOWN":
+      if (lookup.reason === "SAVE_IN_PROGRESS") {
+        return `Status confirmed (${checkedTime}) — save is still in progress.`;
+      }
+      if (presentation.isDifferentAccount || lookup.reason === "OWNED_BY_OTHER_ACCOUNT") {
+        return `Status confirmed (${checkedTime}) — still pending under ${
+          presentation.isDifferentAccount ? "another account" : "the initiating account"
+        }.`;
+      }
+      return `Status confirmed (${checkedTime}) — status is still unresolved.`;
+  }
 }
 
 export function stationStatusFromDay(day: PosDayResponse): {
