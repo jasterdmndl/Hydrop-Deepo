@@ -71,7 +71,7 @@ describe("Dashboard sales report and authorization (DEC-076)", () => {
   beforeEach(async () => {
     ctx = await createTestContext({ clock: new ManualClock(SUNDAY_BEFORE_MIDNIGHT_MANILA) });
     owner = await activatedAccount(ctx, "owner1", "OWNER");
-    cashier = await activatedAccount(ctx, "cashier1", "CASHIER");
+    cashier = await activatedAccount(ctx, "cashier1", "EMPLOYEE");
   });
 
   afterEach(async () => {
@@ -774,7 +774,7 @@ describe("Final Dashboard Sales comparison, breakdowns, and recommendations (DEC
   beforeEach(async () => {
     ctx = await createTestContext({ clock: new ManualClock("2026-11-04T08:00:00+08:00") });
     owner = await activatedAccount(ctx, "owner1", "OWNER");
-    cashier = await activatedAccount(ctx, "cashier1", "CASHIER");
+    cashier = await activatedAccount(ctx, "cashier1", "EMPLOYEE");
   });
 
   afterEach(async () => {

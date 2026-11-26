@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "tsx watch --env-file-if-exists=.env src/index.ts",
     "migrate": "tsx --env-file-if-exists=.env src/cli/migrate.ts",
+    "rollback:employee-role": "tsx --env-file-if-exists=.env src/cli/rollback-employee-role.ts",
     "provision": "tsx --env-file-if-exists=.env src/cli/provision.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",

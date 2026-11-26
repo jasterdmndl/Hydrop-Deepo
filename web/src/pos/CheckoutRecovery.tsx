@@ -26,7 +26,7 @@ export interface CheckoutRecoveryProps {
   record: PendingCheckoutRecovery;
   allRecoveries?: PendingCheckoutRecovery[];
   currentUsername: string;
-  currentUserRole?: "OWNER" | "CASHIER";
+  currentUserRole?: "OWNER" | "EMPLOYEE";
   todayDate?: string;
   checking: boolean;
   retrying: boolean;
@@ -120,7 +120,7 @@ export function CheckoutRecovery({
   record,
   allRecoveries,
   currentUsername,
-  currentUserRole = "CASHIER",
+  currentUserRole = "EMPLOYEE",
   todayDate,
   checking,
   retrying,
@@ -545,7 +545,7 @@ export function CheckoutRecovery({
                 <p className="muted-sm">
                   {presentation.canCancelUnpaid
                     ? "Record the filled-container disposition and confirm no cash was received above to cancel this unpaid draft so the station day can close."
-                    : currentUserRole === "CASHIER" &&
+                    : currentUserRole === "EMPLOYEE" &&
                         effectiveTodayDate &&
                         record.businessDate < effectiveTodayDate
                       ? "Keep this reference for Owner review. Only the Owner can settle or resolve a prior-day checkout; partial and uncertain outcomes remain pending."

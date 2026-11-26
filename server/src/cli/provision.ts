@@ -1,7 +1,7 @@
 /**
  * Local provisioning: creates one account with a generated temporary password.
  *
- *   npm run provision -- --username <name> --role OWNER|CASHIER
+ *   npm run provision -- --username <name> --role OWNER|EMPLOYEE
  *
  * The temporary password is printed once to this terminal only. It is not
  * stored anywhere except as an Argon2id hash. Hand it to the account holder
@@ -25,7 +25,7 @@ const { values } = parseArgs({
 const username = values.username?.trim();
 const role = values.role?.toUpperCase() as Role | undefined;
 if (!username || !/^[A-Za-z0-9._-]{3,64}$/.test(username) || !role || !ROLES.includes(role)) {
-  console.error("Usage: npm run provision -- --username <3-64 letters, digits, . _ -> --role OWNER|CASHIER");
+  console.error("Usage: npm run provision -- --username <3-64 letters, digits, . _ -> --role OWNER|EMPLOYEE");
   process.exit(1);
 }
 

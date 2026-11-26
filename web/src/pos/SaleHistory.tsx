@@ -23,7 +23,7 @@ import { SaleActionModal } from "./SaleActionModal";
 
 export interface SaleHistoryProps {
   todayDate: string;
-  currentUserRole?: "OWNER" | "CASHIER";
+  currentUserRole?: "OWNER" | "EMPLOYEE";
   dayStatus?: PosDayResponse | null;
   initialReference?: string | null;
   initialSettlementRef?: string | null;
@@ -66,7 +66,7 @@ function formatHistoryItemsSubtitle(
 
 export function SaleHistory({
   todayDate,
-  currentUserRole = "CASHIER",
+  currentUserRole = "EMPLOYEE",
   dayStatus = null,
   initialReference,
   initialSettlementRef,

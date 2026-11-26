@@ -9,6 +9,7 @@ import {
   manilaGreeting,
   orderSidebarModules,
   resolveSidebarState,
+  roleLabel,
   selectHomeCardModules,
 } from "./chooseModuleView";
 import type { PendingCheckoutRecovery, PosDayResponse } from "./pos/posRecovery";
@@ -124,7 +125,7 @@ describe("chooseModuleView helpers", () => {
       body: "Filter housing cleaning was due November 8. Open Activity Calendar to review and record completion.",
       overdueCount: 1,
     });
-    expect(buildOverdueAttention(oneOverdue, "CASHIER", now)).toEqual({
+    expect(buildOverdueAttention(oneOverdue, "EMPLOYEE", now)).toEqual({
       title: "One activity needs your attention",
       body: "Filter housing cleaning was due November 8. Open Activity Calendar to view details. Only the Owner can record completion.",
       overdueCount: 1,
@@ -151,7 +152,7 @@ describe("chooseModuleView helpers", () => {
       body: "Filter housing cleaning was due November 8 (+2 more overdue). Open Activity Calendar to review and record completion.",
       overdueCount: 3,
     });
-    expect(buildOverdueAttention(multiOverdue, "CASHIER", now)).toEqual({
+    expect(buildOverdueAttention(multiOverdue, "EMPLOYEE", now)).toEqual({
       title: "3 activities need your attention",
       body: "Filter housing cleaning was due November 8 (+2 more overdue). Open Activity Calendar to view details. Only the Owner can record completion.",
       overdueCount: 3,
@@ -246,5 +247,10 @@ describe("chooseModuleView helpers", () => {
       sidebarExpanded: true,
       toggleLabel: "Open navigation menu",
     });
+  });
+
+  it("formats human-readable role labels for Owner and Employee", () => {
+    expect(roleLabel("OWNER")).toBe("Owner");
+    expect(roleLabel("EMPLOYEE")).toBe("Employee");
   });
 });

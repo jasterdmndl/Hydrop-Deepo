@@ -12,6 +12,7 @@ import {
   manilaGreeting,
   orderSidebarModules,
   resolveSidebarState,
+  roleLabel,
   selectHomeCardModules,
 } from "./chooseModuleView";
 import {
@@ -73,10 +74,6 @@ export function useModulesData() {
 function userInitials(username: string): string {
   const cleaned = username.trim().replace(/[^A-Za-z0-9]/g, "");
   return (cleaned.slice(0, 2) || "HD").toUpperCase();
-}
-
-function roleLabel(role: "OWNER" | "CASHIER"): string {
-  return role === "OWNER" ? "Owner" : "Cashier";
 }
 
 function moduleBadgeText(state: ModuleState): string {

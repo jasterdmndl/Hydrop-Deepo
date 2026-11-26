@@ -29,5 +29,5 @@ export const ARGON2_OPTIONS = {
   parallelism: 1,
 } as const;
 
-export const ROLES = ["OWNER", "CASHIER"] as const;
+export const ROLES = ["OWNER", "EMPLOYEE"] as const;
 export type Role = (typeof ROLES)[number];

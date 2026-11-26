@@ -113,7 +113,7 @@ describe("Inventory Round/Slim opening stock and merchandise products (DEC-065, 
   beforeEach(async () => {
     ctx = await createTestContext({ clock: new ManualClock(BASE_MANILA) });
     owner = await activatedAccount(ctx, "owner1", "OWNER");
-    cashier = await activatedAccount(ctx, "cashier1", "CASHIER");
+    cashier = await activatedAccount(ctx, "cashier1", "EMPLOYEE");
   });
 
   afterEach(async () => {

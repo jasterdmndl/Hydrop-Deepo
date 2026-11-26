@@ -128,9 +128,13 @@ export interface OverdueAttentionView {
   overdueCount: number;
 }
 
+export function roleLabel(role: "OWNER" | "EMPLOYEE"): string {
+  return role === "OWNER" ? "Owner" : "Employee";
+}
+
 export function buildOverdueAttention(
   reminders: RemindersResponse | null,
-  role: "OWNER" | "CASHIER",
+  role: "OWNER" | "EMPLOYEE",
   now: Date = new Date(),
 ): OverdueAttentionView | null {
   if (!reminders || reminders.overdueCount <= 0) return null;

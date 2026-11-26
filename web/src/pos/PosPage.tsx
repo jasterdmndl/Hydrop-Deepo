@@ -4080,7 +4080,7 @@ export function PosPage() {
                     )} = ${formatCentavos(parsedCustomPriceCentavos * customQty)} (${formatLiters(
                       Number((parsedCustomLiters * customQty).toFixed(2)),
                     )})`
-                    : "Cashier consults Owner for the custom price, then enters liters and price per container."}
+                    : "Employee consults Owner for the custom price, then enters liters and price per container."}
                 </p>
               </div>
 

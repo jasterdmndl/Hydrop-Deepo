@@ -374,13 +374,13 @@ function toIsoOrNull(value: Date | string | null): string | null {
 
 /**
  * Refill-only POS HTTP endpoints, mounted at /api/pos behind the shared
- * module-access guards. Accessible to both OWNER and CASHIER roles.
+ * module-access guards. Accessible to both OWNER and EMPLOYEE roles.
  */
 export function posRoutes(db: Database): Router {
   const router = Router();
   const inFlight = new InFlightCheckoutTracker();
 
-  router.use(requireRole("OWNER", "CASHIER"));
+  router.use(requireRole("OWNER", "EMPLOYEE"));
 
   router.get("/catalog", async (_req, res) => {
     const [items, merchandise, containerPackages, posSections] = await Promise.all([

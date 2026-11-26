@@ -1561,7 +1561,7 @@ export function InventoryPage() {
             <div className="inventory-board-note" role="status">
               <span className="inventory-board-note__title">View-only access</span>
               <span>
-                Both Owner and Cashier can view stock counts and POS catalog status. Only the Owner can add or edit
+                Both Owner and Employee can view stock counts and POS catalog status. Only the Owner can add or edit
                 merchandise products, manage POS visibility, archive products, record initial opening counts, or
                 reconcile physical stock counts.
               </span>

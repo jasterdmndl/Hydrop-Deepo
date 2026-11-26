@@ -764,7 +764,7 @@ describe("account-scoped unpaid cart and workstation recovery storage", () => {
         },
       }),
       "cashier1",
-      "CASHIER",
+      "EMPLOYEE",
       "2026-11-10",
     );
     expect(cashierFallback.canSettlePriorDay).toBe(false);
@@ -872,11 +872,11 @@ describe("account-scoped unpaid cart and workstation recovery storage", () => {
 
     // Cached Owner true must NOT expose settle button when switched to Cashier.
     expect(
-      resolveRecoveryPresentation(cachedOwnerTrue, "cashier1", "CASHIER", "2026-11-10")
+      resolveRecoveryPresentation(cachedOwnerTrue, "cashier1", "EMPLOYEE", "2026-11-10")
         .canSettlePriorDay,
     ).toBe(false);
     expect(
-      resolveRecoveryPresentation(cachedOwnerTrue, "cashier1", "CASHIER").canSettlePriorDay,
+      resolveRecoveryPresentation(cachedOwnerTrue, "cashier1", "EMPLOYEE").canSettlePriorDay,
     ).toBe(false);
 
     const cachedCashierFalse = makePendingRecord({
@@ -969,7 +969,7 @@ describe("account-scoped unpaid cart and workstation recovery storage", () => {
       resolveRecoveryPresentation(merchPending, "owner1", "OWNER", "2026-11-10").canSettlePriorDay,
     ).toBe(true);
     expect(
-      resolveRecoveryPresentation(merchPending, "cashier1", "CASHIER", "2026-11-10").canSettlePriorDay,
+      resolveRecoveryPresentation(merchPending, "cashier1", "EMPLOYEE", "2026-11-10").canSettlePriorDay,
     ).toBe(false);
   });
 
@@ -1086,7 +1086,7 @@ describe("account-scoped unpaid cart and workstation recovery storage", () => {
       resolveRecoveryPresentation(pkgPending, "owner1", "OWNER", "2026-11-10").canSettlePriorDay,
     ).toBe(true);
     expect(
-      resolveRecoveryPresentation(pkgPending, "cashier1", "CASHIER", "2026-11-10").canSettlePriorDay,
+      resolveRecoveryPresentation(pkgPending, "cashier1", "EMPLOYEE", "2026-11-10").canSettlePriorDay,
     ).toBe(false);
 
     // Mixed customer-owned refill + merchandise is now settleable by Owner (DEC-095)
@@ -1141,7 +1141,7 @@ describe("account-scoped unpaid cart and workstation recovery storage", () => {
       resolveRecoveryPresentation(mixedPending, "owner1", "OWNER", "2026-11-10").canSettlePriorDay,
     ).toBe(true);
     expect(
-      resolveRecoveryPresentation(mixedPending, "cashier1", "CASHIER", "2026-11-10").canSettlePriorDay,
+      resolveRecoveryPresentation(mixedPending, "cashier1", "EMPLOYEE", "2026-11-10").canSettlePriorDay,
     ).toBe(false);
   });
 
@@ -1189,7 +1189,7 @@ describe("account-scoped unpaid cart and workstation recovery storage", () => {
     const cashierPresentation = resolveRecoveryPresentation(
       refillAcrossMidnight,
       "cashier1",
-      "CASHIER",
+      "EMPLOYEE",
       "2026-11-24",
     );
     expect(cashierPresentation.canSettlePriorDay).toBe(false);
@@ -1348,7 +1348,7 @@ describe("account-scoped unpaid cart and workstation recovery storage", () => {
       "Status confirmed (10:05:12 AM) — checkout was cancelled with no payment recorded.",
     );
 
-    const cashierCancelled = resolveRecoveryPresentation(record, "cashier2", "CASHIER", "2026-11-25");
+    const cashierCancelled = resolveRecoveryPresentation(record, "cashier2", "EMPLOYEE", "2026-11-25");
     expect(cashierCancelled.screen).toBe("CANCELLED");
     expect(cashierCancelled.canDismissCancelled).toBe(true);
 
@@ -1430,7 +1430,7 @@ describe("account-scoped unpaid cart and workstation recovery storage", () => {
       };
       const serverRecord = createServerRecoveryRecord(checkout);
 
-      const beforeLookup = resolveRecoveryPresentation(serverRecord, "cashier1", "CASHIER");
+      const beforeLookup = resolveRecoveryPresentation(serverRecord, "cashier1", "EMPLOYEE");
       expect(beforeLookup.screen).toBe("UNKNOWN");
       expect(beforeLookup.canCheckStatus).toBe(true);
       expect(beforeLookup.canRetry).toBe(false);
@@ -1450,7 +1450,7 @@ describe("account-scoped unpaid cart and workstation recovery storage", () => {
       const safeOnNewDevice = resolveRecoveryPresentation(
         mergeRecoveryLookup(serverRecord, safeLookup),
         "cashier1",
-        "CASHIER",
+        "EMPLOYEE",
       );
       expect(safeOnNewDevice).toMatchObject({
         screen: "SAFE_TO_RETRY",
@@ -1470,7 +1470,7 @@ describe("account-scoped unpaid cart and workstation recovery storage", () => {
       const disallowedFlag = resolveRecoveryPresentation(
         mergeRecoveryLookup(serverRecord, { ...safeLookup, canCancelUnpaid: false }),
         "cashier1",
-        "CASHIER",
+        "EMPLOYEE",
       );
       expect(disallowedFlag.canCancelUnpaid).toBe(false);
 
@@ -1480,7 +1480,7 @@ describe("account-scoped unpaid cart and workstation recovery storage", () => {
           checkout: { ...checkout, cashReceivedCentavos: 50000, paymentRecordedAt: "2026-11-09T10:42:00+08:00" },
         }),
         "cashier1",
-        "CASHIER",
+        "EMPLOYEE",
       );
       expect(withRecordedCash.canCancelUnpaid).toBe(false);
     });
@@ -1502,7 +1502,7 @@ describe("account-scoped unpaid cart and workstation recovery storage", () => {
         sale: savedSale,
       });
       const savedRecord = createServerRecoveryRecord(checkout, savedLookup);
-      const savedPresentation = resolveRecoveryPresentation(savedRecord, "cashier1", "CASHIER");
+      const savedPresentation = resolveRecoveryPresentation(savedRecord, "cashier1", "EMPLOYEE");
       expect(savedPresentation).toMatchObject({
         screen: "SAVED",
         canContinueSaved: true,
@@ -1534,7 +1534,7 @@ describe("account-scoped unpaid cart and workstation recovery storage", () => {
         resolveRecoveryPresentation(priorRecord, "owner1", "OWNER", "2026-11-09").canSettlePriorDay,
       ).toBe(true);
       expect(
-        resolveRecoveryPresentation(priorRecord, "cashier1", "CASHIER", "2026-11-09").canSettlePriorDay,
+        resolveRecoveryPresentation(priorRecord, "cashier1", "EMPLOYEE", "2026-11-09").canSettlePriorDay,
       ).toBe(false);
     });
 
@@ -1748,7 +1748,7 @@ describe("account-scoped unpaid cart and workstation recovery storage", () => {
         canResolveFullRefund: true,
       });
       expect(
-        resolveRecoveryPresentation(pendingPrior, "cashier1", "CASHIER", "2026-11-10"),
+        resolveRecoveryPresentation(pendingPrior, "cashier1", "EMPLOYEE", "2026-11-10"),
       ).toMatchObject({
         canResolveNoCashPriorDay: false,
         canResolveFullRefund: false,
@@ -1780,7 +1780,7 @@ describe("account-scoped unpaid cart and workstation recovery storage", () => {
         }),
       );
       expect(
-        resolveRecoveryPresentation(sameDayDraft, "cashier1", "CASHIER", "2026-11-10"),
+        resolveRecoveryPresentation(sameDayDraft, "cashier1", "EMPLOYEE", "2026-11-10"),
       ).toMatchObject({
         screen: "SAFE_TO_RETRY",
         needsOriginalBrowserForRetry: true,
@@ -1813,7 +1813,7 @@ describe("account-scoped unpaid cart and workstation recovery storage", () => {
         }),
       );
       expect(
-        resolveRecoveryPresentation(midnightDraft, "cashier1", "CASHIER", "2026-11-10"),
+        resolveRecoveryPresentation(midnightDraft, "cashier1", "EMPLOYEE", "2026-11-10"),
       ).toMatchObject({
         screen: "REVIEW_REQUIRED",
         canCancelUnpaid: true,
@@ -1830,7 +1830,7 @@ describe("account-scoped unpaid cart and workstation recovery storage", () => {
         }),
       );
       expect(
-        resolveRecoveryPresentation(midnightPending, "cashier1", "CASHIER", "2026-11-10"),
+        resolveRecoveryPresentation(midnightPending, "cashier1", "EMPLOYEE", "2026-11-10"),
       ).toMatchObject({
         screen: "REVIEW_REQUIRED",
         canCancelUnpaid: false,
