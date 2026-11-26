@@ -1098,6 +1098,17 @@ export function InventoryPage() {
         </TemporaryNotice>
       )}
 
+      {items.some((item) => (item.pendingStockReviews?.length ?? 0) > 0) && (
+        <div className="callout callout--warning" role="status">
+          <p className="callout__title">Sale-return stock reviews awaiting physical count</p>
+          <p className="callout__body">
+            One or more voided or corrected sales had unclear physical-count coverage. Reconcile
+            the flagged product below with a physical count (INV-009) to confirm actual on-hand
+            stock.
+          </p>
+        </div>
+      )}
+
       {loadError && (
         <div className="alert alert--error inventory-load-alert" role="alert">
           <div className="inventory-load-alert__copy">
@@ -1383,6 +1394,23 @@ export function InventoryPage() {
                                   <dt>Recorded at</dt>
                                   <dd>{formatRecordedAtManila(item.openingStock.recordedAt)}</dd>
                                 </div>
+                                {item.availableQuantity !== undefined &&
+                                  item.availableQuantity !== null &&
+                                  (item.activeHolds ?? []).some((h) => h.reducesAvailability) && (
+                                    <div className="detail-list__row">
+                                      <dt>Available to sell</dt>
+                                      <dd>
+                                        {formatQuantityLabel(item.availableQuantity, item.unit)} (
+                                        {formatQuantityLabel(
+                                          (item.activeHolds ?? [])
+                                            .filter((h) => h.reducesAvailability)
+                                            .reduce((sum, h) => sum + h.quantity, 0),
+                                          item.unit,
+                                        )}{" "}
+                                        held pre-sale)
+                                      </dd>
+                                    </div>
+                                  )}
                                 {item.latestReconciliation && (
                                   <div className="detail-list__row">
                                     <dt>Last physical count</dt>
@@ -1400,6 +1428,54 @@ export function InventoryPage() {
                                   </div>
                                 )}
                               </dl>
+                              {item.activeHolds && item.activeHolds.length > 0 && (
+                                <div className="callout callout--warning" role="status">
+                                  <p className="callout__title">Held / unavailable units</p>
+                                  <ul className="conflict-list">
+                                    {item.activeHolds.map((hold) => (
+                                      <li key={hold.id}>
+                                        <strong>
+                                          {formatQuantityLabel(hold.quantity, hold.unit)}
+                                        </strong>{" "}
+                                        · <span className="mono-ref">{hold.posReference}</span> —{" "}
+                                        {hold.reason}{" "}
+                                        <span className="muted-sm">
+                                          (
+                                          {hold.reducesAvailability
+                                            ? "held from available stock"
+                                            : "post-sale damaged/held exclusion — already outside sellable stock"}
+                                          )
+                                        </span>
+                                      </li>
+                                    ))}
+                                  </ul>
+                                </div>
+                              )}
+                              {item.pendingStockReviews && item.pendingStockReviews.length > 0 && (
+                                <div className="callout callout--warning" role="status">
+                                  <p className="callout__title">
+                                    Physical count reconciliation needed (INV-009)
+                                  </p>
+                                  <ul className="conflict-list">
+                                    {item.pendingStockReviews.map((review) => (
+                                      <li key={review.saleActionReference}>
+                                        <span className="mono-ref">
+                                          {review.saleActionReference}
+                                        </span>{" "}
+                                        ({review.actionType} {review.originalSaleReference}):{" "}
+                                        <strong>
+                                          {formatQuantityLabel(
+                                            review.unclearQuantity,
+                                            review.unit,
+                                          )}
+                                        </strong>{" "}
+                                        not automatically restored due to unclear count coverage. Run
+                                        Correct / count stock to reconcile.
+                                      </li>
+                                    ))}
+                                  </ul>
+                                </div>
+                              )}
                               {item.latestReconciliation && (
                                 <p className="inventory-card-footnote">
                                   Last count reason: {item.latestReconciliation.reason} (

@@ -2715,7 +2715,7 @@ describe("POS station day and refill sales", () => {
       expect(closedPrep.status).toBe(409);
       expect(closedPrep.body.error.code).toBe("DAY_ALREADY_CLOSED");
 
-      // Next business day: mixed refill + merchandise checkout crossing midnight remains pending (DEC-075 covers merchandise-only only).
+      // Next business day: mixed refill + merchandise checkout crossing midnight can be settled once both confirmations are provided (DEC-095).
       ctx.clock.advance(24 * 60 * 60_000);
       owner = await reauth(ctx, "owner1", owner);
       cashier = await reauth(ctx, "cashier1", cashier);
@@ -2746,15 +2746,28 @@ describe("POS station day and refill sales", () => {
         .set("Cookie", owner.cookie);
       expect(priorLookup.status).toBe(200);
       expect(priorLookup.body.recoveryState).toBe("REVIEW_REQUIRED");
-      expect(priorLookup.body.canSettlePriorDay).toBe(false);
+      expect(priorLookup.body.canSettlePriorDay).toBe(true);
+
+      const missingRefillConfirm = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(priorRef)}/settle`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ paymentKeptConfirmed: true, itemsHandedOverConfirmed: true });
+      expect(missingRefillConfirm.status).toBe(400);
+      expect(missingRefillConfirm.body.error.code).toBe("VALIDATION_FAILED");
 
       const settleMixed = await request(ctx.app)
         .post(`/api/pos/checkouts/${encodeURIComponent(priorRef)}/settle`)
         .set("Cookie", owner.cookie)
         .set("X-CSRF-Token", owner.csrfToken)
-        .send({ paymentKeptConfirmed: true, itemsHandedOverConfirmed: true });
-      expect(settleMixed.status).toBe(409);
-      expect(settleMixed.body.error.code).toBe("CHECKOUT_NOT_SETTLABLE");
+        .send({
+          paymentKeptConfirmed: true,
+          refillDeliveredConfirmed: true,
+          itemsHandedOverConfirmed: true,
+        });
+      expect(settleMixed.status).toBe(201);
+      expect(settleMixed.body.outcome).toBe("SETTLED");
+      expect(settleMixed.body.settlement.itemsHandedOverConfirmed).toBe(true);
     });
 
     it("publishes Round/Slim container packages sharing one shape balance, enforces shared stock gates, exposes custom sections, and keeps started checkout recovery safe after archive (DEC-073, DEC-074)", async () => {
@@ -3411,6 +3424,9 @@ describe("POS station day and refill sales", () => {
           "0011_pos_legacy_pending_container_gripo.sql",
           "0012_pos_prior_day_merchandise_settlement.sql",
           "0013_dashboard_final_settings.sql",
+          "0014_pos_checkout_resolutions_and_holds.sql",
+          "0015_pos_sale_actions.sql",
+          "0016_pos_sale_action_stock_effects.sql",
         ]);
 
         const cashierAfter = await signIn(upgradeApp, "upcashier", upCashier.password);
@@ -3517,6 +3533,9 @@ describe("POS station day and refill sales", () => {
           "0011_pos_legacy_pending_container_gripo.sql",
           "0012_pos_prior_day_merchandise_settlement.sql",
           "0013_dashboard_final_settings.sql",
+          "0014_pos_checkout_resolutions_and_holds.sql",
+          "0015_pos_sale_actions.sql",
+          "0016_pos_sale_action_stock_effects.sql",
         ]);
       } finally {
         await revisedDb.close();
@@ -3643,6 +3662,9 @@ describe("POS station day and refill sales", () => {
           "0011_pos_legacy_pending_container_gripo.sql",
           "0012_pos_prior_day_merchandise_settlement.sql",
           "0013_dashboard_final_settings.sql",
+          "0014_pos_checkout_resolutions_and_holds.sql",
+          "0015_pos_sale_actions.sql",
+          "0016_pos_sale_action_stock_effects.sql",
         ]);
 
         const cashier = await signIn(upgradeApp, "f6cashier", upCashier.password);
@@ -3884,6 +3906,9 @@ describe("POS station day and refill sales", () => {
           "0011_pos_legacy_pending_container_gripo.sql",
           "0012_pos_prior_day_merchandise_settlement.sql",
           "0013_dashboard_final_settings.sql",
+          "0014_pos_checkout_resolutions_and_holds.sql",
+          "0015_pos_sale_actions.sql",
+          "0016_pos_sale_action_stock_effects.sql",
         ]);
 
         const cashier = await signIn(upgradeApp, "f7cashier", upCashier.password);
@@ -4119,6 +4144,9 @@ describe("POS station day and refill sales", () => {
           "0011_pos_legacy_pending_container_gripo.sql",
           "0012_pos_prior_day_merchandise_settlement.sql",
           "0013_dashboard_final_settings.sql",
+          "0014_pos_checkout_resolutions_and_holds.sql",
+          "0015_pos_sale_actions.sql",
+          "0016_pos_sale_action_stock_effects.sql",
         ]);
 
         // Cross Asia/Manila midnight with cash collection never started on draftRef
@@ -5099,6 +5127,3711 @@ describe("POS station day and refill sales", () => {
       });
       expect(legacyRetry.status).toBe(200);
       expect(legacyRetry.body.replayed).toBe(true);
+    });
+  });
+
+  describe("Final POS Task 1 — verified checkout outcomes and pre-sale holds (DEC-095–098, DEC-103)", () => {
+    async function setupRoundContainers(stockQuantity: number) {
+      expect(
+        (
+          await request(ctx.app)
+            .patch("/api/inventory/containers/ROUND")
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({ showInPos: true })
+        ).status,
+      ).toBe(200);
+      const opening = await request(ctx.app)
+        .post("/api/inventory/items/ROUND/opening-stock")
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ quantity: stockQuantity });
+      expect(opening.status).toBe(201);
+      return opening.body.item.id as string;
+    }
+
+    it("settles prior-day mixed refill + container package once with both delivery confirmations and leaves closed reports unchanged (DEC-095)", async () => {
+      const roundId = await setupRoundContainers(4);
+      expect((await startDay(ctx, owner, { requestKey: "t1-mixed-day1" })).status).toBe(201);
+
+      const savedDay1 = await prepareCheckout(ctx, cashier, {
+        prepareKey: "t1-mixed-day1-sale",
+        items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 1 }],
+      });
+      expect(savedDay1.status).toBe(201);
+      expect(
+        (
+          await confirmCheckout(ctx.app, cashier, savedDay1.body.checkout.reference as string, {
+            cashReceivedCentavos: 2500,
+          })
+        ).status,
+      ).toBe(201);
+
+      // Mixed checkout: 1 customer-owned Purified refill (₱25) + 1 Empty Round package (₱175) = ₱200
+      const mixedPrep = await prepareCheckout(ctx, cashier, {
+        prepareKey: "t1-mixed-prior",
+        items: [
+          { kind: "STANDARD", waterType: "PURIFIED", quantity: 1 },
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_EMPTY",
+            includedGripo: "PUSH_TYPE",
+            quantity: 1,
+          },
+        ],
+      });
+      expect(mixedPrep.status).toBe(201);
+      const mixedRef = mixedPrep.body.checkout.reference as string;
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/checkouts/${encodeURIComponent(mixedRef)}/begin-payment`)
+            .set("Cookie", cashier.cookie)
+            .set("X-CSRF-Token", cashier.csrfToken)
+            .send({})
+        ).status,
+      ).toBe(200);
+
+      // Day crosses midnight while payment is pending
+      ctx.clock.advance(24 * 60 * 60_000);
+      owner = await reauth(ctx, "owner1", owner);
+      cashier = await reauth(ctx, "cashier1", cashier);
+
+      const lookupBefore = await request(ctx.app)
+        .get(`/api/pos/checkouts/${encodeURIComponent(mixedRef)}`)
+        .set("Cookie", owner.cookie);
+      expect(lookupBefore.status).toBe(200);
+      expect(lookupBefore.body).toMatchObject({
+        recoveryState: "REVIEW_REQUIRED",
+        canSettlePriorDay: true,
+        canResolveNoCashPriorDay: true,
+        canResolveFullRefund: true,
+      });
+
+      // Missing either delivery confirmation keeps it pending (DEC-098)
+      const missingItems = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(mixedRef)}/settle`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ paymentKeptConfirmed: true, refillDeliveredConfirmed: true });
+      expect(missingItems.status).toBe(400);
+
+      const missingRefill = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(mixedRef)}/settle`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ paymentKeptConfirmed: true, itemsHandedOverConfirmed: true });
+      expect(missingRefill.status).toBe(400);
+
+      // Cashier is rejected
+      const cashierAttempt = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(mixedRef)}/settle`)
+        .set("Cookie", cashier.cookie)
+        .set("X-CSRF-Token", cashier.csrfToken)
+        .send({
+          paymentKeptConfirmed: true,
+          refillDeliveredConfirmed: true,
+          itemsHandedOverConfirmed: true,
+        });
+      expect(cashierAttempt.status).toBe(403);
+      expect(cashierAttempt.body.error.code).toBe("FORBIDDEN");
+
+      // Owner settles with both confirmations
+      const settled = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(mixedRef)}/settle`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          paymentKeptConfirmed: true,
+          refillDeliveredConfirmed: true,
+          itemsHandedOverConfirmed: true,
+          cashReceivedCentavos: 25000,
+          note: "Verified mixed handover",
+        });
+      expect(settled.status).toBe(201);
+      expect(settled.body.outcome).toBe("SETTLED");
+      expect(settled.body.settlement).toMatchObject({
+        checkoutReference: mixedRef,
+        originalBusinessDate: "2026-11-09",
+        settlementDate: "2026-11-10",
+        netAmountKeptCentavos: 20000,
+        cashReceivedCentavos: 25000,
+        changeCentavos: 5000,
+        refillDeliveredConfirmed: true,
+        itemsHandedOverConfirmed: true,
+      });
+
+      // Round stock deducted once (4 -> 3); customer-owned refill did not deduct another Round
+      const invAfter = await request(ctx.app).get("/api/inventory/items").set("Cookie", owner.cookie);
+      const roundAfter = invAfter.body.items.find((i: any) => i.id === roundId);
+      expect(roundAfter.currentQuantity).toBe(3);
+
+      // Repeat settle replays cleanly without duplicate stock deduction
+      const replaySettle = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(mixedRef)}/settle`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          paymentKeptConfirmed: true,
+          refillDeliveredConfirmed: true,
+          itemsHandedOverConfirmed: true,
+        });
+      expect(replaySettle.status).toBe(200);
+      expect(replaySettle.body.replayed).toBe(true);
+
+      const { rows: movementRows } = await ctx.db.query<{ quantity_delta: number }>(
+        `SELECT quantity_delta FROM inventory_stock_movements WHERE item_id = $1`,
+        [roundId],
+      );
+      expect(movementRows).toHaveLength(1);
+      expect(Number(movementRows[0]!.quantity_delta)).toBe(-1);
+
+      // Previous day can now close and keeps only Day 1's ₱25 sale
+      const closedDay1 = await endDay(ctx, owner, { requestKey: "t1-mixed-close-day1" });
+      expect(closedDay1.status).toBe(200);
+      expect(closedDay1.body.summary).toMatchObject({
+        businessDate: "2026-11-09",
+        totalSalesCentavos: 2500,
+        validTransactionCount: 1,
+      });
+    });
+
+    it("cancels a prior-day payment-pending checkout with no cash, releases reservations, and rejects contradictory resolutions (DEC-096)", async () => {
+      const roundId = await setupRoundContainers(3);
+      expect((await startDay(ctx, owner, { requestKey: "t1-nocash-day1" })).status).toBe(201);
+
+      const prep = await prepareCheckout(ctx, cashier, {
+        prepareKey: "t1-nocash-prep",
+        items: [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_EMPTY",
+            includedGripo: "TWIST_TYPE",
+            quantity: 2,
+          },
+        ],
+      });
+      expect(prep.status).toBe(201);
+      const ref = prep.body.checkout.reference as string;
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/checkouts/${encodeURIComponent(ref)}/begin-payment`)
+            .set("Cookie", cashier.cookie)
+            .set("X-CSRF-Token", cashier.csrfToken)
+            .send({})
+        ).status,
+      ).toBe(200);
+
+      // 2 of 3 Rounds are reserved
+      const catReserved = await request(ctx.app).get("/api/pos/catalog").set("Cookie", cashier.cookie);
+      expect(catReserved.body.containerPackages[0].availableQuantity).toBe(1);
+
+      ctx.clock.advance(24 * 60 * 60_000);
+      owner = await reauth(ctx, "owner1", owner);
+      cashier = await reauth(ctx, "cashier1", cashier);
+
+      // Cashier cannot resolve
+      const cashierForbidden = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(ref)}/resolve`)
+        .set("Cookie", cashier.cookie)
+        .set("X-CSRF-Token", cashier.csrfToken)
+        .send({ outcome: "NO_CASH_CANCELLED", noCashReceivedConfirmed: true });
+      expect(cashierForbidden.status).toBe(403);
+
+      // Missing confirmation keeps checkout pending and End Day blocked
+      const unconfirmed = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(ref)}/resolve`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ outcome: "NO_CASH_CANCELLED", noCashReceivedConfirmed: false });
+      expect(unconfirmed.status).toBe(400);
+
+      const endBlocked = await endDay(ctx, owner, { requestKey: "t1-nocash-end-blocked" });
+      expect(endBlocked.status).toBe(409);
+
+      // Owner resolves NO_CASH_CANCELLED
+      const resolved = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(ref)}/resolve`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          outcome: "NO_CASH_CANCELLED",
+          noCashReceivedConfirmed: true,
+          note: "Customer left without paying",
+        });
+      expect(resolved.status).toBe(201);
+      expect(resolved.body.outcome).toBe("RESOLVED");
+      expect(resolved.body.resolution).toMatchObject({
+        checkoutReference: ref,
+        originalBusinessDate: "2026-11-09",
+        resolutionDate: "2026-11-10",
+        outcome: "NO_CASH_CANCELLED",
+        quoteTotalCentavos: 35000,
+        cashReceivedCentavos: null,
+        refundedAmountCentavos: null,
+        heldItems: [],
+      });
+
+      // Reservation released (all 3 Rounds available again) and End Day succeeds
+      const catReleased = await request(ctx.app).get("/api/pos/catalog").set("Cookie", owner.cookie);
+      expect(catReleased.body.containerPackages.find((p: any) => p.productId === roundId).availableQuantity).toBe(3);
+      expect((await endDay(ctx, owner, { requestKey: "t1-nocash-end-ok" })).status).toBe(200);
+
+      // Lookup returns terminal CANCELLED_NO_CASH with all action flags false
+      const lookupAfter = await request(ctx.app)
+        .get(`/api/pos/checkouts/${encodeURIComponent(ref)}`)
+        .set("Cookie", owner.cookie);
+      expect(lookupAfter.status).toBe(200);
+      expect(lookupAfter.body).toMatchObject({
+        recoveryState: "CANCELLED_NO_CASH",
+        canRetry: false,
+        canCancelUnpaid: false,
+        canSettlePriorDay: false,
+        canResolveNoCashPriorDay: false,
+        canResolveFullRefund: false,
+        sale: null,
+        settlement: null,
+      });
+
+      // Repeat NO_CASH_CANCELLED replays 200; contradictory FULL_REFUND or settle rejected 409
+      const replayNoCash = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(ref)}/resolve`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ outcome: "NO_CASH_CANCELLED", noCashReceivedConfirmed: true });
+      expect(replayNoCash.status).toBe(200);
+      expect(replayNoCash.body.replayed).toBe(true);
+
+      const contradictRefund = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(ref)}/resolve`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          outcome: "FULL_REFUND",
+          undeliveredConfirmed: true,
+          fullRefundConfirmed: true,
+          cashReceivedCentavos: 35000,
+          changeAlreadyGiven: false,
+        });
+      expect(contradictRefund.status).toBe(409);
+      expect(contradictRefund.body.error.code).toBe("CHECKOUT_ALREADY_RESOLVED");
+
+      const contradictSettle = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(ref)}/settle`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ paymentKeptConfirmed: true, itemsHandedOverConfirmed: true });
+      expect(contradictSettle.status).toBe(409);
+      expect(contradictSettle.body.error.code).toBe("CHECKOUT_ALREADY_RESOLVED");
+    });
+
+    it("records exact full refund for ₱175 quote with ₱250 tender (change given vs no change given) without creating a sale (DEC-097)", async () => {
+      await setupRoundContainers(5);
+      expect((await startDay(ctx, owner, { requestKey: "t1-refund-day1" })).status).toBe(201);
+
+      // Checkout A: ₱175 quote, ₱250 tender, ₱75 change already given -> ₱175 refunded
+      const prepA = await prepareCheckout(ctx, cashier, {
+        prepareKey: "t1-refund-a",
+        items: [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_EMPTY",
+            includedGripo: "PUSH_TYPE",
+            quantity: 1,
+          },
+        ],
+      });
+      const refA = prepA.body.checkout.reference as string;
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/checkouts/${encodeURIComponent(refA)}/begin-payment`)
+            .set("Cookie", cashier.cookie)
+            .set("X-CSRF-Token", cashier.csrfToken)
+            .send({})
+        ).status,
+      ).toBe(200);
+
+      // Checkout B: ₱175 quote, ₱250 tender, NO change given -> ₱250 refunded
+      const prepB = await prepareCheckout(ctx, cashier, {
+        prepareKey: "t1-refund-b",
+        items: [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_EMPTY",
+            includedGripo: "TWIST_TYPE",
+            quantity: 1,
+          },
+        ],
+      });
+      const refB = prepB.body.checkout.reference as string;
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/checkouts/${encodeURIComponent(refB)}/begin-payment`)
+            .set("Cookie", cashier.cookie)
+            .set("X-CSRF-Token", cashier.csrfToken)
+            .send({})
+        ).status,
+      ).toBe(200);
+
+      // Missing undelivered/refund confirmation stays pending
+      const partialConfirm = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(refA)}/resolve`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          outcome: "FULL_REFUND",
+          undeliveredConfirmed: true,
+          fullRefundConfirmed: false,
+          cashReceivedCentavos: 25000,
+          changeAlreadyGiven: true,
+        });
+      expect(partialConfirm.status).toBe(400);
+
+      // Resolve A with changeAlreadyGiven: true
+      const resA = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(refA)}/resolve`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          outcome: "FULL_REFUND",
+          undeliveredConfirmed: true,
+          fullRefundConfirmed: true,
+          cashReceivedCentavos: 25000,
+          changeAlreadyGiven: true,
+        });
+      expect(resA.status).toBe(201);
+      expect(resA.body.resolution).toMatchObject({
+        checkoutReference: refA,
+        outcome: "FULL_REFUND",
+        quoteTotalCentavos: 17500,
+        cashReceivedCentavos: 25000,
+        changeAlreadyGiven: true,
+        changeGivenCentavos: 7500,
+        refundedAmountCentavos: 17500,
+      });
+
+      // Resolve B with changeAlreadyGiven: false
+      const resB = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(refB)}/resolve`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          outcome: "FULL_REFUND",
+          undeliveredConfirmed: true,
+          fullRefundConfirmed: true,
+          cashReceivedCentavos: 25000,
+          changeAlreadyGiven: false,
+        });
+      expect(resB.status).toBe(201);
+      expect(resB.body.resolution).toMatchObject({
+        checkoutReference: refB,
+        outcome: "FULL_REFUND",
+        quoteTotalCentavos: 17500,
+        cashReceivedCentavos: 25000,
+        changeAlreadyGiven: false,
+        changeGivenCentavos: 0,
+        refundedAmountCentavos: 25000,
+      });
+
+      const { rows: salesCount } = await ctx.db.query<{ count: string }>(
+        `SELECT COUNT(*)::text AS count FROM pos_sales`,
+      );
+      expect(salesCount[0]!.count).toBe("0");
+
+      const lookupA = await request(ctx.app)
+        .get(`/api/pos/checkouts/${encodeURIComponent(refA)}`)
+        .set("Cookie", owner.cookie);
+      expect(lookupA.status).toBe(200);
+      expect(lookupA.body).toMatchObject({
+        recoveryState: "REFUNDED_UNSAVED",
+        canRetry: false,
+        canResolveFullRefund: false,
+        sale: null,
+      });
+    });
+
+    it("holds a cancelled filled container once across retry, exposes it in POS and Inventory, and blocks competing checkouts (DEC-103, INV-015)", async () => {
+      const roundId = await setupRoundContainers(3);
+      expect((await startDay(ctx, owner, { requestKey: "t1-hold-day1" })).status).toBe(201);
+
+      const prep = await prepareCheckout(ctx, cashier, {
+        prepareKey: "t1-hold-filled",
+        items: [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_PURIFIED",
+            includedGripo: "PUSH_TYPE",
+            quantity: 1,
+          },
+        ],
+      });
+      expect(prep.status).toBe(201);
+      const ref = prep.body.checkout.reference as string;
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/checkouts/${encodeURIComponent(ref)}/begin-payment`)
+            .set("Cookie", cashier.cookie)
+            .set("X-CSRF-Token", cashier.csrfToken)
+            .send({})
+        ).status,
+      ).toBe(200);
+
+      // Resolve with 1 held unit
+      const holdReason = "Cancelled filled Round order held pending health guidance";
+      const resHold = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(ref)}/resolve`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          outcome: "FULL_REFUND",
+          undeliveredConfirmed: true,
+          fullRefundConfirmed: true,
+          cashReceivedCentavos: 20000,
+          changeAlreadyGiven: false,
+          heldItems: [{ productId: roundId, quantity: 1, reason: holdReason }],
+        });
+      expect(resHold.status).toBe(201);
+      expect(resHold.body.resolution.heldItems).toHaveLength(1);
+      expect(resHold.body.resolution.heldItems[0]).toMatchObject({
+        itemId: roundId,
+        quantity: 1,
+        reason: holdReason,
+        posReference: ref,
+      });
+
+      // Retry replays 200 without creating a second hold
+      const retryHold = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(ref)}/resolve`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          outcome: "FULL_REFUND",
+          undeliveredConfirmed: true,
+          fullRefundConfirmed: true,
+          cashReceivedCentavos: 20000,
+          changeAlreadyGiven: false,
+          heldItems: [{ productId: roundId, quantity: 1, reason: holdReason }],
+        });
+      expect(retryHold.status).toBe(200);
+      expect(retryHold.body.replayed).toBe(true);
+
+      const { rows: holdRows } = await ctx.db.query<{ quantity: number }>(
+        `SELECT quantity FROM inventory_stock_holds WHERE item_id = $1 AND status = 'ACTIVE'`,
+        [roundId],
+      );
+      expect(holdRows).toHaveLength(1);
+      expect(Number(holdRows[0]!.quantity)).toBe(1);
+
+      // POS catalog shows 2 available (3 physical - 1 held) and Inventory shows heldQuantity 1
+      const posCat = await request(ctx.app).get("/api/pos/catalog").set("Cookie", cashier.cookie);
+      expect(posCat.body.containerPackages.find((p: any) => p.productId === roundId).availableQuantity).toBe(2);
+
+      const invItems = await request(ctx.app).get("/api/inventory/items").set("Cookie", cashier.cookie);
+      const roundInv = invItems.body.items.find((i: any) => i.id === roundId);
+      expect(roundInv).toMatchObject({
+        currentQuantity: 3,
+        heldQuantity: 1,
+        availableQuantity: 2,
+      });
+      expect(roundInv.activeHolds).toHaveLength(1);
+      expect(roundInv.activeHolds[0]).toMatchObject({
+        quantity: 1,
+        reason: holdReason,
+        posReference: ref,
+      });
+
+      // Competing checkout trying to buy 3 Rounds is blocked; buying 2 Rounds succeeds
+      const competingOver = await prepareCheckout(ctx, cashier, {
+        prepareKey: "t1-hold-compete-over",
+        items: [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_EMPTY",
+            includedGripo: "PUSH_TYPE",
+            quantity: 3,
+          },
+        ],
+      });
+      expect(competingOver.status).toBe(409);
+      expect(competingOver.body.error.code).toBe("INSUFFICIENT_STOCK");
+
+      const competingOk = await prepareCheckout(ctx, cashier, {
+        prepareKey: "t1-hold-compete-ok",
+        items: [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_EMPTY",
+            includedGripo: "PUSH_TYPE",
+            quantity: 2,
+          },
+        ],
+      });
+      expect(competingOk.status).toBe(201);
+
+      // Same-account takeover + refresh lookup returns committed REFUNDED_UNSAVED with all action flags false
+      const ownerDeviceB = await signIn(ctx.app, "owner1", owner.password);
+      const takeoverLookup = await request(ctx.app)
+        .get(`/api/pos/checkouts/${encodeURIComponent(ref)}`)
+        .set("Cookie", ownerDeviceB.cookie);
+      expect(takeoverLookup.status).toBe(200);
+      expect(takeoverLookup.body).toMatchObject({
+        recoveryState: "REFUNDED_UNSAVED",
+        canRetry: false,
+        canCancelUnpaid: false,
+        canSettlePriorDay: false,
+        canResolveNoCashPriorDay: false,
+        canResolveFullRefund: false,
+      });
+      expect(takeoverLookup.body.resolution.heldItems).toHaveLength(1);
+    });
+
+    it("rejects resolve while confirm is in flight and returns committed sale after a lost confirm response", async () => {
+      const enteredTx = deferred<void>();
+      const releaseTx = deferred<void>();
+      let pauseNextTx = false;
+
+      const wrappedDb: Database = {
+        query: (sql, params) => ctx.db.query(sql, params),
+        exec: (sql) => ctx.db.exec(sql),
+        close: () => ctx.db.close(),
+        async transaction<T>(fn: (tx: Queryable) => Promise<T>): Promise<T> {
+          if (pauseNextTx) {
+            pauseNextTx = false;
+            enteredTx.resolve();
+            await releaseTx.promise;
+          }
+          return ctx.db.transaction(fn);
+        },
+      };
+      const pausedApp = createApp({ db: wrappedDb, clock: ctx.clock, secureCookies: false });
+
+      expect((await startDay(ctx, owner, { requestKey: "t1-overlap-day" })).status).toBe(201);
+      const prep = await prepareCheckout(ctx, cashier, {
+        prepareKey: "t1-overlap-prep",
+        items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 2 }],
+      });
+      const ref = prep.body.checkout.reference as string;
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/checkouts/${encodeURIComponent(ref)}/begin-payment`)
+            .set("Cookie", cashier.cookie)
+            .set("X-CSRF-Token", cashier.csrfToken)
+            .send({})
+        ).status,
+      ).toBe(200);
+
+      pauseNextTx = true;
+      const confirmPromise = confirmCheckout(pausedApp, cashier, ref, {
+        cashReceivedCentavos: 10000,
+      });
+      await enteredTx.promise;
+
+      // While confirm is in flight, resolve is rejected
+      const resolveDuringInflight = await request(pausedApp)
+        .post(`/api/pos/checkouts/${encodeURIComponent(ref)}/resolve`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          outcome: "FULL_REFUND",
+          undeliveredConfirmed: true,
+          fullRefundConfirmed: true,
+          cashReceivedCentavos: 10000,
+          changeAlreadyGiven: true,
+        });
+      expect(resolveDuringInflight.status).toBe(409);
+      expect(resolveDuringInflight.body.error.code).toBe("CHECKOUT_NOT_RESOLVABLE");
+
+      // Confirm finishes (lost response scenario); subsequent resolve returns CHECKOUT_ALREADY_SAVED + sale
+      releaseTx.resolve();
+      const confirmed = await confirmPromise;
+      expect(confirmed.status).toBe(201);
+
+      const resolveAfterSave = await request(pausedApp)
+        .post(`/api/pos/checkouts/${encodeURIComponent(ref)}/resolve`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          outcome: "FULL_REFUND",
+          undeliveredConfirmed: true,
+          fullRefundConfirmed: true,
+          cashReceivedCentavos: 10000,
+          changeAlreadyGiven: true,
+        });
+      expect(resolveAfterSave.status).toBe(409);
+      expect(resolveAfterSave.body.error.code).toBe("CHECKOUT_ALREADY_SAVED");
+      expect(resolveAfterSave.body.sale.reference).toBe(ref);
+
+      // Conversely, resolving an eligible checkout blocks subsequent confirm
+      const prep2 = await prepareCheckout(ctx, cashier, {
+        prepareKey: "t1-overlap-prep2",
+        items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 1 }],
+      });
+      const ref2 = prep2.body.checkout.reference as string;
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/checkouts/${encodeURIComponent(ref2)}/begin-payment`)
+            .set("Cookie", cashier.cookie)
+            .set("X-CSRF-Token", cashier.csrfToken)
+            .send({})
+        ).status,
+      ).toBe(200);
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/checkouts/${encodeURIComponent(ref2)}/resolve`)
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({
+              outcome: "FULL_REFUND",
+              undeliveredConfirmed: true,
+              fullRefundConfirmed: true,
+              cashReceivedCentavos: 5000,
+              changeAlreadyGiven: false,
+            })
+        ).status,
+      ).toBe(201);
+
+      const confirmAfterResolve = await confirmCheckout(ctx.app, cashier, ref2, {
+        cashReceivedCentavos: 5000,
+      });
+      expect(confirmAfterResolve.status).toBe(409);
+      expect(confirmAfterResolve.body.error.code).toBe("CHECKOUT_ALREADY_RESOLVED");
+    });
+
+    it("requires filled disposition on prior-day NO_CASH_CANCELLED, holds filled goods once across replay, blocks competing checkouts, and supports never-filled confirmation (Finding 1)", async () => {
+      const roundId = await setupRoundContainers(3);
+      expect((await startDay(ctx, owner, { requestKey: "t1-f1-nocash-day1" })).status).toBe(201);
+
+      const prepHold = await prepareCheckout(ctx, cashier, {
+        prepareKey: "t1-f1-nocash-filled-1",
+        items: [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_PURIFIED",
+            includedGripo: "PUSH_TYPE",
+            quantity: 1,
+          },
+        ],
+      });
+      expect(prepHold.status).toBe(201);
+      const refHold = prepHold.body.checkout.reference as string;
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/checkouts/${encodeURIComponent(refHold)}/begin-payment`)
+            .set("Cookie", cashier.cookie)
+            .set("X-CSRF-Token", cashier.csrfToken)
+            .send({})
+        ).status,
+      ).toBe(200);
+
+      const prepNeverFilled = await prepareCheckout(ctx, cashier, {
+        prepareKey: "t1-f1-nocash-filled-2",
+        items: [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_ALKALINE",
+            includedGripo: "TWIST_TYPE",
+            quantity: 1,
+          },
+        ],
+      });
+      expect(prepNeverFilled.status).toBe(201);
+      const refNeverFilled = prepNeverFilled.body.checkout.reference as string;
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/checkouts/${encodeURIComponent(refNeverFilled)}/begin-payment`)
+            .set("Cookie", cashier.cookie)
+            .set("X-CSRF-Token", cashier.csrfToken)
+            .send({})
+        ).status,
+      ).toBe(200);
+
+      ctx.clock.advance(24 * 60 * 60_000);
+      owner = await reauth(ctx, "owner1", owner);
+      cashier = await reauth(ctx, "cashier1", cashier);
+
+      // Missing disposition on filled NO_CASH_CANCELLED is rejected
+      const missingDisp = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(refHold)}/resolve`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ outcome: "NO_CASH_CANCELLED", noCashReceivedConfirmed: true });
+      expect(missingDisp.status).toBe(400);
+
+      // Hold the 1 filled Round unit with NO_CASH_CANCELLED
+      const reason = "Customer left unpaid after 1 Round was filled";
+      const resolvedHold = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(refHold)}/resolve`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          outcome: "NO_CASH_CANCELLED",
+          noCashReceivedConfirmed: true,
+          heldItems: [{ productId: roundId, quantity: 1, reason }],
+        });
+      expect(resolvedHold.status).toBe(201);
+      expect(resolvedHold.body.resolution.heldItems).toHaveLength(1);
+      expect(resolvedHold.body.resolution.heldItems[0]).toMatchObject({
+        itemId: roundId,
+        quantity: 1,
+        reason,
+        posReference: refHold,
+      });
+
+      // Exact repeat replays 200 without duplicating hold; contradictory replay returns 409
+      const replaySame = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(refHold)}/resolve`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          outcome: "NO_CASH_CANCELLED",
+          noCashReceivedConfirmed: true,
+          heldItems: [{ productId: roundId, quantity: 1, reason }],
+        });
+      expect(replaySame.status).toBe(200);
+      expect(replaySame.body.replayed).toBe(true);
+
+      const replayContradict = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(refHold)}/resolve`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          outcome: "NO_CASH_CANCELLED",
+          noCashReceivedConfirmed: true,
+          noFilledUnitsHeldConfirmed: true,
+        });
+      expect(replayContradict.status).toBe(409);
+      expect(replayContradict.body.error.code).toBe("CHECKOUT_ALREADY_RESOLVED");
+
+      // Second filled order explicitly confirmed as never actually filled creates no hold
+      const resolvedNeverFilled = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(refNeverFilled)}/resolve`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          outcome: "NO_CASH_CANCELLED",
+          noCashReceivedConfirmed: true,
+          noFilledUnitsHeldConfirmed: true,
+        });
+      expect(resolvedNeverFilled.status).toBe(201);
+      expect(resolvedNeverFilled.body.resolution.heldItems).toEqual([]);
+
+      expect((await endDay(ctx, owner, { requestKey: "t1-f1-nocash-end1" })).status).toBe(200);
+      expect((await startDay(ctx, owner, { requestKey: "t1-f1-nocash-day2" })).status).toBe(201);
+
+      // Only 2 Rounds are available (3 physical - 1 CHECKOUT_CANCEL hold)
+      const invAfter = await request(ctx.app).get("/api/inventory/items").set("Cookie", owner.cookie);
+      const invAfterRound = invAfter.body.items.find((i: any) => i.id === roundId);
+      expect(invAfterRound).toMatchObject({
+        currentQuantity: 3,
+        heldQuantity: 1,
+        availableQuantity: 2,
+      });
+      expect(invAfterRound.activeHolds[0]).toMatchObject({
+        sourceKind: "CHECKOUT_CANCEL",
+        quantity: 1,
+        posReference: refHold,
+      });
+
+      const compete3 = await prepareCheckout(ctx, cashier, {
+        prepareKey: "t1-f1-nocash-compete3",
+        items: [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_EMPTY",
+            includedGripo: "PUSH_TYPE",
+            quantity: 3,
+          },
+        ],
+      });
+      expect(compete3.status).toBe(409);
+      expect(compete3.body.error.code).toBe("INSUFFICIENT_STOCK");
+
+      const compete2 = await prepareCheckout(ctx, cashier, {
+        prepareKey: "t1-f1-nocash-compete2",
+        items: [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_EMPTY",
+            includedGripo: "PUSH_TYPE",
+            quantity: 2,
+          },
+        ],
+      });
+      expect(compete2.status).toBe(201);
+    });
+
+    it("requires filled disposition on ordinary POST /cancel, preserves role/payment guards, holds filled goods once across replay, and blocks competing checkouts (Finding 1)", async () => {
+      const roundId = await setupRoundContainers(3);
+      expect((await startDay(ctx, owner, { requestKey: "t1-f1-cancel-day1" })).status).toBe(201);
+
+      // Cashier prepares and enters PAYMENT_PENDING for 1 filled Round
+      const prepPay = await prepareCheckout(ctx, cashier, {
+        prepareKey: "t1-f1-cancel-pay",
+        items: [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_PURIFIED",
+            includedGripo: "PUSH_TYPE",
+            quantity: 1,
+          },
+        ],
+      });
+      expect(prepPay.status).toBe(201);
+      const refPay = prepPay.body.checkout.reference as string;
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/checkouts/${encodeURIComponent(refPay)}/begin-payment`)
+            .set("Cookie", cashier.cookie)
+            .set("X-CSRF-Token", cashier.csrfToken)
+            .send({})
+        ).status,
+      ).toBe(200);
+
+      // Missing no-cash confirmation is still rejected
+      const noCashMissing = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(refPay)}/cancel`)
+        .set("Cookie", cashier.cookie)
+        .set("X-CSRF-Token", cashier.csrfToken)
+        .send({ noFilledUnitsHeldConfirmed: true });
+      expect(noCashMissing.status).toBe(409);
+      expect(noCashMissing.body.error.code).toBe("CHECKOUT_NOT_CANCELLABLE");
+
+      // Missing filled disposition on filled PAYMENT_PENDING cancel is rejected
+      const dispMissing = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(refPay)}/cancel`)
+        .set("Cookie", cashier.cookie)
+        .set("X-CSRF-Token", cashier.csrfToken)
+        .send({ confirmNoCashTaken: true, reason: "Customer left" });
+      expect(dispMissing.status).toBe(400);
+
+      // Cancelling PAYMENT_PENDING with heldItems succeeds and records CHECKOUT_CANCEL hold
+      const holdReason = "Cancelled unpaid filled Round at counter";
+      const cancelHold = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(refPay)}/cancel`)
+        .set("Cookie", cashier.cookie)
+        .set("X-CSRF-Token", cashier.csrfToken)
+        .send({
+          confirmNoCashTaken: true,
+          reason: "No cash received",
+          heldItems: [{ productId: roundId, quantity: 1, reason: holdReason }],
+        });
+      expect(cancelHold.status).toBe(200);
+      expect(cancelHold.body.checkout.status).toBe("CANCELLED_DRAFT");
+      expect(cancelHold.body.replayed).toBe(false);
+      expect(cancelHold.body.heldItems).toHaveLength(1);
+      expect(cancelHold.body.heldItems[0]).toMatchObject({
+        itemId: roundId,
+        quantity: 1,
+        reason: holdReason,
+        posReference: refPay,
+      });
+
+      // Exact repeat replays 200 without duplicating hold; contradictory repeat returns 409
+      const cancelReplay = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(refPay)}/cancel`)
+        .set("Cookie", cashier.cookie)
+        .set("X-CSRF-Token", cashier.csrfToken)
+        .send({
+          confirmNoCashTaken: true,
+          reason: "No cash received",
+          heldItems: [{ productId: roundId, quantity: 1, reason: holdReason }],
+        });
+      expect(cancelReplay.status).toBe(200);
+      expect(cancelReplay.body.replayed).toBe(true);
+
+      const cancelContradict = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(refPay)}/cancel`)
+        .set("Cookie", cashier.cookie)
+        .set("X-CSRF-Token", cashier.csrfToken)
+        .send({
+          confirmNoCashTaken: true,
+          reason: "No cash received",
+          noFilledUnitsHeldConfirmed: true,
+        });
+      expect(cancelContradict.status).toBe(409);
+      expect(cancelContradict.body.error.code).toBe("CHECKOUT_NOT_CANCELLABLE");
+
+      const { rows: cancelHoldRows } = await ctx.db.query<{
+        source_kind: string;
+        resolution_id: string | null;
+      }>(
+        `SELECT source_kind, resolution_id FROM inventory_stock_holds WHERE checkout_id = (SELECT id FROM pos_checkouts WHERE reference = $1)`,
+        [refPay],
+      );
+      expect(cancelHoldRows).toHaveLength(1);
+      expect(cancelHoldRows[0]).toMatchObject({
+        source_kind: "CHECKOUT_CANCEL",
+        resolution_id: null,
+      });
+
+      // Competing checkout for 3 Rounds fails; 2 Rounds succeeds
+      const competeOver = await prepareCheckout(ctx, cashier, {
+        prepareKey: "t1-f1-cancel-compete3",
+        items: [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_EMPTY",
+            includedGripo: "PUSH_TYPE",
+            quantity: 3,
+          },
+        ],
+      });
+      expect(competeOver.status).toBe(409);
+      expect(competeOver.body.error.code).toBe("INSUFFICIENT_STOCK");
+
+      // Cancelling a filled DRAFT order with noFilledUnitsHeldConfirmed leaves available stock at 2
+      const prepDraft = await prepareCheckout(ctx, cashier, {
+        prepareKey: "t1-f1-cancel-draft",
+        items: [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_PURIFIED",
+            includedGripo: "TWIST_TYPE",
+            quantity: 1,
+          },
+        ],
+      });
+      expect(prepDraft.status).toBe(201);
+      const refDraft = prepDraft.body.checkout.reference as string;
+      const cancelDraft = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(refDraft)}/cancel`)
+        .set("Cookie", cashier.cookie)
+        .set("X-CSRF-Token", cashier.csrfToken)
+        .send({ reason: "Returned to refill selection", noFilledUnitsHeldConfirmed: true });
+      expect(cancelDraft.status).toBe(200);
+      expect(cancelDraft.body.heldItems).toEqual([]);
+
+      const invItems = await request(ctx.app).get("/api/inventory/items").set("Cookie", cashier.cookie);
+      expect(invItems.body.items.find((i: any) => i.id === roundId)).toMatchObject({
+        currentQuantity: 3,
+        heldQuantity: 1,
+        availableQuantity: 2,
+      });
+    });
+
+    it("enforces filled disposition on FULL_REFUND and holds only the filled unit in a mixed same-shape empty/filled order (Findings 1 & 2)", async () => {
+      const roundId = await setupRoundContainers(4);
+      expect((await startDay(ctx, owner, { requestKey: "t1-f2-mixed-day1" })).status).toBe(201);
+
+      // 1 Empty Round + 1 Purified Round (same roundId, total ordered 2, filled 1)
+      const prepMixed = await prepareCheckout(ctx, cashier, {
+        prepareKey: "t1-f2-mixed-prep",
+        items: [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_EMPTY",
+            includedGripo: "PUSH_TYPE",
+            quantity: 1,
+          },
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_PURIFIED",
+            includedGripo: "PUSH_TYPE",
+            quantity: 1,
+          },
+        ],
+      });
+      expect(prepMixed.status).toBe(201);
+      const refMixed = prepMixed.body.checkout.reference as string;
+      const totalCentavos = prepMixed.body.checkout.totalCentavos as number;
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/checkouts/${encodeURIComponent(refMixed)}/begin-payment`)
+            .set("Cookie", cashier.cookie)
+            .set("X-CSRF-Token", cashier.csrfToken)
+            .send({})
+        ).status,
+      ).toBe(200);
+
+      // Omitting both heldItems and noFilledUnitsHeldConfirmed on FULL_REFUND is rejected 400
+      const omitDisp = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(refMixed)}/resolve`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          outcome: "FULL_REFUND",
+          undeliveredConfirmed: true,
+          fullRefundConfirmed: true,
+          cashReceivedCentavos: totalCentavos,
+          changeAlreadyGiven: false,
+        });
+      expect(omitDisp.status).toBe(400);
+
+      // Holding only the 1 filled Round unit satisfies the disposition requirement without holding the empty one
+      const resolveMixed = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(refMixed)}/resolve`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          outcome: "FULL_REFUND",
+          undeliveredConfirmed: true,
+          fullRefundConfirmed: true,
+          cashReceivedCentavos: totalCentavos,
+          changeAlreadyGiven: false,
+          heldItems: [{ productId: roundId, quantity: 1, reason: "Only filled Round held" }],
+        });
+      expect(resolveMixed.status).toBe(201);
+      expect(resolveMixed.body.resolution.heldItems).toHaveLength(1);
+      expect(resolveMixed.body.resolution.heldItems[0].quantity).toBe(1);
+
+      const invAfterMixed = await request(ctx.app).get("/api/inventory/items").set("Cookie", owner.cookie);
+      expect(invAfterMixed.body.items.find((i: any) => i.id === roundId)).toMatchObject({
+        currentQuantity: 4,
+        heldQuantity: 1,
+        availableQuantity: 3,
+      });
+
+      // A filled order never actually filled can be FULL_REFUND resolved with noFilledUnitsHeldConfirmed: true
+      const prepUnfilled = await prepareCheckout(ctx, cashier, {
+        prepareKey: "t1-f1-refund-never-filled",
+        items: [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_ALKALINE",
+            includedGripo: "TWIST_TYPE",
+            quantity: 1,
+          },
+        ],
+      });
+      const refUnfilled = prepUnfilled.body.checkout.reference as string;
+      const totalUnfilled = prepUnfilled.body.checkout.totalCentavos as number;
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/checkouts/${encodeURIComponent(refUnfilled)}/begin-payment`)
+            .set("Cookie", cashier.cookie)
+            .set("X-CSRF-Token", cashier.csrfToken)
+            .send({})
+        ).status,
+      ).toBe(200);
+      const resolveUnfilled = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(refUnfilled)}/resolve`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          outcome: "FULL_REFUND",
+          undeliveredConfirmed: true,
+          fullRefundConfirmed: true,
+          cashReceivedCentavos: totalUnfilled,
+          changeAlreadyGiven: false,
+          noFilledUnitsHeldConfirmed: true,
+        });
+      expect(resolveUnfilled.status).toBe(201);
+      expect(resolveUnfilled.body.resolution.heldItems).toEqual([]);
+    });
+
+    it("blocks End Day from bulk-cancelling filled drafts while clearing unaffected drafts, and supports partial subset holds on filled cancellations (Finding 1)", async () => {
+      const roundId = await setupRoundContainers(5);
+      expect((await startDay(ctx, owner, { requestKey: "t1-f1-draft-day1" })).status).toBe(201);
+
+      // Prepare a 2-unit filled Round DRAFT and a 1-unit unaffected empty Round DRAFT
+      const prepFilledDraft = await prepareCheckout(ctx, cashier, {
+        prepareKey: "t1-f1-draft-filled-2",
+        items: [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_PURIFIED",
+            includedGripo: "PUSH_TYPE",
+            quantity: 2,
+          },
+        ],
+      });
+      expect(prepFilledDraft.status).toBe(201);
+      const filledRef = prepFilledDraft.body.checkout.reference as string;
+
+      const prepEmptyDraft = await prepareCheckout(ctx, cashier, {
+        prepareKey: "t1-f1-draft-empty-1",
+        items: [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_EMPTY",
+            includedGripo: "PUSH_TYPE",
+            quantity: 1,
+          },
+        ],
+      });
+      expect(prepEmptyDraft.status).toBe(201);
+      const emptyRef = prepEmptyDraft.body.checkout.reference as string;
+
+      // Filled DRAFT is exposed in unresolvedCheckouts (not unpaidDrafts) and exposes canCancelUnpaid for its operator
+      const dayCheck = await request(ctx.app).get("/api/pos/day").set("Cookie", cashier.cookie);
+      expect(dayCheck.status).toBe(200);
+      expect(dayCheck.body.unresolvedCheckouts.map((c: any) => c.reference)).toContain(filledRef);
+      expect(dayCheck.body.unpaidDrafts.map((c: any) => c.reference)).toEqual([emptyRef]);
+
+      const lookupFilled = await request(ctx.app)
+        .get(`/api/pos/checkouts/${encodeURIComponent(filledRef)}`)
+        .set("Cookie", cashier.cookie);
+      expect(lookupFilled.status).toBe(200);
+      expect(lookupFilled.body.canCancelUnpaid).toBe(true);
+
+      // End Day with clearUnpaidDrafts: true refuses to bulk-cancel the filled draft
+      const endBlocked = await endDay(ctx, owner, {
+        requestKey: "t1-f1-draft-end-blocked",
+        clearUnpaidDrafts: true,
+      });
+      expect(endBlocked.status).toBe(409);
+      expect(endBlocked.body.error.code).toBe("UNRESOLVED_CHECKOUTS");
+      expect(endBlocked.body.blockingCheckouts.map((c: any) => c.reference)).toContain(filledRef);
+
+      // Partial subset hold (1 of 2 filled units) without noFilledUnitsHeldConfirmed is rejected 400
+      const partialMissingConfirm = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(filledRef)}/cancel`)
+        .set("Cookie", cashier.cookie)
+        .set("X-CSRF-Token", cashier.csrfToken)
+        .send({
+          reason: "Returned to refill selection",
+          heldItems: [{ productId: roundId, quantity: 1, reason: "Only 1 of 2 was filled" }],
+        });
+      expect(partialMissingConfirm.status).toBe(400);
+
+      // Partial subset hold (1 of 2 filled units) with noFilledUnitsHeldConfirmed succeeds and holds only 1 unit
+      const subsetReason = "Only 1 of 2 filled Rounds was filled before returning";
+      const partialCancel = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(filledRef)}/cancel`)
+        .set("Cookie", cashier.cookie)
+        .set("X-CSRF-Token", cashier.csrfToken)
+        .send({
+          reason: "Returned to refill selection",
+          heldItems: [{ productId: roundId, quantity: 1, reason: subsetReason }],
+          noFilledUnitsHeldConfirmed: true,
+        });
+      expect(partialCancel.status).toBe(200);
+      expect(partialCancel.body.heldItems).toHaveLength(1);
+      expect(partialCancel.body.heldItems[0]).toMatchObject({
+        itemId: roundId,
+        quantity: 1,
+        reason: subsetReason,
+      });
+
+      // Exact replay returns 200 without duplicating hold
+      const partialReplay = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(filledRef)}/cancel`)
+        .set("Cookie", cashier.cookie)
+        .set("X-CSRF-Token", cashier.csrfToken)
+        .send({
+          reason: "Returned to refill selection",
+          heldItems: [{ productId: roundId, quantity: 1, reason: subsetReason }],
+          noFilledUnitsHeldConfirmed: true,
+        });
+      expect(partialReplay.status).toBe(200);
+      expect(partialReplay.body.replayed).toBe(true);
+
+      // Now only the unaffected empty draft remains, so End Day with clearUnpaidDrafts clears it cleanly
+      const endOk = await endDay(ctx, owner, {
+        requestKey: "t1-f1-draft-end-ok",
+        clearUnpaidDrafts: true,
+      });
+      expect(endOk.status).toBe(200);
+      expect(endOk.body.clearedDraftReferences).toEqual([emptyRef]);
+
+      // Inventory retains the 1 CHECKOUT_CANCEL hold (available 4 out of 5)
+      const invAfter = await request(ctx.app).get("/api/inventory/items").set("Cookie", owner.cookie);
+      expect(invAfter.body.items.find((i: any) => i.id === roundId)).toMatchObject({
+        currentQuantity: 5,
+        heldQuantity: 1,
+        availableQuantity: 4,
+      });
+    });
+
+    it("lets the original operator cancel a recovered filled draft after midnight (open day) while protecting prior-day PAYMENT_PENDING and role boundaries (Finding 1)", async () => {
+      const roundId = await setupRoundContainers(5);
+      expect((await startDay(ctx, owner, { requestKey: "t1-f1-midnight-day1" })).status).toBe(201);
+
+      // Cashier creates a 2-unit filled DRAFT and a 1-unit PAYMENT_PENDING before midnight
+      const prepDraft = await prepareCheckout(ctx, cashier, {
+        prepareKey: "t1-f1-midnight-draft",
+        items: [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_PURIFIED",
+            includedGripo: "PUSH_TYPE",
+            quantity: 2,
+          },
+        ],
+      });
+      expect(prepDraft.status).toBe(201);
+      const draftRef = prepDraft.body.checkout.reference as string;
+
+      const prepPending = await prepareCheckout(ctx, cashier, {
+        prepareKey: "t1-f1-midnight-pending",
+        items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 1 }],
+      });
+      expect(prepPending.status).toBe(201);
+      const pendingRef = prepPending.body.checkout.reference as string;
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/checkouts/${encodeURIComponent(pendingRef)}/begin-payment`)
+            .set("Cookie", cashier.cookie)
+            .set("X-CSRF-Token", cashier.csrfToken)
+            .send({})
+        ).status,
+      ).toBe(200);
+
+      // Advance past Manila midnight while previous day remains open
+      ctx.clock.advance(24 * 60 * 60_000);
+      owner = await reauth(ctx, "owner1", owner);
+      cashier = await reauth(ctx, "cashier1", cashier);
+
+      // Lookup of filled DRAFT across midnight lets original Cashier cancel it without allowing retry or prior-day PAYMENT_PENDING cancel
+      const draftLookupCashier = await request(ctx.app)
+        .get(`/api/pos/checkouts/${encodeURIComponent(draftRef)}`)
+        .set("Cookie", cashier.cookie);
+      expect(draftLookupCashier.status).toBe(200);
+      expect(draftLookupCashier.body).toMatchObject({
+        recoveryState: "REVIEW_REQUIRED",
+        reason: "BUSINESS_DATE_CROSSED",
+        canRetry: false,
+        canCancelUnpaid: true,
+        canSettlePriorDay: false,
+        canResolveNoCashPriorDay: false,
+        canResolveFullRefund: false,
+      });
+
+      // Another account (Owner) cannot cancel Cashier's draft directly
+      const draftLookupOwner = await request(ctx.app)
+        .get(`/api/pos/checkouts/${encodeURIComponent(draftRef)}`)
+        .set("Cookie", owner.cookie);
+      expect(draftLookupOwner.status).toBe(200);
+      expect(draftLookupOwner.body.canCancelUnpaid).toBe(false);
+
+      const ownerCancelDraft = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(draftRef)}/cancel`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ confirmNoCashTaken: true, noFilledUnitsHeldConfirmed: true });
+      expect(ownerCancelDraft.status).toBe(403);
+
+      // Prior-day PAYMENT_PENDING remains protected from Cashier /cancel across midnight
+      const pendingLookupCashier = await request(ctx.app)
+        .get(`/api/pos/checkouts/${encodeURIComponent(pendingRef)}`)
+        .set("Cookie", cashier.cookie);
+      expect(pendingLookupCashier.status).toBe(200);
+      expect(pendingLookupCashier.body.canCancelUnpaid).toBe(false);
+
+      // Cashier cancels the prior-day filled draft holding 1 of 2 filled Rounds; End Day stays blocked only by the prior-day PAYMENT_PENDING until Owner resolves it
+      const cashierCancelDraft = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(draftRef)}/cancel`)
+        .set("Cookie", cashier.cookie)
+        .set("X-CSRF-Token", cashier.csrfToken)
+        .send({
+          confirmNoCashTaken: true,
+          reason: "No cash received",
+          heldItems: [{ productId: roundId, quantity: 1, reason: "1 of 2 Round filled before midnight" }],
+          noFilledUnitsHeldConfirmed: true,
+        });
+      expect(cashierCancelDraft.status).toBe(200);
+      expect(cashierCancelDraft.body.checkout.status).toBe("CANCELLED_DRAFT");
+      expect(cashierCancelDraft.body.heldItems).toHaveLength(1);
+
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/checkouts/${encodeURIComponent(pendingRef)}/resolve`)
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({ outcome: "NO_CASH_CANCELLED", noCashReceivedConfirmed: true })
+        ).status,
+      ).toBe(201);
+
+      const endOk = await endDay(ctx, owner, {
+        requestKey: "t1-f1-midnight-end-ok",
+        clearUnpaidDrafts: true,
+      });
+      expect(endOk.status).toBe(200);
+
+      const invAfter = await request(ctx.app).get("/api/inventory/items").set("Cookie", owner.cookie);
+      expect(invAfter.body.items.find((i: any) => i.id === roundId)).toMatchObject({
+        currentQuantity: 5,
+        heldQuantity: 1,
+        availableQuantity: 4,
+      });
+    });
+  });
+
+  describe("Final POS Task 2 — durable Owner sale actions (POS-004, POS-005, DEC-099, DEC-106)", () => {
+    async function setupRoundContainers(stockQuantity: number) {
+      expect(
+        (
+          await request(ctx.app)
+            .patch("/api/inventory/containers/ROUND")
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({ showInPos: true })
+        ).status,
+      ).toBe(200);
+      const opening = await request(ctx.app)
+        .post("/api/inventory/items/ROUND/opening-stock")
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ quantity: stockQuantity });
+      expect(opening.status).toBe(201);
+      return opening.body.item.id as string;
+    }
+
+    async function saveRefillSale(
+      actor: Parameters<typeof prepareCheckout>[1],
+      input: {
+        prepareKey: string;
+        items: unknown[];
+        cashReceivedCentavos: number;
+      },
+    ) {
+      const prep = await prepareCheckout(ctx, actor, {
+        prepareKey: input.prepareKey,
+        items: input.items,
+      });
+      expect(prep.status).toBe(201);
+      const reference = prep.body.checkout.reference as string;
+      const confirm = await confirmCheckout(ctx.app, actor, reference, {
+        cashReceivedCentavos: input.cashReceivedCentavos,
+      });
+      expect(confirm.status).toBe(201);
+      return confirm.body.sale as {
+        reference: string;
+        totalCentavos: number;
+        cashReceivedCentavos: number;
+        changeCentavos: number;
+        businessDate: string;
+      };
+    }
+
+    it("supports Void Sale refunding sale total (₱175 vs ₱200 tender) and lower/higher/equal Correct Sale with Cashier, duplicate, replay, and stock gates", async () => {
+      const roundId = await setupRoundContainers(4);
+      expect((await startDay(ctx, owner, { requestKey: "t2-day1" })).status).toBe(201);
+
+      // 1) Sale ₱175 with ₱200 tender (₱25 change) -> Void Sale must refund ₱175 (not ₱200)
+      const saleVoid = await saveRefillSale(cashier, {
+        prepareKey: "t2-sale-void",
+        items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 7 }],
+        cashReceivedCentavos: 20000,
+      });
+      expect(saleVoid.totalCentavos).toBe(17500);
+      expect(saleVoid.changeCentavos).toBe(2500);
+
+      // Cashier is rejected on prepare/lookup/confirm/cancel
+      const cashierPrep = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(saleVoid.reference)}/actions`)
+        .set("Cookie", cashier.cookie)
+        .set("X-CSRF-Token", cashier.csrfToken)
+        .send({ actionType: "VOID", reason: "Cashier cannot void" });
+      expect(cashierPrep.status).toBe(403);
+
+      const prepVoid = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(saleVoid.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "VOID",
+          reason: "Customer cancelled refill order",
+          prepareKey: "t2-act-void-key",
+        });
+      expect(prepVoid.status).toBe(201);
+      expect(prepVoid.body.replayed).toBe(false);
+      expect(prepVoid.body.action).toMatchObject({
+        originalSaleReference: saleVoid.reference,
+        actionType: "VOID",
+        status: "PENDING",
+        originalTotalCentavos: 17500,
+        originalCashReceivedCentavos: 20000,
+        originalChangeCentavos: 2500,
+        correctedTotalCentavos: 0,
+        cashDifferenceCentavos: -17500,
+        cashDirection: "REFUND",
+      });
+      const voidActionRef = prepVoid.body.action.reference as string;
+
+      // Same prepareKey replays 200; duplicate second action on same sale returns 409 SALE_ACTION_ALREADY_PENDING
+      const prepVoidReplay = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(saleVoid.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "VOID",
+          reason: "Customer cancelled refill order",
+          prepareKey: "t2-act-void-key",
+        });
+      expect(prepVoidReplay.status).toBe(200);
+      expect(prepVoidReplay.body.replayed).toBe(true);
+
+      const competingAction = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(saleVoid.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ actionType: "VOID", reason: "Competing action" });
+      expect(competingAction.status).toBe(409);
+      expect(competingAction.body.error.code).toBe("SALE_ACTION_ALREADY_PENDING");
+
+      // Cashier rejected on lookup/confirm/cancel
+      expect(
+        (
+          await request(ctx.app)
+            .get(`/api/pos/sale-actions/${encodeURIComponent(voidActionRef)}`)
+            .set("Cookie", cashier.cookie)
+        ).status,
+      ).toBe(403);
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/sale-actions/${encodeURIComponent(voidActionRef)}/confirm`)
+            .set("Cookie", cashier.cookie)
+            .set("X-CSRF-Token", cashier.csrfToken)
+            .send({ cashConfirmed: true })
+        ).status,
+      ).toBe(403);
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/sale-actions/${encodeURIComponent(voidActionRef)}/cancel`)
+            .set("Cookie", cashier.cookie)
+            .set("X-CSRF-Token", cashier.csrfToken)
+            .send({ noCashExchangedConfirmed: true })
+        ).status,
+      ).toBe(403);
+
+      // Missing cashConfirmed on refund rejected 400
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/sale-actions/${encodeURIComponent(voidActionRef)}/confirm`)
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({})
+        ).status,
+      ).toBe(400);
+
+      // Confirm void -> refund is ₱175 (17500), original status becomes VOIDED, replay returns 200
+      const confirmVoid = await request(ctx.app)
+        .post(`/api/pos/sale-actions/${encodeURIComponent(voidActionRef)}/confirm`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ cashConfirmed: true });
+      expect(confirmVoid.status).toBe(201);
+      expect(confirmVoid.body).toMatchObject({
+        outcome: "COMPLETED",
+        replayed: false,
+        replacementSale: null,
+        originalSale: { reference: saleVoid.reference, status: "VOIDED" },
+        action: {
+          reference: voidActionRef,
+          status: "COMPLETED",
+          cashRefundedCentavos: 17500,
+        },
+      });
+
+      const confirmVoidReplay = await request(ctx.app)
+        .post(`/api/pos/sale-actions/${encodeURIComponent(voidActionRef)}/confirm`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ cashConfirmed: true });
+      expect(confirmVoidReplay.status).toBe(200);
+      expect(confirmVoidReplay.body.replayed).toBe(true);
+
+      const contradictCancelAfterVoid = await request(ctx.app)
+        .post(`/api/pos/sale-actions/${encodeURIComponent(voidActionRef)}/cancel`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ noCashExchangedConfirmed: true });
+      expect(contradictCancelAfterVoid.status).toBe(409);
+      expect(contradictCancelAfterVoid.body.error.code).toBe("SALE_ACTION_ALREADY_COMPLETED");
+
+      // 2) Lower correction: ₱350 -> ₱175 refunds ₱175 and voids original + activates replacement
+      const saleLower = await saveRefillSale(cashier, {
+        prepareKey: "t2-sale-lower",
+        items: [{ kind: "STANDARD", waterType: "ALKALINE", quantity: 10 }],
+        cashReceivedCentavos: 40000,
+      });
+      expect(saleLower.totalCentavos).toBe(35000);
+      const prepLower = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(saleLower.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "CORRECT",
+          reason: "Recorded 10 Alkaline instead of 7 Purified",
+          items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 7 }],
+        });
+      expect(prepLower.status).toBe(201);
+      expect(prepLower.body.action).toMatchObject({
+        correctedTotalCentavos: 17500,
+        cashDifferenceCentavos: -17500,
+        cashDirection: "REFUND",
+      });
+      const lowerConfirm = await request(ctx.app)
+        .post(`/api/pos/sale-actions/${encodeURIComponent(prepLower.body.action.reference)}/confirm`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ cashConfirmed: true });
+      expect(lowerConfirm.status).toBe(201);
+      expect(lowerConfirm.body.action.cashRefundedCentavos).toBe(17500);
+      expect(lowerConfirm.body.originalSale.status).toBe("VOIDED");
+      expect(lowerConfirm.body.replacementSale).toMatchObject({
+        status: "ACTIVE",
+        totalCentavos: 17500,
+        correctedFromSaleReference: saleLower.reference,
+      });
+
+      // 3) Higher correction: ₱100 -> ₱175 collects ₱75 with ₱100 tender and ₱25 change
+      const saleHigher = await saveRefillSale(cashier, {
+        prepareKey: "t2-sale-higher",
+        items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 4 }],
+        cashReceivedCentavos: 10000,
+      });
+      const prepHigher = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(saleHigher.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "CORRECT",
+          reason: "Added 3 more Purified refills",
+          items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 7 }],
+        });
+      expect(prepHigher.status).toBe(201);
+      expect(prepHigher.body.action).toMatchObject({
+        cashDifferenceCentavos: 7500,
+        cashDirection: "COLLECT",
+      });
+      const higherConfirm = await request(ctx.app)
+        .post(`/api/pos/sale-actions/${encodeURIComponent(prepHigher.body.action.reference)}/confirm`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ cashConfirmed: true, cashTenderedCentavos: 10000 });
+      expect(higherConfirm.status).toBe(201);
+      expect(higherConfirm.body.action).toMatchObject({
+        cashTenderedCentavos: 10000,
+        cashChangeCentavos: 2500,
+      });
+      expect(higherConfirm.body.replacementSale.totalCentavos).toBe(17500);
+
+      // 4) Equal zero-cash correction: ₱25 Standard Purified -> ₱25 Custom Alkaline
+      const saleEqual = await saveRefillSale(cashier, {
+        prepareKey: "t2-sale-equal",
+        items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 1 }],
+        cashReceivedCentavos: 2500,
+      });
+      const prepEqual = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(saleEqual.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "CORRECT",
+          reason: "Water type switched at equal price",
+          items: [
+            {
+              kind: "CUSTOM",
+              waterType: "ALKALINE",
+              unitVolumeLiters: 18.9,
+              unitPriceCentavos: 2500,
+              quantity: 1,
+            },
+          ],
+        });
+      expect(prepEqual.status).toBe(201);
+      expect(prepEqual.body.action).toMatchObject({
+        cashDifferenceCentavos: 0,
+        cashDirection: "NONE",
+      });
+      const equalConfirm = await request(ctx.app)
+        .post(`/api/pos/sale-actions/${encodeURIComponent(prepEqual.body.action.reference)}/confirm`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({});
+      expect(equalConfirm.status).toBe(201);
+      expect(equalConfirm.body.replacementSale).toMatchObject({
+        status: "ACTIVE",
+        totalCentavos: 2500,
+      });
+
+      // 5) Stock-changing sales (container/merchandise) are now preparable in Task 3 (test prepare + no-cash cancel leaves sale active)
+      const saleMerch = await saveRefillSale(cashier, {
+        prepareKey: "t2-sale-merch",
+        items: [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_EMPTY",
+            includedGripo: "PUSH_TYPE",
+            quantity: 1,
+          },
+        ],
+        cashReceivedCentavos: 20000,
+      });
+      const stockPrepared = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(saleMerch.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "VOID",
+          reason: "Task 3 prepare & cancel check",
+          stockDispositions: [{ productId: roundId, notReturnedQuantity: 1 }],
+        });
+      expect(stockPrepared.status).toBe(201);
+      expect(stockPrepared.body.action.merchandisePlan.hasMerchandise).toBe(true);
+      const cancelMerch = await request(ctx.app)
+        .post(`/api/pos/sale-actions/${encodeURIComponent(stockPrepared.body.action.reference)}/cancel`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ noCashExchangedConfirmed: true, reason: "Cancel after preview" });
+      expect(cancelMerch.status).toBe(200);
+      expect(cancelMerch.body.originalSale.status).toBe("ACTIVE");
+      expect(roundId).toBeTruthy();
+
+      // Verify live day summary reflects replacements & voids accurately
+      const dayNow = await request(ctx.app).get("/api/pos/day").set("Cookie", owner.cookie);
+      expect(dayNow.status).toBe(200);
+      expect(dayNow.body.day.summary).toMatchObject({
+        validTransactionCount: 4, // lower repl (17500) + higher repl (17500) + equal repl (2500) + merch (17500)
+        totalSalesCentavos: 17500 + 17500 + 2500 + saleMerch.totalCentavos,
+        voidedCount: 4, // saleVoid (17500) + saleLower (35000) + saleHigher (10000) + saleEqual (2500)
+        voidedTotalCentavos: 17500 + 35000 + 10000 + 2500,
+      });
+    });
+
+    it("recovers pending actions across Manila midnight on the original open day, blocks End Day, allows verified no-cash cancel, rejects new prior-day actions, and preserves saved zero-cash replacements", async () => {
+      expect((await startDay(ctx, owner, { requestKey: "t2-mid-day1" })).status).toBe(201);
+
+      // Sale A: prepared for lower correction before midnight, finished after midnight
+      const saleA = await saveRefillSale(cashier, {
+        prepareKey: "t2-mid-sale-a",
+        items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 4 }],
+        cashReceivedCentavos: 10000,
+      });
+      // Sale B: prepared for void before midnight, cancelled no-cash after midnight
+      const saleB = await saveRefillSale(cashier, {
+        prepareKey: "t2-mid-sale-b",
+        items: [{ kind: "STANDARD", waterType: "ALKALINE", quantity: 2 }],
+        cashReceivedCentavos: 10000,
+      });
+      // Sale C: zero-cash replacement committed before midnight, read again after midnight
+      const saleC = await saveRefillSale(cashier, {
+        prepareKey: "t2-mid-sale-c",
+        items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 1 }],
+        cashReceivedCentavos: 2500,
+      });
+      // Sale D: untouched before midnight; starting a new action after midnight must be rejected
+      const saleD = await saveRefillSale(cashier, {
+        prepareKey: "t2-mid-sale-d",
+        items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 2 }],
+        cashReceivedCentavos: 5000,
+      });
+
+      const prepA = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(saleA.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "CORRECT",
+          reason: "Reduce to 2 Purified refills",
+          items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 2 }],
+        });
+      expect(prepA.status).toBe(201);
+      const actARef = prepA.body.action.reference as string;
+
+      const prepB = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(saleB.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ actionType: "VOID", reason: "Power blip during void" });
+      expect(prepB.status).toBe(201);
+      const actBRef = prepB.body.action.reference as string;
+
+      const prepC = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(saleC.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "CORRECT",
+          reason: "Switch to zero-cash custom Purified",
+          items: [
+            {
+              kind: "CUSTOM",
+              waterType: "PURIFIED",
+              unitVolumeLiters: 25,
+              unitPriceCentavos: 2500,
+              quantity: 1,
+            },
+          ],
+        });
+      expect(prepC.status).toBe(201);
+      const actCRef = prepC.body.action.reference as string;
+      const confirmC = await request(ctx.app)
+        .post(`/api/pos/sale-actions/${encodeURIComponent(actCRef)}/confirm`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({});
+      expect(confirmC.status).toBe(201);
+      const replCBeforeRef = confirmC.body.replacementSale.reference as string;
+
+      // Cross Manila midnight while 2026-11-09 remains open
+      ctx.clock.advance(24 * 60 * 60_000);
+      owner = await reauth(ctx, "owner1", owner);
+      cashier = await reauth(ctx, "cashier1", cashier);
+
+      // Starting a new action on Sale D (previous business date) is rejected
+      const newPriorDayAction = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(saleD.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ actionType: "VOID", reason: "Too late" });
+      expect(newPriorDayAction.status).toBe(409);
+      expect(newPriorDayAction.body.error.code).toBe("PRIOR_DAY_ACTION_BLOCKED");
+
+      // Reading committed zero-cash replacement C after midnight leaves it untouched and blocks cancel
+      const lookupC = await request(ctx.app)
+        .get(`/api/pos/sale-actions/${encodeURIComponent(actCRef)}`)
+        .set("Cookie", owner.cookie);
+      expect(lookupC.status).toBe(200);
+      expect(lookupC.body).toMatchObject({
+        canConfirm: false,
+        canCancelNoCash: false,
+        action: { status: "COMPLETED", replacementSaleReference: replCBeforeRef },
+        replacementSale: { reference: replCBeforeRef, status: "ACTIVE", businessDate: "2026-11-09" },
+      });
+      const replayConfirmC = await request(ctx.app)
+        .post(`/api/pos/sale-actions/${encodeURIComponent(actCRef)}/confirm`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({});
+      expect(replayConfirmC.status).toBe(200);
+      expect(replayConfirmC.body.replacementSale.reference).toBe(replCBeforeRef);
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/sale-actions/${encodeURIComponent(actCRef)}/cancel`)
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({ noCashExchangedConfirmed: true })
+        ).status,
+      ).toBe(409);
+
+      // Pending actions A and B block End Day
+      const endBlocked1 = await endDay(ctx, owner, { requestKey: "t2-mid-end-blocked-1" });
+      expect(endBlocked1.status).toBe(409);
+      expect(endBlocked1.body.error.code).toBe("UNRESOLVED_SALE_ACTIONS");
+      expect(endBlocked1.body.blockingSaleActions).toHaveLength(2);
+
+      // Action A is recoverable after midnight and assigns replacement to original 2026-11-09 with 2026-11-10 completion timestamp
+      const lookupA = await request(ctx.app)
+        .get(`/api/pos/sale-actions/${encodeURIComponent(actARef)}`)
+        .set("Cookie", owner.cookie);
+      expect(lookupA.status).toBe(200);
+      expect(lookupA.body).toMatchObject({ canConfirm: true, canCancelNoCash: true });
+
+      const confirmA = await request(ctx.app)
+        .post(`/api/pos/sale-actions/${encodeURIComponent(actARef)}/confirm`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ cashConfirmed: true });
+      expect(confirmA.status).toBe(201);
+      expect(confirmA.body.replacementSale).toMatchObject({
+        status: "ACTIVE",
+        businessDate: "2026-11-09",
+        totalCentavos: 5000,
+      });
+      expect(confirmA.body.action.completedAt.startsWith("2026-11-10")).toBe(true);
+
+      // Action B still blocks End Day until explicitly cancelled with noCashExchangedConfirmed: true
+      const endBlocked2 = await endDay(ctx, owner, { requestKey: "t2-mid-end-blocked-2" });
+      expect(endBlocked2.status).toBe(409);
+      expect(endBlocked2.body.error.code).toBe("UNRESOLVED_SALE_ACTIONS");
+
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/sale-actions/${encodeURIComponent(actBRef)}/cancel`)
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({ noCashExchangedConfirmed: false })
+        ).status,
+      ).toBe(400);
+
+      const cancelB = await request(ctx.app)
+        .post(`/api/pos/sale-actions/${encodeURIComponent(actBRef)}/cancel`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ noCashExchangedConfirmed: true, reason: "Verified no cash moved" });
+      expect(cancelB.status).toBe(200);
+      expect(cancelB.body.originalSale).toMatchObject({
+        reference: saleB.reference,
+        status: "ACTIVE",
+      });
+
+      // End Day now succeeds; pending actions cleared
+      const endOk = await endDay(ctx, owner, { requestKey: "t2-mid-end-ok" });
+      expect(endOk.status).toBe(200);
+
+      // Closed day blocks any remaining recovery lookup from claiming canConfirm
+      const lookupAfterClose = await request(ctx.app)
+        .get(`/api/pos/sale-actions/${encodeURIComponent(actARef)}`)
+        .set("Cookie", owner.cookie);
+      expect(lookupAfterClose.status).toBe(200);
+      expect(lookupAfterClose.body).toMatchObject({
+        canConfirm: false,
+        canCancelNoCash: false,
+      });
+    });
+
+    it("replays identical CORRECT prepare requests, rejects modified payloads, exposes sourceAction cash truth on replacements, and blocks confirming unsaved zero-cash corrections after midnight (Findings 3, 4 & 5)", async () => {
+      expect((await startDay(ctx, owner, { requestKey: "t2-f345-day1" })).status).toBe(201);
+
+      // Original sale ₱100 paid with ₱120 tender (₱20 change) -> corrected to ₱175 taking ₱100 tender (₱25 change)
+      const origSale = await saveRefillSale(cashier, {
+        prepareKey: "t2-f345-sale1",
+        items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 4 }],
+        cashReceivedCentavos: 12000,
+      });
+      expect(origSale.changeCentavos).toBe(2000);
+
+      const correctPayload = {
+        actionType: "CORRECT" as const,
+        reason: "Increased order to 7 Purified refills",
+        prepareKey: "t2-f3-correct-replay",
+        items: [{ kind: "STANDARD" as const, waterType: "PURIFIED" as const, quantity: 7 }],
+      };
+      const prep1 = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(origSale.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send(correctPayload);
+      expect(prep1.status).toBe(201);
+      expect(prep1.body.replayed).toBe(false);
+      const actRef = prep1.body.action.reference as string;
+
+      // Finding 3: Identical retry with same prepareKey replays 200 across JSONB round-trip
+      const prepReplay = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(origSale.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send(correctPayload);
+      expect(prepReplay.status).toBe(200);
+      expect(prepReplay.body.replayed).toBe(true);
+      expect(prepReplay.body.action.reference).toBe(actRef);
+
+      // Finding 3: Changed correction items with same prepareKey reject 409 PAYLOAD_MISMATCH
+      const prepChanged = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(origSale.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          ...correctPayload,
+          items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 6 }],
+        });
+      expect(prepChanged.status).toBe(409);
+      expect(prepChanged.body.error.code).toBe("PAYLOAD_MISMATCH");
+
+      // Complete collection (₱100 tender for ₱75 increase -> ₱25 change) and check Finding 5 sourceAction
+      const confirm1 = await request(ctx.app)
+        .post(`/api/pos/sale-actions/${encodeURIComponent(actRef)}/confirm`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ cashConfirmed: true, cashTenderedCentavos: 10000 });
+      expect(confirm1.status).toBe(201);
+      const replRef = confirm1.body.replacementSale.reference as string;
+
+      const replDetail = await request(ctx.app)
+        .get(`/api/pos/sales/${encodeURIComponent(replRef)}`)
+        .set("Cookie", cashier.cookie);
+      expect(replDetail.status).toBe(200);
+      expect(replDetail.body.totalCentavos).toBe(17500);
+      expect(replDetail.body.sourceAction).toMatchObject({
+        reference: actRef,
+        originalSaleReference: origSale.reference,
+        originalTotalCentavos: 10000,
+        originalCashReceivedCentavos: 12000,
+        originalChangeCentavos: 2000,
+        cashDirection: "COLLECT",
+        cashDifferenceCentavos: 7500,
+        cashTenderedCentavos: 10000,
+        cashChangeCentavos: 2500,
+      });
+
+      // Finding 4: Unsaved equal-total (zero-cash) correction prepared before midnight cannot be confirmed after midnight
+      const saleZero = await saveRefillSale(cashier, {
+        prepareKey: "t2-f4-zero-sale",
+        items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 1 }],
+        cashReceivedCentavos: 5000,
+      });
+      const prepZero = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(saleZero.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "CORRECT",
+          reason: "Equal swap before midnight",
+          items: [
+            {
+              kind: "CUSTOM",
+              waterType: "ALKALINE",
+              unitVolumeLiters: 20,
+              unitPriceCentavos: 2500,
+              quantity: 1,
+            },
+          ],
+        });
+      expect(prepZero.status).toBe(201);
+      const zeroActRef = prepZero.body.action.reference as string;
+
+      ctx.clock.advance(24 * 60 * 60_000);
+      owner = await reauth(ctx, "owner1", owner);
+
+      const lookupZeroAfterMidnight = await request(ctx.app)
+        .get(`/api/pos/sale-actions/${encodeURIComponent(zeroActRef)}`)
+        .set("Cookie", owner.cookie);
+      expect(lookupZeroAfterMidnight.status).toBe(200);
+      expect(lookupZeroAfterMidnight.body).toMatchObject({
+        canConfirm: false,
+        canCancelNoCash: true,
+        action: { status: "PENDING", cashDirection: "NONE" },
+      });
+
+      const confirmZeroAfterMidnight = await request(ctx.app)
+        .post(`/api/pos/sale-actions/${encodeURIComponent(zeroActRef)}/confirm`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({});
+      expect(confirmZeroAfterMidnight.status).toBe(409);
+      expect(confirmZeroAfterMidnight.body.error.code).toBe("PRIOR_DAY_ACTION_BLOCKED");
+
+      // Owner cancels the unsaved zero-cash correction cleanly so original sale stays ACTIVE and End Day succeeds
+      const cancelZeroAfterMidnight = await request(ctx.app)
+        .post(`/api/pos/sale-actions/${encodeURIComponent(zeroActRef)}/cancel`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ noCashExchangedConfirmed: true, reason: "Cleared zero-cash attempt after midnight" });
+      expect(cancelZeroAfterMidnight.status).toBe(200);
+      expect(cancelZeroAfterMidnight.body.originalSale.status).toBe("ACTIVE");
+      expect((await endDay(ctx, owner, { requestKey: "t2-f345-end-ok" })).status).toBe(200);
+    });
+
+    it("distinguishes intermediate replacements from cash sales across chained Correct and Void actions and exposes linked cash events (Finding 5)", async () => {
+      expect((await startDay(ctx, owner, { requestKey: "t2-f5-chain-day1" })).status).toBe(201);
+
+      // Root cash sale: ₱100 total paid with ₱120 tender (₱20 change)
+      const rootSale = await saveRefillSale(cashier, {
+        prepareKey: "t2-f5-root-sale",
+        items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 4 }],
+        cashReceivedCentavos: 12000,
+      });
+
+      // Correction 1: ₱100 -> ₱175 (collect ₱75 with ₱100 tender, ₱25 change) => Replacement 1
+      const prep1 = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(rootSale.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "CORRECT",
+          reason: "Added 3 refills",
+          items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 7 }],
+        });
+      expect(prep1.status).toBe(201);
+      expect(prep1.body.action).toMatchObject({
+        originalSaleIsReplacement: false,
+        originalCashReceivedCentavos: 12000,
+        originalChangeCentavos: 2000,
+      });
+      const act1Ref = prep1.body.action.reference as string;
+      const conf1 = await request(ctx.app)
+        .post(`/api/pos/sale-actions/${encodeURIComponent(act1Ref)}/confirm`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ cashConfirmed: true, cashTenderedCentavos: 10000 });
+      expect(conf1.status).toBe(201);
+      const repl1Ref = conf1.body.replacementSale.reference as string;
+
+      // Correction 2 on Active Replacement 1: ₱175 -> ₱200 (collect ₱25 with ₱50 tender, ₱25 change) => Replacement 2
+      const prep2 = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(repl1Ref)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "CORRECT",
+          reason: "Added 1 more refill to replacement",
+          items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 8 }],
+        });
+      expect(prep2.status).toBe(201);
+      expect(prep2.body.action).toMatchObject({
+        originalSaleReference: repl1Ref,
+        originalSaleIsReplacement: true,
+        originalTotalCentavos: 17500,
+        originalCashReceivedCentavos: null,
+        originalChangeCentavos: null,
+        correctedTotalCentavos: 20000,
+        cashDifferenceCentavos: 2500,
+        cashDirection: "COLLECT",
+      });
+      const act2Ref = prep2.body.action.reference as string;
+      const conf2 = await request(ctx.app)
+        .post(`/api/pos/sale-actions/${encodeURIComponent(act2Ref)}/confirm`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ cashConfirmed: true, cashTenderedCentavos: 5000 });
+      expect(conf2.status).toBe(201);
+      const repl2Ref = conf2.body.replacementSale.reference as string;
+
+      // Lookup Action 2 still hides invented intermediate tender/change and Replacement 2 carries the full chain
+      const lookupAct2 = await request(ctx.app)
+        .get(`/api/pos/sale-actions/${encodeURIComponent(act2Ref)}`)
+        .set("Cookie", owner.cookie);
+      expect(lookupAct2.status).toBe(200);
+      expect(lookupAct2.body.action).toMatchObject({
+        originalSaleIsReplacement: true,
+        originalCashReceivedCentavos: null,
+        originalChangeCentavos: null,
+      });
+
+      const repl2Detail = await request(ctx.app)
+        .get(`/api/pos/sales/${encodeURIComponent(repl2Ref)}`)
+        .set("Cookie", cashier.cookie);
+      expect(repl2Detail.status).toBe(200);
+      expect(repl2Detail.body).toMatchObject({
+        reference: repl2Ref,
+        totalCentavos: 20000,
+        correctedFromSaleReference: repl1Ref,
+        sourceAction: {
+          reference: act2Ref,
+          originalSaleReference: repl1Ref,
+          originalSaleIsReplacement: true,
+          originalTotalCentavos: 17500,
+          originalCashReceivedCentavos: null,
+          originalChangeCentavos: null,
+          cashTenderedCentavos: 5000,
+          cashChangeCentavos: 2500,
+        },
+        cashEventChain: {
+          rootCashSale: {
+            reference: rootSale.reference,
+            totalCentavos: 10000,
+            cashReceivedCentavos: 12000,
+            changeCentavos: 2000,
+          },
+          correctionEvents: [
+            {
+              actionReference: act1Ref,
+              replacementSaleReference: repl1Ref,
+              cashDifferenceCentavos: 7500,
+              cashTenderedCentavos: 10000,
+              cashChangeCentavos: 2500,
+            },
+            {
+              actionReference: act2Ref,
+              replacementSaleReference: repl2Ref,
+              cashDifferenceCentavos: 2500,
+              cashTenderedCentavos: 5000,
+              cashChangeCentavos: 2500,
+            },
+          ],
+        },
+      });
+
+      // Void Sale on Active Replacement 2 refunds ₱200 and preserves originalSaleIsReplacement: true
+      const prepVoidRepl2 = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(repl2Ref)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ actionType: "VOID", reason: "Void final replacement" });
+      expect(prepVoidRepl2.status).toBe(201);
+      expect(prepVoidRepl2.body.action).toMatchObject({
+        originalSaleReference: repl2Ref,
+        originalSaleIsReplacement: true,
+        originalTotalCentavos: 20000,
+        originalCashReceivedCentavos: null,
+        originalChangeCentavos: null,
+        cashDirection: "REFUND",
+        cashDifferenceCentavos: -20000,
+      });
+      const voidRepl2Ref = prepVoidRepl2.body.action.reference as string;
+      const confVoidRepl2 = await request(ctx.app)
+        .post(`/api/pos/sale-actions/${encodeURIComponent(voidRepl2Ref)}/confirm`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ cashConfirmed: true });
+      expect(confVoidRepl2.status).toBe(201);
+      expect(confVoidRepl2.body).toMatchObject({
+        originalSale: { reference: repl2Ref, status: "VOIDED" },
+        action: { cashRefundedCentavos: 20000 },
+      });
+
+      // End Day reporting retains accurate totals (0 active, 3 voided = 100 + 175 + 200 = 475)
+      const endRes = await endDay(ctx, owner, { requestKey: "t2-f5-chain-end" });
+      expect(endRes.status).toBe(200);
+      expect(endRes.body.summary).toMatchObject({
+        validTransactionCount: 0,
+        totalSalesCentavos: 0,
+        voidedCount: 3,
+        voidedTotalCentavos: 47500,
+      });
+    });
+  });
+
+  describe("Final POS Task 3 — linked inventory stock effects, holds, reservations, and intervening count reviews", () => {
+    async function initRoundContainer(stockQuantity: number) {
+      expect(
+        (
+          await request(ctx.app)
+            .patch("/api/inventory/containers/ROUND")
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({ showInPos: true })
+        ).status,
+      ).toBe(200);
+      const opening = await request(ctx.app)
+        .post("/api/inventory/items/ROUND/opening-stock")
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ quantity: stockQuantity });
+      expect(opening.status).toBe(201);
+      return opening.body.item.id as string;
+    }
+
+    async function createMerchProduct(input: {
+      name: string;
+      unitPriceCentavos: number;
+      openingQuantity: number;
+      showInPos?: boolean;
+      faucetReportingType?: "PUSH_TYPE" | "TWIST_TYPE" | null;
+    }) {
+      const created = await request(ctx.app)
+        .post("/api/inventory/products")
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          name: input.name,
+          unit: "pcs",
+          unitConfirmed: true,
+          unitPriceCentavos: input.unitPriceCentavos,
+          showInPos: input.showInPos ?? true,
+          posSection: "TAKIP_ACCESSORIES",
+          faucetReportingType: input.faucetReportingType ?? null,
+        });
+      expect(created.status).toBe(201);
+      const id = created.body.item.id as string;
+      const opening = await request(ctx.app)
+        .post(`/api/inventory/items/${id}/opening-stock`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ quantity: input.openingQuantity });
+      expect(opening.status).toBe(201);
+      return id;
+    }
+
+    async function saveSale(
+      actor: Parameters<typeof prepareCheckout>[1],
+      prepareKey: string,
+      items: unknown[],
+      cashReceivedCentavos: number,
+    ) {
+      const prep = await prepareCheckout(ctx, actor, { prepareKey, items });
+      expect(prep.status).toBe(201);
+      const confirm = await confirmCheckout(
+        ctx.app,
+        actor,
+        prep.body.checkout.reference as string,
+        { cashReceivedCentavos },
+      );
+      expect(confirm.status).toBe(201);
+      return confirm.body.sale as {
+        reference: string;
+        totalCentavos: number;
+      };
+    }
+
+    async function reconcileItem(
+      itemKey: string,
+      expectedItem: { stockRevision: number; currentQuantity: number },
+      physicalCount: number,
+      reason: string,
+      requestKey: string,
+    ) {
+      return request(ctx.app)
+        .post(`/api/inventory/items/${encodeURIComponent(itemKey)}/reconciliations`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          physicalCount,
+          reason,
+          expectedRevision: expectedItem.stockRevision,
+          expectedCurrentQuantity: expectedItem.currentQuantity,
+          requestKey,
+        });
+    }
+
+    it("restores good returns, excludes damaged returns as reducesAvailability=false holds, and keeps Dashboard Stock Trend complete", async () => {
+      const roundId = await initRoundContainer(4);
+      ctx.clock.advance(5_000);
+      const faucetId = await createMerchProduct({
+        name: "Task3 Valve",
+        unitPriceCentavos: 5000,
+        openingQuantity: 4,
+      });
+      ctx.clock.advance(5_000);
+      expect((await startDay(ctx, owner, { requestKey: "t3-day-1" })).status).toBe(201);
+      ctx.clock.advance(5_000);
+
+      const sale = await saveSale(
+        cashier,
+        "t3-sale-void-hold",
+        [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_EMPTY",
+            includedGripo: "PUSH_TYPE",
+            quantity: 2,
+          },
+          { kind: "MERCHANDISE", productId: faucetId, quantity: 3 },
+        ],
+        50000,
+      );
+      expect(sale.totalCentavos).toBe(50000); // 2 * 17500 + 3 * 5000
+
+      ctx.clock.advance(5_000);
+      const prepVoid = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(sale.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "VOID",
+          reason: "One container cracked on return",
+          prepareKey: "t3-void-prep-1",
+          stockDispositions: [
+            {
+              productId: roundId,
+              eligibleReturnedQuantity: 1,
+              heldQuantity: 1,
+              holdReason: "Cracked container neck",
+            },
+            {
+              productId: faucetId,
+              eligibleReturnedQuantity: 3,
+            },
+          ],
+        });
+      expect(prepVoid.status).toBe(201);
+      expect(prepVoid.body.action.merchandisePlan.items).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            productId: roundId,
+            returningFromSaleQuantity: 2,
+            restoredQuantity: 1,
+            heldQuantity: 1,
+            holdReason: "Cracked container neck",
+          }),
+          expect.objectContaining({
+            productId: faucetId,
+            returningFromSaleQuantity: 3,
+            restoredQuantity: 3,
+            heldQuantity: 0,
+          }),
+        ]),
+      );
+
+      ctx.clock.advance(5_000);
+      const confVoid = await request(ctx.app)
+        .post(`/api/pos/sale-actions/${encodeURIComponent(prepVoid.body.action.reference)}/confirm`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ cashConfirmed: true });
+      expect(confVoid.status).toBe(201);
+
+      // Round started at 4 -> sold 2 (=2) -> restored 1 (=3) + 1 reducesAvailability=false hold (available stays 3)
+      const invRes = await request(ctx.app).get("/api/inventory/items").set("Cookie", owner.cookie);
+      expect(invRes.status).toBe(200);
+      const roundInv = invRes.body.items.find((i: { id: string }) => i.id === roundId);
+      const faucetInv = invRes.body.items.find((i: { id: string }) => i.id === faucetId);
+      expect(roundInv).toMatchObject({
+        currentQuantity: 3,
+        availableQuantity: 3,
+        heldQuantity: 1,
+      });
+      expect(roundInv.activeHolds).toEqual([
+        expect.objectContaining({
+          sourceKind: "SALE_ACTION",
+          reducesAvailability: false,
+          quantity: 1,
+          reason: "Cracked container neck",
+          posReference: prepVoid.body.action.reference,
+        }),
+      ]);
+      expect(faucetInv).toMatchObject({
+        currentQuantity: 4,
+        availableQuantity: 4,
+      });
+
+      // Dashboard Stock Trend stays COMPLETE with SALE_ACTION_RESTORATION
+      const trendRes = await request(ctx.app)
+        .get(`/api/dashboard/stocks/${roundId}/trend`)
+        .set("Cookie", owner.cookie);
+      expect(trendRes.status).toBe(200);
+      expect(trendRes.body.historyState).toBe("COMPLETE");
+      expect(trendRes.body.points.map((p: { movementType: string }) => p.movementType)).toEqual([
+        "OPENING_COUNT",
+        "POS_SALE",
+        "SALE_ACTION_RESTORATION",
+      ]);
+    });
+
+    it("keeps same-shape package edits at 0 container movement even at 0 stock, while physical exchanges check stock and deduct replacements", async () => {
+      const roundId = await initRoundContainer(1);
+      ctx.clock.advance(5_000);
+      expect((await startDay(ctx, owner, { requestKey: "t3-day-2" })).status).toBe(201);
+      ctx.clock.advance(5_000);
+
+      // Sell the last remaining Round container (currentQuantity becomes 0)
+      const sale = await saveSale(
+        cashier,
+        "t3-last-round",
+        [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_EMPTY",
+            includedGripo: "PUSH_TYPE",
+            quantity: 1,
+          },
+        ],
+        20000,
+      );
+
+      // Edit option ROUND_EMPTY -> ROUND_PURIFIED without physical exchange succeeds with 0 stock!
+      ctx.clock.advance(5_000);
+      const editOptPrep = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(sale.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "CORRECT",
+          reason: "Customer actually got purified fill",
+          prepareKey: "t3-edit-opt-prep",
+          items: [
+            {
+              kind: "CONTAINER_PACKAGE",
+              packageCode: "ROUND_PURIFIED",
+              includedGripo: "TWIST_TYPE",
+              quantity: 1,
+            },
+          ],
+        });
+      expect(editOptPrep.status).toBe(201);
+      expect(editOptPrep.body.action.cashDirection).toBe("COLLECT");
+      expect(editOptPrep.body.action.cashDifferenceCentavos).toBe(2500);
+      expect(editOptPrep.body.action.merchandisePlan.items[0]).toMatchObject({
+        productId: roundId,
+        retainedQuantity: 1,
+        exchangedQuantity: 0,
+        addedQuantity: 0,
+        restoredQuantity: 0,
+        heldQuantity: 0,
+      });
+
+      const editOptConf = await request(ctx.app)
+        .post(`/api/pos/sale-actions/${encodeURIComponent(editOptPrep.body.action.reference)}/confirm`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ cashConfirmed: true, cashTenderedCentavos: 5000 });
+      expect(editOptConf.status).toBe(201);
+      const replRef = editOptConf.body.replacementSale.reference as string;
+
+      // Exchange attempt when Round stock === 0 is blocked with 409 INSUFFICIENT_STOCK
+      const blockedExchange = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(replRef)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "CORRECT",
+          reason: "Swap container",
+          prepareKey: "t3-exch-blocked",
+          items: [
+            {
+              kind: "CONTAINER_PACKAGE",
+              packageCode: "ROUND_PURIFIED",
+              includedGripo: "TWIST_TYPE",
+              quantity: 1,
+            },
+          ],
+          stockDispositions: [
+            {
+              productId: roundId,
+              exchangedQuantity: 1,
+              heldQuantity: 1,
+              holdReason: "Leaking seam",
+            },
+          ],
+        });
+      expect(blockedExchange.status).toBe(409);
+      expect(blockedExchange.body.error.code).toBe("INSUFFICIENT_STOCK");
+
+      // Reconcile Round up to 1 available container, then complete same-shape physical exchange
+      const invBefore = await request(ctx.app).get("/api/inventory/items").set("Cookie", owner.cookie);
+      const roundBefore = invBefore.body.items.find((i: { id: string }) => i.id === roundId);
+      ctx.clock.advance(5_000);
+      const recRes = await reconcileItem("ROUND", roundBefore, 1, "Found 1 spare", "t3-rec-spare");
+      expect(recRes.status).toBe(201);
+
+      ctx.clock.advance(5_000);
+      const exchPrep = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(replRef)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "CORRECT",
+          reason: "Swapped leaking round container for spare",
+          prepareKey: "t3-exch-ok",
+          items: [
+            {
+              kind: "CONTAINER_PACKAGE",
+              packageCode: "ROUND_PURIFIED",
+              includedGripo: "TWIST_TYPE",
+              quantity: 1,
+            },
+          ],
+          stockDispositions: [
+            {
+              productId: roundId,
+              exchangedQuantity: 1,
+              heldQuantity: 1,
+              holdReason: "Leaking seam swapped out",
+            },
+          ],
+        });
+      expect(exchPrep.status).toBe(201);
+      expect(exchPrep.body.action.merchandisePlan.items[0]).toMatchObject({
+        retainedQuantity: 0,
+        exchangedQuantity: 1,
+        addedQuantity: 1,
+        restoredQuantity: 0,
+        heldQuantity: 1,
+      });
+
+      const exchConf = await request(ctx.app)
+        .post(`/api/pos/sale-actions/${encodeURIComponent(exchPrep.body.action.reference)}/confirm`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({});
+      expect(exchConf.status).toBe(201);
+
+      const invAfter = await request(ctx.app).get("/api/inventory/items").set("Cookie", owner.cookie);
+      const roundAfter = invAfter.body.items.find((i: { id: string }) => i.id === roundId);
+      expect(roundAfter).toMatchObject({
+        currentQuantity: 0,
+        availableQuantity: 0,
+        heldQuantity: 1,
+      });
+    });
+
+    it("reserves added stock while pending, releases on no-cash cancel, and enforces retained vs archived/price-changed snapshots", async () => {
+      const capId = await createMerchProduct({
+        name: "Seal Cap",
+        unitPriceCentavos: 2000,
+        openingQuantity: 3,
+      });
+      const oldBagId = await createMerchProduct({
+        name: "Old Carry Bag",
+        unitPriceCentavos: 4000,
+        openingQuantity: 3,
+      });
+      ctx.clock.advance(5_000);
+      expect((await startDay(ctx, owner, { requestKey: "t3-day-3" })).status).toBe(201);
+      ctx.clock.advance(5_000);
+
+      // Sell 1x Seal Cap (2 left) + 2x Old Carry Bag (1 left)
+      const capSale = await saveSale(
+        cashier,
+        "t3-cap-sale",
+        [{ kind: "MERCHANDISE", productId: capId, quantity: 1 }],
+        2000,
+      );
+      const bagSale = await saveSale(
+        cashier,
+        "t3-bag-sale",
+        [{ kind: "MERCHANDISE", productId: oldBagId, quantity: 2 }],
+        8000,
+      );
+
+      // Prepare pending CORRECT increasing Seal Cap 1 -> 3 (reserves remaining 2)
+      ctx.clock.advance(5_000);
+      const prepAdd = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(capSale.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "CORRECT",
+          reason: "Customer added 2 more caps",
+          prepareKey: "t3-cap-add-prep",
+          items: [{ kind: "MERCHANDISE", productId: capId, quantity: 3 }],
+        });
+      expect(prepAdd.status).toBe(201);
+
+      // Pending reservation blocks another checkout for Seal Cap and blocks INV-009 reconcile below 2
+      const competingCheckout = await prepareCheckout(ctx, cashier, {
+        prepareKey: "t3-competing-cap",
+        items: [{ kind: "MERCHANDISE", productId: capId, quantity: 1 }],
+      });
+      expect(competingCheckout.status).toBe(409);
+      expect(competingCheckout.body.error.code).toBe("INSUFFICIENT_STOCK");
+
+      const invBeforeRec = await request(ctx.app).get("/api/inventory/items").set("Cookie", owner.cookie);
+      const capBeforeRec = invBeforeRec.body.items.find((i: { id: string }) => i.id === capId);
+      const blockedCapRec = await reconcileItem(capId, capBeforeRec, 1, "Below reserved", "t3-cap-rec-block");
+      expect(blockedCapRec.status).toBe(409);
+      expect(blockedCapRec.body.error.code).toBe("ACTIVE_PAYMENT_COMMITMENT");
+
+      // Cancelling no-cash releases the reservation so competing checkout can proceed
+      const cancelAdd = await request(ctx.app)
+        .post(`/api/pos/sale-actions/${encodeURIComponent(prepAdd.body.action.reference)}/cancel`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ noCashExchangedConfirmed: true, reason: "Customer declined extra caps" });
+      expect(cancelAdd.status).toBe(200);
+
+      // Raise Seal Cap price from ₱20 -> ₱30; archive Old Carry Bag
+      expect(
+        (
+          await request(ctx.app)
+            .patch(`/api/inventory/products/${capId}`)
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({ unitPriceCentavos: 3000 })
+        ).status,
+      ).toBe(200);
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/inventory/products/${oldBagId}/archive`)
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({})
+        ).status,
+      ).toBe(200);
+
+      // Adding new qty on archived Old Carry Bag fails, while retaining original qty 2 preserves ₱40 snapshot!
+      const blockedArchivedAdd = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(bagSale.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "CORRECT",
+          reason: "Try adding archived product",
+          prepareKey: "t3-bag-add-fail",
+          items: [{ kind: "MERCHANDISE", productId: oldBagId, quantity: 3 }],
+        });
+      expect(blockedArchivedAdd.status).toBe(409);
+      expect(blockedArchivedAdd.body.error.code).toBe("PRODUCT_UNAVAILABLE");
+
+      const retainArchivedOk = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(bagSale.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "CORRECT",
+          reason: "Add water refill while retaining archived bags",
+          prepareKey: "t3-bag-retain-ok",
+          items: [
+            { kind: "MERCHANDISE", productId: oldBagId, quantity: 2 },
+            { kind: "STANDARD", waterType: "PURIFIED", quantity: 1 },
+          ],
+        });
+      expect(retainArchivedOk.status).toBe(201);
+      expect(retainArchivedOk.body.action.correctedTotalCentavos).toBe(8000 + 2500);
+
+      // Correcting Seal Cap 1 -> 2 after price raise retains 1 @ ₱20 + adds 1 @ ₱30 = ₱50 (+₱30 collect)
+      const capPriceSplit = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(capSale.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "CORRECT",
+          reason: "Add 1 more cap at updated price",
+          prepareKey: "t3-cap-split-ok",
+          items: [{ kind: "MERCHANDISE", productId: capId, quantity: 2 }],
+        });
+      expect(capPriceSplit.status).toBe(201);
+      expect(capPriceSplit.body.action.correctedTotalCentavos).toBe(2000 + 3000);
+      expect(capPriceSplit.body.action.cashDifferenceCentavos).toBe(3000);
+      const confCap = await request(ctx.app)
+        .post(`/api/pos/sale-actions/${encodeURIComponent(capPriceSplit.body.action.reference)}/confirm`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ cashConfirmed: true, cashTenderedCentavos: 3000 });
+      expect(confCap.status).toBe(201);
+    });
+
+    it("protects pending items from counts, allows confirm re-review on same reference, and supports UNCOVERED and PARTIAL return coverage (Findings 2 & 4)", async () => {
+      const nozzleId = await createMerchProduct({
+        name: "Twist Nozzle",
+        unitPriceCentavos: 6000,
+        openingQuantity: 6,
+      });
+      ctx.clock.advance(5_000);
+      expect((await startDay(ctx, owner, { requestKey: "t3-day-4" })).status).toBe(201);
+      ctx.clock.advance(5_000);
+
+      const sale1 = await saveSale(
+        cashier,
+        "t3-cnt-sale1",
+        [{ kind: "MERCHANDISE", productId: nozzleId, quantity: 1 }],
+        6000,
+      );
+      const sale2 = await saveSale(
+        cashier,
+        "t3-cnt-sale2",
+        [{ kind: "MERCHANDISE", productId: nozzleId, quantity: 1 }],
+        6000,
+      );
+      const sale3 = await saveSale(
+        cashier,
+        "t3-cnt-sale3",
+        [{ kind: "MERCHANDISE", productId: nozzleId, quantity: 1 }],
+        6000,
+      );
+
+      // Prepare Void on sale3 -> Inventory physical count on Twist Nozzle is blocked (409 UNRESOLVED_SALE_ACTIONS)
+      ctx.clock.advance(5_000);
+      const prepSale3 = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(sale3.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "VOID",
+          reason: "Prepare before count",
+          prepareKey: "t3-stale-prep",
+          stockDispositions: [{ productId: nozzleId, eligibleReturnedQuantity: 1 }],
+        });
+      expect(prepSale3.status).toBe(201);
+
+      const invBeforePending = await request(ctx.app).get("/api/inventory/items").set("Cookie", owner.cookie);
+      const nozzleBeforePending = invBeforePending.body.items.find((i: { id: string }) => i.id === nozzleId);
+      const blockedPendingRec = await reconcileItem(
+        nozzleId,
+        nozzleBeforePending,
+        3,
+        "Attempted count during pending void",
+        "t3-cnt-blocked-pending",
+      );
+      expect(blockedPendingRec.status).toBe(409);
+      expect(blockedPendingRec.body.error.code).toBe("UNRESOLVED_SALE_ACTIONS");
+
+      // Simulate an intervening physical count arriving after prepare (e.g. direct/concurrent legacy count row)
+      // and confirm on the SAME pending reference re-verifies coverage without stranding cash refund or End Day.
+      ctx.clock.advance(5_000);
+      await ctx.db.query(
+        `INSERT INTO inventory_reconciliations (
+           item_id, request_key, balance_before, physical_count, quantity_delta,
+           balance_after, unit, reason, actor_user_id, recorded_at
+         )
+         VALUES ($1, 't3-cnt-rec1-direct', 3, 3, 0, 3, 'pcs', 'Midday count', $2, $3)`,
+        [nozzleId, (await ctx.db.query<{ id: string }>(`SELECT id FROM app_users WHERE role = 'OWNER' LIMIT 1`)).rows[0]!.id, ctx.clock.now()],
+      );
+
+      const needReviewConfirm = await request(ctx.app)
+        .post(`/api/pos/sale-actions/${encodeURIComponent(prepSale3.body.action.reference)}/confirm`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ cashConfirmed: true });
+      expect(needReviewConfirm.status).toBe(409);
+      expect(needReviewConfirm.body.error.code).toBe("INTERVENING_COUNT_REVIEW_REQUIRED");
+      expect(needReviewConfirm.body.staleStockCount).toBe(true);
+
+      const recoveredConfirm = await request(ctx.app)
+        .post(`/api/pos/sale-actions/${encodeURIComponent(prepSale3.body.action.reference)}/confirm`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          cashConfirmed: true,
+          stockDispositions: [
+            { productId: nozzleId, eligibleReturnedQuantity: 1, countCoverage: "COVERED_BY_COUNT" },
+          ],
+        });
+      expect(recoveredConfirm.status).toBe(201);
+      expect(recoveredConfirm.body.action.merchandisePlan.items[0]).toMatchObject({
+        restoredQuantity: 0,
+        countCoveredQuantity: 1,
+      });
+
+      // Voiding sale1 after rec1 without countCoverage returns 409 INTERVENING_COUNT_REVIEW_REQUIRED
+      ctx.clock.advance(5_000);
+      const promptReq = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(sale1.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "VOID",
+          reason: "Void after count",
+          prepareKey: "t3-cnt-uncovered",
+          stockDispositions: [{ productId: nozzleId, eligibleReturnedQuantity: 1 }],
+        });
+      expect(promptReq.status).toBe(409);
+      expect(promptReq.body.error.code).toBe("INTERVENING_COUNT_REVIEW_REQUIRED");
+      expect(promptReq.body.affectedItems[0]).toMatchObject({
+        productId: nozzleId,
+        returningQuantity: 1,
+        physicalCount: 3,
+      });
+
+      // Retry with UNCOVERED (Finding 4) -> restores +1 once (stock moves 3 -> 4)
+      const uncoveredPrep = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(sale1.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "VOID",
+          reason: "Void after count",
+          prepareKey: "t3-cnt-uncovered",
+          stockDispositions: [
+            { productId: nozzleId, eligibleReturnedQuantity: 1, countCoverage: "UNCOVERED" },
+          ],
+        });
+      expect(uncoveredPrep.status).toBe(201);
+      expect(uncoveredPrep.body.action.merchandisePlan.items[0]).toMatchObject({
+        restoredQuantity: 1,
+        countCoveredQuantity: 0,
+        unclearCoverageQuantity: 0,
+      });
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/sale-actions/${encodeURIComponent(uncoveredPrep.body.action.reference)}/confirm`)
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({ cashConfirmed: true })
+        ).status,
+      ).toBe(201);
+
+      // Void sale2 with UNCLEAR -> requiresInventoryReview = true, exposed in Inventory, cleared by subsequent count
+      ctx.clock.advance(5_000);
+      const unclearPrep = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(sale2.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "VOID",
+          reason: "Unsure if counted",
+          prepareKey: "t3-cnt-unclear",
+          stockDispositions: [
+            { productId: nozzleId, eligibleReturnedQuantity: 1, countCoverage: "UNCLEAR" },
+          ],
+        });
+      expect(unclearPrep.status).toBe(201);
+      expect(unclearPrep.body.action.merchandisePlan.requiresInventoryReview).toBe(true);
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/sale-actions/${encodeURIComponent(unclearPrep.body.action.reference)}/confirm`)
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({ cashConfirmed: true })
+        ).status,
+      ).toBe(201);
+
+      const invWithReview = await request(ctx.app).get("/api/inventory/items").set("Cookie", owner.cookie);
+      const nozzleReview = invWithReview.body.items.find((i: { id: string }) => i.id === nozzleId);
+      expect(nozzleReview.currentQuantity).toBe(4);
+      expect(nozzleReview.pendingStockReviews).toEqual([
+        expect.objectContaining({
+          saleActionReference: unclearPrep.body.action.reference,
+          itemId: nozzleId,
+          unclearQuantity: 1,
+        }),
+      ]);
+
+      // Subsequent INV-009 reconciliation clears pendingStockReviews cleanly and End Day succeeds
+      ctx.clock.advance(5_000);
+      const rec2 = await reconcileItem(
+        nozzleId,
+        nozzleReview,
+        5,
+        "Confirmed returned nozzle on shelf",
+        "t3-cnt-rec2",
+      );
+      expect(rec2.status).toBe(201);
+      const invAfterClear = await request(ctx.app).get("/api/inventory/items").set("Cookie", owner.cookie);
+      const nozzleCleared = invAfterClear.body.items.find((i: { id: string }) => i.id === nozzleId);
+      expect(nozzleCleared.currentQuantity).toBe(5);
+      expect(nozzleCleared.pendingStockReviews).toEqual([]);
+
+      const dayEnd = await endDay(ctx, owner, { requestKey: "t3-day-4-end" });
+      expect(dayEnd.status).toBe(200);
+    });
+
+    it("requires explicit dispositions, enforces filled-package INV-014/015 exclusions without fake holds, and preserves multi-snapshot faucet types at equal price (Findings 1, 3 & 4)", async () => {
+      const roundId = await initRoundContainer(6);
+      ctx.clock.advance(5_000);
+      const faucetId = await createMerchProduct({
+        name: "Dual Faucet",
+        unitPriceCentavos: 5000,
+        openingQuantity: 6,
+        faucetReportingType: "PUSH_TYPE",
+      });
+      ctx.clock.advance(5_000);
+      expect((await startDay(ctx, owner, { requestKey: "t3-day-5" })).status).toBe(201);
+      ctx.clock.advance(5_000);
+
+      // Finding 1: Voiding a filled container package without disposition or with eligibleReturnedQuantity > 0 is blocked; notReturnedQuantity keeps 0 holds and 0 restoration
+      const filledSale = await saveSale(
+        cashier,
+        "t3-f1-filled",
+        [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_PURIFIED",
+            includedGripo: "PUSH_TYPE",
+            quantity: 1,
+          },
+        ],
+        20000,
+      );
+
+      const silentRejected = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(filledSale.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ actionType: "VOID", reason: "Refund filled bottle without confirm", prepareKey: "t3-f1-silent" });
+      expect(silentRejected.status).toBe(400);
+
+      const filledRestoreRejected = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(filledSale.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "VOID",
+          reason: "Try auto-restoring filled container",
+          prepareKey: "t3-f1-bad-restore",
+          stockDispositions: [{ productId: roundId, eligibleReturnedQuantity: 1 }],
+        });
+      expect(filledRestoreRejected.status).toBe(400);
+
+      const notReturnedOk = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(filledSale.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "VOID",
+          reason: "Customer kept bottle / unreturned",
+          prepareKey: "t3-f1-not-returned",
+          stockDispositions: [{ productId: roundId, notReturnedQuantity: 1 }],
+        });
+      expect(notReturnedOk.status).toBe(201);
+      expect(notReturnedOk.body.action.merchandisePlan.items[0]).toMatchObject({
+        restoredQuantity: 0,
+        heldQuantity: 0,
+        notReturnedQuantity: 1,
+        returningFilledQuantity: 1,
+      });
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/sale-actions/${encodeURIComponent(notReturnedOk.body.action.reference)}/confirm`)
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({ cashConfirmed: true })
+        ).status,
+      ).toBe(201);
+
+      const invAfterF1 = await request(ctx.app).get("/api/inventory/items").set("Cookie", owner.cookie);
+      const roundAfterF1 = invAfterF1.body.items.find((i: { id: string }) => i.id === roundId);
+      expect(roundAfterF1).toMatchObject({
+        currentQuantity: 5,
+        availableQuantity: 5,
+        heldQuantity: 0,
+      });
+
+      // Finding 4: Partial return coverage after intervening count (2 empty Rounds -> 1 uncovered +1, 1 covered +0)
+      const twoEmptySale = await saveSale(
+        cashier,
+        "t3-f4-partial-sale",
+        [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_EMPTY",
+            includedGripo: "PUSH_TYPE",
+            quantity: 2,
+          },
+        ],
+        35000,
+      );
+      ctx.clock.advance(5_000);
+      const invBeforePartial = await request(ctx.app).get("/api/inventory/items").set("Cookie", owner.cookie);
+      const roundBeforePartial = invBeforePartial.body.items.find((i: { id: string }) => i.id === roundId);
+      expect(
+        (await reconcileItem("ROUND", roundBeforePartial, 3, "Count after empty sale", "t3-f4-rec")).status,
+      ).toBe(201);
+
+      ctx.clock.advance(5_000);
+      const partialPrep = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(twoEmptySale.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "VOID",
+          reason: "Partial count overlap on 2 empty containers",
+          prepareKey: "t3-f4-partial-void",
+          stockDispositions: [
+            {
+              productId: roundId,
+              eligibleReturnedQuantity: 2,
+              countCoverage: "PARTIAL",
+              uncoveredReturnedQuantity: 1,
+              coveredByCountQuantity: 1,
+              unclearCoverageQuantity: 0,
+            },
+          ],
+        });
+      expect(partialPrep.status).toBe(201);
+      expect(partialPrep.body.action.merchandisePlan.items[0]).toMatchObject({
+        restoredQuantity: 1,
+        countCoveredQuantity: 1,
+        unclearCoverageQuantity: 0,
+      });
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/sale-actions/${encodeURIComponent(partialPrep.body.action.reference)}/confirm`)
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({ cashConfirmed: true })
+        ).status,
+      ).toBe(201);
+      const invAfterPartial = await request(ctx.app).get("/api/inventory/items").set("Cookie", owner.cookie);
+      const roundAfterPartial = invAfterPartial.body.items.find((i: { id: string }) => i.id === roundId);
+      expect(roundAfterPartial.currentQuantity).toBe(4);
+
+      // Finding 3: Equal-price faucetReportingType update preserves retained line type & repeated corrections retain mixed snapshots
+      const faucetSale = await saveSale(
+        cashier,
+        "t3-f3-faucet1",
+        [{ kind: "MERCHANDISE", productId: faucetId, quantity: 1 }],
+        5000,
+      );
+      expect(
+        (
+          await request(ctx.app)
+            .patch(`/api/inventory/products/${faucetId}`)
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({ faucetReportingType: "TWIST_TYPE" })
+        ).status,
+      ).toBe(200);
+
+      const prepSplitSamePrice = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(faucetSale.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "CORRECT",
+          reason: "Add second faucet after reporting type update",
+          prepareKey: "t3-f3-corr1",
+          items: [{ kind: "MERCHANDISE", productId: faucetId, quantity: 2 }],
+        });
+      expect(prepSplitSamePrice.status).toBe(201);
+      expect(prepSplitSamePrice.body.action.correctedItems).toHaveLength(2);
+      expect(prepSplitSamePrice.body.action.correctedItems[0]).toMatchObject({
+        quantity: 1,
+        unitPriceCentavos: 5000,
+        faucetReportingType: "PUSH_TYPE",
+      });
+      expect(prepSplitSamePrice.body.action.correctedItems[1]).toMatchObject({
+        quantity: 1,
+        unitPriceCentavos: 5000,
+        faucetReportingType: "TWIST_TYPE",
+      });
+
+      const confSplit1 = await request(ctx.app)
+        .post(`/api/pos/sale-actions/${encodeURIComponent(prepSplitSamePrice.body.action.reference)}/confirm`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ cashConfirmed: true, cashTenderedCentavos: 5000 });
+      expect(confSplit1.status).toBe(201);
+      const replFaucetRef = confSplit1.body.replacementSale.reference as string;
+
+      // Second correction after a price raise preserves both earlier PUSH (₱50) and TWIST (₱50) lines, adding 1x @ ₱60
+      expect(
+        (
+          await request(ctx.app)
+            .patch(`/api/inventory/products/${faucetId}`)
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({ unitPriceCentavos: 6000 })
+        ).status,
+      ).toBe(200);
+      const prepSplitRepeat = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(replFaucetRef)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "CORRECT",
+          reason: "Add third faucet at new price",
+          prepareKey: "t3-f3-corr2",
+          items: [{ kind: "MERCHANDISE", productId: faucetId, quantity: 3 }],
+        });
+      expect(prepSplitRepeat.status).toBe(201);
+      expect(prepSplitRepeat.body.action.correctedItems).toHaveLength(3);
+      expect(prepSplitRepeat.body.action.correctedItems[0]).toMatchObject({
+        quantity: 1,
+        unitPriceCentavos: 5000,
+        faucetReportingType: "PUSH_TYPE",
+      });
+      expect(prepSplitRepeat.body.action.correctedItems[1]).toMatchObject({
+        quantity: 1,
+        unitPriceCentavos: 5000,
+        faucetReportingType: "TWIST_TYPE",
+      });
+      expect(prepSplitRepeat.body.action.correctedItems[2]).toMatchObject({
+        quantity: 1,
+        unitPriceCentavos: 6000,
+        faucetReportingType: "TWIST_TYPE",
+      });
+      expect(prepSplitRepeat.body.action.correctedTotalCentavos).toBe(16000);
+
+      // Cancel prepSplitRepeat so replFaucetRef stays clean, then test selected originalLineIndex removal
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/sale-actions/${encodeURIComponent(prepSplitRepeat.body.action.reference)}/cancel`)
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({ noCashExchangedConfirmed: true })
+        ).status,
+      ).toBe(200);
+
+      // Build a clean ₹120 replacement sale: Line 0 = 1x PUSH_TYPE @ ₱50, Line 1 = 1x TWIST_TYPE @ ₱70
+      const faucet2Id = await createMerchProduct({
+        name: "Mixed Price Faucet",
+        unitPriceCentavos: 5000,
+        openingQuantity: 4,
+        faucetReportingType: "PUSH_TYPE",
+      });
+      const mixedOrig = await saveSale(
+        cashier,
+        "t3-f3-mixed-orig",
+        [{ kind: "MERCHANDISE", productId: faucet2Id, quantity: 1 }],
+        5000,
+      );
+      expect(
+        (
+          await request(ctx.app)
+            .patch(`/api/inventory/products/${faucet2Id}`)
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({ unitPriceCentavos: 7000, faucetReportingType: "TWIST_TYPE" })
+        ).status,
+      ).toBe(200);
+      const mixedPrep1 = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(mixedOrig.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "CORRECT",
+          reason: "Add ₱70 twist faucet",
+          prepareKey: "t3-f3-mixed-p1",
+          items: [{ kind: "MERCHANDISE", productId: faucet2Id, quantity: 2 }],
+        });
+      expect(mixedPrep1.status).toBe(201);
+      const mixedConf1 = await request(ctx.app)
+        .post(`/api/pos/sale-actions/${encodeURIComponent(mixedPrep1.body.action.reference)}/confirm`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ cashConfirmed: true, cashTenderedCentavos: 7000 });
+      expect(mixedConf1.status).toBe(201);
+      const mixedReplRef = mixedConf1.body.replacementSale.reference as string;
+      expect(mixedConf1.body.replacementSale.totalCentavos).toBe(12000);
+
+      // Invalid originalLineIndex -> 400 VALIDATION_FAILED
+      const badIdx = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(mixedReplRef)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "CORRECT",
+          reason: "Invalid index check",
+          prepareKey: "t3-f3-bad-idx",
+          items: [{ kind: "MERCHANDISE", productId: faucet2Id, quantity: 1, originalLineIndex: 9 }],
+          stockDispositions: [{ productId: faucet2Id, eligibleReturnedQuantity: 1 }],
+        });
+      expect(badIdx.status).toBe(400);
+
+      // Removing ₱50 PUSH_TYPE line (keeping originalLineIndex: 1 = ₱70 TWIST_TYPE) refunds ₱50 and keeps ₱70 TWIST_TYPE
+      const remove50Prep = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(mixedReplRef)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "CORRECT",
+          reason: "Remove ₱50 Push-Type unit, keep ₱70 Twist-Type unit",
+          prepareKey: "t3-f3-rem-50",
+          items: [{ kind: "MERCHANDISE", productId: faucet2Id, quantity: 1, originalLineIndex: 1 }],
+          stockDispositions: [{ productId: faucet2Id, eligibleReturnedQuantity: 1 }],
+        });
+      expect(remove50Prep.status).toBe(201);
+      expect(remove50Prep.body.action.correctedTotalCentavos).toBe(7000);
+      expect(remove50Prep.body.action.cashDirection).toBe("REFUND");
+      expect(remove50Prep.body.action.cashDifferenceCentavos).toBe(-5000);
+      expect(remove50Prep.body.action.correctedItems).toEqual([
+        expect.objectContaining({
+          quantity: 1,
+          unitPriceCentavos: 7000,
+          faucetReportingType: "TWIST_TYPE",
+        }),
+      ]);
+
+      // Reusing prepareKey with originalLineIndex: 0 (₱50 line instead of ₱70 line) is rejected with 409 PAYLOAD_MISMATCH
+      const mismatchIdxReplay = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(mixedReplRef)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "CORRECT",
+          reason: "Remove ₱50 Push-Type unit, keep ₱70 Twist-Type unit",
+          prepareKey: "t3-f3-rem-50",
+          items: [{ kind: "MERCHANDISE", productId: faucet2Id, quantity: 1, originalLineIndex: 0 }],
+          stockDispositions: [{ productId: faucet2Id, eligibleReturnedQuantity: 1 }],
+        });
+      expect(mismatchIdxReplay.status).toBe(409);
+      expect(mismatchIdxReplay.body.error.code).toBe("PAYLOAD_MISMATCH");
+
+      // Cancel no-cash, then remove ₱70 TWIST_TYPE line (keeping originalLineIndex: 0 = ₱50 PUSH_TYPE) -> refunds ₱70 and keeps ₱50 PUSH_TYPE
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/sale-actions/${encodeURIComponent(remove50Prep.body.action.reference)}/cancel`)
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({ noCashExchangedConfirmed: true })
+        ).status,
+      ).toBe(200);
+
+      const remove70Prep = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(mixedReplRef)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "CORRECT",
+          reason: "Remove ₱70 Twist-Type unit, keep ₱50 Push-Type unit",
+          prepareKey: "t3-f3-rem-70",
+          items: [{ kind: "MERCHANDISE", productId: faucet2Id, quantity: 1, originalLineIndex: 0 }],
+          stockDispositions: [{ productId: faucet2Id, eligibleReturnedQuantity: 1 }],
+        });
+      expect(remove70Prep.status).toBe(201);
+      expect(remove70Prep.body.action.correctedTotalCentavos).toBe(5000);
+      expect(remove70Prep.body.action.cashDirection).toBe("REFUND");
+      expect(remove70Prep.body.action.cashDifferenceCentavos).toBe(-7000);
+      expect(remove70Prep.body.action.correctedItems).toEqual([
+        expect.objectContaining({
+          quantity: 1,
+          unitPriceCentavos: 5000,
+          faucetReportingType: "PUSH_TYPE",
+        }),
+      ]);
+      const remove70Conf = await request(ctx.app)
+        .post(`/api/pos/sale-actions/${encodeURIComponent(remove70Prep.body.action.reference)}/confirm`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ cashConfirmed: true });
+      expect(remove70Conf.status).toBe(201);
+      expect(remove70Conf.body.action.cashRefundedCentavos).toBe(7000);
+      expect(remove70Conf.body.replacementSale.items[0]).toMatchObject({
+        unitPriceCentavos: 5000,
+        faucetReportingType: "PUSH_TYPE",
+      });
+
+      // Exchange retry regression: sell ₱50 PUSH_TYPE, update to ₱70 TWIST_TYPE, exchange selected originalLineIndex: 0
+      const exchFaucetId = await createMerchProduct({
+        name: "Exchange Retry Faucet",
+        unitPriceCentavos: 5000,
+        openingQuantity: 3,
+        faucetReportingType: "PUSH_TYPE",
+      });
+      const exchOrig = await saveSale(
+        cashier,
+        "t3-f3-exch-orig",
+        [{ kind: "MERCHANDISE", productId: exchFaucetId, quantity: 1 }],
+        5000,
+      );
+      expect(
+        (
+          await request(ctx.app)
+            .patch(`/api/inventory/products/${exchFaucetId}`)
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({ unitPriceCentavos: 7000, faucetReportingType: "TWIST_TYPE" })
+        ).status,
+      ).toBe(200);
+
+      const exchPayload = {
+        actionType: "CORRECT",
+        reason: "Physical exchange for updated faucet",
+        prepareKey: "t3-f3-exch-retry",
+        items: [{ kind: "MERCHANDISE", productId: exchFaucetId, quantity: 1, originalLineIndex: 0 }],
+        stockDispositions: [
+          { productId: exchFaucetId, exchangedQuantity: 1, eligibleReturnedQuantity: 1 },
+        ],
+      };
+      const firstExch = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(exchOrig.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send(exchPayload);
+      expect(firstExch.status).toBe(201);
+      expect(firstExch.body.action.correctedTotalCentavos).toBe(7000);
+      expect(firstExch.body.action.cashDifferenceCentavos).toBe(2000);
+      expect(firstExch.body.action.correctedItems).toEqual([
+        expect.objectContaining({
+          quantity: 1,
+          unitPriceCentavos: 7000,
+          faucetReportingType: "TWIST_TYPE",
+        }),
+      ]);
+
+      // Identical retry with same prepareKey must replay cleanly and keep one reservation
+      const identicalRetry = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(exchOrig.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send(exchPayload);
+      expect(identicalRetry.status).toBe(200);
+      expect(identicalRetry.body.replayed).toBe(true);
+      expect(identicalRetry.body.action.reference).toBe(firstExch.body.action.reference);
+
+      const { rows: commitCount } = await ctx.db.query<{ count: string }>(
+        `SELECT COUNT(*)::text AS count
+           FROM pos_sale_action_stock_commitments c
+           JOIN pos_sale_action_requests r ON r.id = c.sale_action_id
+          WHERE r.reference = $1 AND c.status = 'ACTIVE'`,
+        [firstExch.body.action.reference],
+      );
+      expect(commitCount[0]!.count).toBe("1");
+
+      // Changing disposition (exchangedQuantity: 0) or removing originalLineIndex under same key must still return 409 PAYLOAD_MISMATCH
+      const changedDispositionRetry = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(exchOrig.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          ...exchPayload,
+          stockDispositions: [],
+        });
+      expect(changedDispositionRetry.status).toBe(409);
+      expect(changedDispositionRetry.body.error.code).toBe("PAYLOAD_MISMATCH");
+
+      const changedIndexRetry = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(exchOrig.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          ...exchPayload,
+          items: [{ kind: "MERCHANDISE", productId: exchFaucetId, quantity: 1 }],
+        });
+      expect(changedIndexRetry.status).toBe(409);
+      expect(changedIndexRetry.body.error.code).toBe("PAYLOAD_MISMATCH");
+    });
+  });
+
+  describe("Final POS Task 4 — End Day races & integrated reporting", () => {
+    async function initRound(stockQuantity: number) {
+      expect(
+        (
+          await request(ctx.app)
+            .patch("/api/inventory/containers/ROUND")
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({ showInPos: true })
+        ).status,
+      ).toBe(200);
+      const opening = await request(ctx.app)
+        .post("/api/inventory/items/ROUND/opening-stock")
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ quantity: stockQuantity });
+      expect(opening.status).toBe(201);
+      return opening.body.item.id as string;
+    }
+
+    async function initProduct(input: {
+      name: string;
+      unitPriceCentavos: number;
+      openingQuantity: number;
+      faucetReportingType?: "PUSH_TYPE" | "TWIST_TYPE" | null;
+    }) {
+      const created = await request(ctx.app)
+        .post("/api/inventory/products")
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          name: input.name,
+          unit: "pcs",
+          unitConfirmed: true,
+          unitPriceCentavos: input.unitPriceCentavos,
+          showInPos: true,
+          posSection: "TAKIP_ACCESSORIES",
+          faucetReportingType: input.faucetReportingType ?? null,
+        });
+      expect(created.status).toBe(201);
+      const id = created.body.item.id as string;
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/inventory/items/${id}/opening-stock`)
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({ quantity: input.openingQuantity })
+        ).status,
+      ).toBe(201);
+      return id;
+    }
+
+    async function saveSale(
+      actor: Parameters<typeof prepareCheckout>[1],
+      prepareKey: string,
+      items: unknown[],
+      cashReceivedCentavos: number,
+    ) {
+      const prep = await prepareCheckout(ctx, actor, { prepareKey, items });
+      expect(prep.status).toBe(201);
+      const conf = await confirmCheckout(
+        ctx.app,
+        actor,
+        prep.body.checkout.reference as string,
+        { cashReceivedCentavos },
+      );
+      expect(conf.status).toBe(201);
+      return conf.body.sale as {
+        reference: string;
+        totalCentavos: number;
+      };
+    }
+
+    it("serializes concurrent End Day against sale-action preparation without allowing both to commit", async () => {
+      expect((await startDay(ctx, owner, { requestKey: "t4-race1-day" })).status).toBe(201);
+      const sale = await saveSale(
+        cashier,
+        "t4-race1-sale",
+        [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 2 }],
+        5000,
+      );
+
+      const [endRes, prepRes] = await Promise.all([
+        endDay(ctx, owner, { requestKey: "t4-race1-end" }),
+        request(ctx.app)
+          .post(`/api/pos/sales/${encodeURIComponent(sale.reference)}/actions`)
+          .set("Cookie", owner.cookie)
+          .set("X-CSRF-Token", owner.csrfToken)
+          .send({
+            actionType: "VOID",
+            reason: "Concurrent prepare vs End Day",
+            prepareKey: "t4-race1-void",
+          }),
+      ]);
+
+      if (endRes.status === 200) {
+        expect(prepRes.status).toBe(409);
+        expect(prepRes.body.error.code).toBe("DAY_CLOSED");
+        expect(endRes.body.summary).toMatchObject({
+          validTransactionCount: 1,
+          totalSalesCentavos: 5000,
+        });
+      } else {
+        expect(endRes.status).toBe(409);
+        expect(endRes.body.error.code).toBe("UNRESOLVED_SALE_ACTIONS");
+        expect(prepRes.status).toBe(201);
+        expect(endRes.body.blockingSaleActions).toEqual([
+          expect.objectContaining({
+            reference: prepRes.body.action.reference,
+            originalSaleReference: sale.reference,
+          }),
+        ]);
+      }
+    });
+
+    it("serializes concurrent End Day against sale-action confirmation so active replacements count once", async () => {
+      expect((await startDay(ctx, owner, { requestKey: "t4-race2-day" })).status).toBe(201);
+      const sale = await saveSale(
+        cashier,
+        "t4-race2-sale",
+        [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 1 }],
+        5000,
+      );
+      const prep = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(sale.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "CORRECT",
+          reason: "Upgrade to 2 refills",
+          prepareKey: "t4-race2-corr",
+          items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 2 }],
+        });
+      expect(prep.status).toBe(201);
+      const actionRef = prep.body.action.reference as string;
+
+      const [endRes, confRes] = await Promise.all([
+        endDay(ctx, owner, { requestKey: "t4-race2-end-1" }),
+        request(ctx.app)
+          .post(`/api/pos/sale-actions/${encodeURIComponent(actionRef)}/confirm`)
+          .set("Cookie", owner.cookie)
+          .set("X-CSRF-Token", owner.csrfToken)
+          .send({ cashConfirmed: true, cashTenderedCentavos: 5000 }),
+      ]);
+
+      expect(confRes.status).toBe(201);
+      if (endRes.status === 200) {
+        expect(endRes.body.summary).toMatchObject({
+          validTransactionCount: 1,
+          totalSalesCentavos: 5000,
+          voidedCount: 1,
+          voidedTotalCentavos: 2500,
+        });
+      } else {
+        expect(endRes.status).toBe(409);
+        expect(endRes.body.error.code).toBe("UNRESOLVED_SALE_ACTIONS");
+        const finalEnd = await endDay(ctx, owner, { requestKey: "t4-race2-end-2" });
+        expect(finalEnd.status).toBe(200);
+        expect(finalEnd.body.summary).toMatchObject({
+          validTransactionCount: 1,
+          totalSalesCentavos: 5000,
+          voidedCount: 1,
+          voidedTotalCentavos: 2500,
+        });
+      }
+    });
+
+    it("reconciles End Day, Dashboard Sales, Container/Faucet breakdowns, prior-day settlements, and Stock Trend across all movement types", async () => {
+      const roundId = await initRound(5);
+      ctx.clock.advance(5_000);
+      const pushId = await initProduct({
+        name: "Push Faucet Pro",
+        unitPriceCentavos: 4000,
+        openingQuantity: 5,
+        faucetReportingType: "PUSH_TYPE",
+      });
+      ctx.clock.advance(5_000);
+      const twistId = await initProduct({
+        name: "Twist Faucet Pro",
+        unitPriceCentavos: 6000,
+        openingQuantity: 5,
+        faucetReportingType: "TWIST_TYPE",
+      });
+      ctx.clock.advance(5_000);
+      expect((await startDay(ctx, owner, { requestKey: "t4-int-day1" })).status).toBe(201);
+      ctx.clock.advance(5_000);
+
+      // Sale A: 1x ROUND_PURIFIED (25 L, ₱200, included Push gripo) + 1x standalone Push Faucet (₱40) = ₱240
+      const saleA = await saveSale(
+        cashier,
+        "t4-int-sale-a",
+        [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_PURIFIED",
+            includedGripo: "PUSH_TYPE",
+            quantity: 1,
+          },
+          { kind: "MERCHANDISE", productId: pushId, quantity: 1 },
+        ],
+        30000,
+      );
+      expect(saleA.totalCentavos).toBe(24000);
+
+      // Correct Sale A -> 1x ROUND_ALKALINE (25 L, ₱210, retained same container) + 1x standalone Twist Faucet (₱60, returning Push Faucet) = ₱270
+      ctx.clock.advance(5_000);
+      const prepCorrA = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(saleA.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "CORRECT",
+          reason: "Switch to Alkaline container package and Twist Faucet",
+          prepareKey: "t4-int-corr-a",
+          items: [
+            {
+              kind: "CONTAINER_PACKAGE",
+              packageCode: "ROUND_ALKALINE",
+              includedGripo: "PUSH_TYPE",
+              quantity: 1,
+            },
+            { kind: "MERCHANDISE", productId: twistId, quantity: 1 },
+          ],
+          stockDispositions: [{ productId: pushId, eligibleReturnedQuantity: 1 }],
+        });
+      expect(prepCorrA.status).toBe(201);
+      const confCorrA = await request(ctx.app)
+        .post(`/api/pos/sale-actions/${encodeURIComponent(prepCorrA.body.action.reference)}/confirm`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ cashConfirmed: true, cashTenderedCentavos: 5000 });
+      expect(confCorrA.status).toBe(201);
+
+      // Sale B: 2x Standard Purified Refill (₱50), then Void Sale B
+      ctx.clock.advance(5_000);
+      const saleB = await saveSale(
+        cashier,
+        "t4-int-sale-b",
+        [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 2 }],
+        5000,
+      );
+      ctx.clock.advance(5_000);
+      const prepVoidB = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(saleB.reference)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "VOID",
+          reason: "Cancelled refill",
+          prepareKey: "t4-int-void-b",
+        });
+      expect(prepVoidB.status).toBe(201);
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/sale-actions/${encodeURIComponent(prepVoidB.body.action.reference)}/confirm`)
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({ cashConfirmed: true })
+        ).status,
+      ).toBe(201);
+
+      // Leave one Day 1 merchandise-only checkout PAYMENT_PENDING across Manila midnight
+      ctx.clock.advance(5_000);
+      const pendingMerch = await prepareCheckout(ctx, cashier, {
+        prepareKey: "t4-int-prior-merch",
+        items: [{ kind: "MERCHANDISE", productId: twistId, quantity: 1 }],
+      });
+      expect(pendingMerch.status).toBe(201);
+      const pendingRef = pendingMerch.body.checkout.reference as string;
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/pos/checkouts/${encodeURIComponent(pendingRef)}/begin-payment`)
+            .set("Cookie", cashier.cookie)
+            .set("X-CSRF-Token", cashier.csrfToken)
+            .send({})
+        ).status,
+      ).toBe(200);
+
+      // Advance past Manila midnight to Day 2 (2026-11-10) and re-authenticate expired session
+      ctx.clock.set("2026-11-10T09:00:00+08:00");
+      const ownerDay2 = await reauth(ctx, "owner1", owner);
+      // Run INV-009 physical count reconciliation on Push Faucet (5 -> 4) before closing Day 1
+      const invBeforeRec = await request(ctx.app).get("/api/inventory/items").set("Cookie", ownerDay2.cookie);
+      expect(invBeforeRec.status).toBe(200);
+      const pushInvBefore = invBeforeRec.body.items.find((i: { id: string }) => i.id === pushId);
+      expect(
+        (
+          await request(ctx.app)
+            .post(`/api/inventory/items/${pushId}/reconciliations`)
+            .set("Cookie", ownerDay2.cookie)
+            .set("X-CSRF-Token", ownerDay2.csrfToken)
+            .send({
+              physicalCount: 4,
+              reason: "Sample physical count adjustment",
+              expectedRevision: pushInvBefore.stockRevision,
+              expectedCurrentQuantity: pushInvBefore.currentQuantity,
+              requestKey: "t4-int-rec-push",
+            })
+        ).status,
+      ).toBe(201);
+
+      // Settle Day 1's merchandise-only prior-day checkout on Day 2 (2026-11-10) before closing Day 1
+      ctx.clock.advance(5_000);
+      const settlePrior = await request(ctx.app)
+        .post(`/api/pos/checkouts/${encodeURIComponent(pendingRef)}/settle`)
+        .set("Cookie", ownerDay2.cookie)
+        .set("X-CSRF-Token", ownerDay2.csrfToken)
+        .send({
+          paymentKeptConfirmed: true,
+          itemsHandedOverConfirmed: true,
+        });
+      expect(settlePrior.status).toBe(201);
+
+      // End Day 1 late on Day 2: summary keeps only Day 1's Active replacement (₱270, 25 L Alkaline) + 2 voided originals (₱240 + ₱50)
+      ctx.clock.advance(5_000);
+      const closeDay1 = await endDay(ctx, ownerDay2, { requestKey: "t4-int-end-day1" });
+      expect(closeDay1.status).toBe(200);
+      expect(closeDay1.body.summary).toMatchObject({
+        businessDate: "2026-11-09",
+        totalSalesCentavos: 27000,
+        validTransactionCount: 1,
+        purifiedQuantity: 0,
+        alkalineQuantity: 1,
+        purifiedVolumeMl: 0,
+        alkalineVolumeMl: 25000,
+        voidedCount: 2,
+        voidedTotalCentavos: 29000,
+      });
+
+      // Start Day 2 and re-verify Day 1's closed snapshot stays preserved and prior-day settlement appears separately on Day 2
+      ctx.clock.advance(5_000);
+      expect((await startDay(ctx, ownerDay2, { requestKey: "t4-int-start-day2" })).status).toBe(201);
+
+      const dashDay1 = await request(ctx.app)
+        .get("/api/dashboard/sales?period=custom&from=2026-11-09&to=2026-11-09")
+        .set("Cookie", ownerDay2.cookie);
+      expect(dashDay1.status).toBe(200);
+      expect(dashDay1.body.totals).toEqual({
+        salesCentavos: 27000,
+        containersRefilled: 0,
+        waterVolumeMl: 25000,
+        transactions: 1,
+      });
+      expect(dashDay1.body.priorDaySettlements).toEqual([]);
+      expect(dashDay1.body.containerSales).toMatchObject({
+        totalUnits: 1,
+        totalSalesCentavos: 21000,
+      });
+      expect(dashDay1.body.faucetSales).toMatchObject({
+        totalUnits: 1,
+        totalSalesCentavos: 6000,
+        leader: "TWIST_TYPE",
+      });
+
+      const dashDay2 = await request(ctx.app)
+        .get("/api/dashboard/sales?period=today")
+        .set("Cookie", ownerDay2.cookie);
+      expect(dashDay2.status).toBe(200);
+      expect(dashDay2.body.totals).toEqual({
+        salesCentavos: 0,
+        containersRefilled: 0,
+        waterVolumeMl: 0,
+        transactions: 0,
+      });
+      expect(dashDay2.body.priorDaySettlements).toHaveLength(1);
+      expect(dashDay2.body.priorDaySettlements[0].netAmountKeptCentavos).toBe(6000);
+
+      // Verify COMPLETE Stock Trend chains across all movement types (OPENING_COUNT, POS_SALE, SALE_ACTION_RESTORATION, SALE_ACTION_DEDUCTION, PRIOR_DAY_SETTLEMENT, PHYSICAL_COUNT_RECONCILIATION)
+      const [pushTrend, twistTrend, roundTrend] = await Promise.all([
+        request(ctx.app).get(`/api/dashboard/stocks/${pushId}/trend`).set("Cookie", ownerDay2.cookie),
+        request(ctx.app).get(`/api/dashboard/stocks/${twistId}/trend`).set("Cookie", ownerDay2.cookie),
+        request(ctx.app).get(`/api/dashboard/stocks/${roundId}/trend`).set("Cookie", ownerDay2.cookie),
+      ]);
+      expect(pushTrend.status).toBe(200);
+      expect(pushTrend.body.historyState).toBe("COMPLETE");
+      expect(pushTrend.body.points.map((p: { movementType: string }) => p.movementType)).toEqual([
+        "OPENING_COUNT",
+        "POS_SALE",
+        "SALE_ACTION_RESTORATION",
+        "PHYSICAL_COUNT_RECONCILIATION",
+      ]);
+
+      expect(twistTrend.status).toBe(200);
+      expect(twistTrend.body.historyState).toBe("COMPLETE");
+      expect(twistTrend.body.points.map((p: { movementType: string }) => p.movementType)).toEqual([
+        "OPENING_COUNT",
+        "SALE_ACTION_DEDUCTION",
+        "PRIOR_DAY_SETTLEMENT",
+      ]);
+
+      expect(roundTrend.status).toBe(200);
+      expect(roundTrend.body.historyState).toBe("COMPLETE");
+      expect(roundTrend.body.points.map((p: { movementType: string }) => p.movementType)).toEqual([
+        "OPENING_COUNT",
+        "POS_SALE",
+      ]);
     });
   });
 });

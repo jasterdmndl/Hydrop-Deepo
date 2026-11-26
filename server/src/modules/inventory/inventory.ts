@@ -76,6 +76,31 @@ export interface StockReconciliationView {
   recordedAt: string;
 }
 
+export interface InventoryStockHoldView {
+  id: string;
+  itemId: string;
+  quantity: number;
+  unit: string;
+  reason: string;
+  sourceKind: "CHECKOUT_REFUND" | "CHECKOUT_CANCEL" | "SALE_ACTION";
+  reducesAvailability: boolean;
+  posReference: string;
+  recordedBy: string;
+  recordedAt: string;
+}
+
+export interface PendingSaleActionStockReviewView {
+  saleActionReference: string;
+  originalSaleReference: string;
+  actionType: "VOID" | "CORRECT";
+  itemId: string;
+  itemName: string;
+  unclearQuantity: number;
+  unit: string;
+  interveningReconciliationAt: string | null;
+  completedAt: string;
+}
+
 export interface InventoryItemView {
   id: string;
   code: string;
@@ -91,6 +116,10 @@ export interface InventoryItemView {
   faucetReportingType: FaucetReportingType | null;
   status: OpeningStockStatus;
   currentQuantity: number | null;
+  heldQuantity: number;
+  availableQuantity: number | null;
+  activeHolds: InventoryStockHoldView[];
+  pendingStockReviews: PendingSaleActionStockReviewView[];
   stockRevision: number;
   openingStock: OpeningStockRecord | null;
   latestReconciliation: StockReconciliationView | null;

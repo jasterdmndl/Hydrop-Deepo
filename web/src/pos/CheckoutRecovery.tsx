@@ -1,11 +1,19 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { type NoticeEnvelope } from "../notifications/noticeTiming";
 import { TemporaryNotice } from "../notifications/TemporaryNotice";
 import {
+  aggregateCheckoutProductsForHold,
+  buildInitialHoldDrafts,
+  evaluateHoldDisposition,
+  type HoldDraftState,
+} from "./checkoutResolution";
+import { FilledHoldDispositionEditor } from "./FilledHoldDispositionEditor";
+import {
+  type CheckoutResolutionView,
+  classifyCheckoutComposition,
   formatCentavos,
   formatLiters,
   formatManilaTimestamp,
-  isPriorDayMerchandiseOnly,
   type PendingCheckoutRecovery,
   type PriorDaySettlementView,
   reconcileRecoveryTodayDate,
@@ -33,9 +41,18 @@ export interface CheckoutRecoveryProps {
   onContinueSaved(reference: string, sale: SaleView): void;
   onViewSavedReceipt?: (reference: string, sale: SaleView) => void;
   onOpenPriorDaySettle?: (record: PendingCheckoutRecovery) => void;
+  onOpenResolveNoCash?: (record: PendingCheckoutRecovery) => void;
+  onOpenResolveFullRefund?: (record: PendingCheckoutRecovery) => void;
   onContinueSettled?: (reference: string, settlement: PriorDaySettlementView) => void;
+  onContinueResolved?: (reference: string, resolution: CheckoutResolutionView) => void;
   onDismissCancelled?: (reference: string) => void;
-  onCancelUnpaid?: (reference: string) => void;
+  onCancelUnpaid?: (
+    reference: string,
+    options?: {
+      heldItems?: Array<{ productId: string; quantity: number; reason: string }>;
+      noFilledUnitsHeldConfirmed?: boolean;
+    },
+  ) => void;
   onCloseServerInspection?: () => void;
 }
 
@@ -118,7 +135,10 @@ export function CheckoutRecovery({
   onContinueSaved,
   onViewSavedReceipt,
   onOpenPriorDaySettle,
+  onOpenResolveNoCash,
+  onOpenResolveFullRefund,
   onContinueSettled,
+  onContinueResolved,
   onDismissCancelled,
   onCancelUnpaid,
   onCloseServerInspection,
@@ -132,11 +152,84 @@ export function CheckoutRecovery({
   );
   const [confirmNoCashCancelled, setConfirmNoCashCancelled] = useState(false);
   const [confirmNoCashUnpaid, setConfirmNoCashUnpaid] = useState(false);
+  const unpaidFilledProducts = useMemo(
+    () =>
+      aggregateCheckoutProductsForHold(presentation.amounts.items).filter(
+        (p) => p.filledQuantity > 0,
+      ),
+    [presentation.amounts.items],
+  );
+  const [unpaidHoldDrafts, setUnpaidHoldDrafts] = useState<Record<string, HoldDraftState>>(() =>
+    buildInitialHoldDrafts(unpaidFilledProducts),
+  );
+  const [unpaidHoldVerified, setUnpaidHoldVerified] = useState(false);
+  const unpaidHoldEval = useMemo(
+    () => evaluateHoldDisposition(unpaidFilledProducts, unpaidHoldDrafts, unpaidHoldVerified),
+    [unpaidFilledProducts, unpaidHoldDrafts, unpaidHoldVerified],
+  );
 
   useEffect(() => {
     setConfirmNoCashCancelled(false);
     setConfirmNoCashUnpaid(false);
-  }, [record.reference, presentation.screen]);
+    setUnpaidHoldDrafts(buildInitialHoldDrafts(unpaidFilledProducts));
+    setUnpaidHoldVerified(false);
+  }, [record.reference, presentation.screen, unpaidFilledProducts]);
+
+  function renderCancelUnpaidBox() {
+    if (!onCancelUnpaid) return null;
+    return (
+      <div className="cancel-unpaid-box">
+        {unpaidFilledProducts.length > 0 && (
+          <FilledHoldDispositionEditor
+            idPrefix={`recovery-${record.reference}`}
+            products={unpaidFilledProducts}
+            drafts={unpaidHoldDrafts}
+            verified={unpaidHoldVerified}
+            disabled={checking || retrying || cancellingUnpaid}
+            onChangeDrafts={setUnpaidHoldDrafts}
+            onChangeVerified={setUnpaidHoldVerified}
+          />
+        )}
+        <label className="checkbox-field">
+          <input
+            type="checkbox"
+            checked={confirmNoCashUnpaid}
+            disabled={checking || retrying || cancellingUnpaid}
+            onChange={(event) => setConfirmNoCashUnpaid(event.target.checked)}
+          />
+          <span>Confirm no cash was received from the customer</span>
+        </label>
+        <button
+          type="button"
+          className="button button--ghost button--block"
+          disabled={
+            !confirmNoCashUnpaid ||
+            (unpaidFilledProducts.length > 0 && !unpaidHoldEval.valid) ||
+            checking ||
+            retrying ||
+            cancellingUnpaid
+          }
+          onClick={() =>
+            onCancelUnpaid(
+              record.reference,
+              unpaidFilledProducts.length === 0
+                ? undefined
+                : {
+                    ...(unpaidHoldEval.heldItems.length > 0
+                      ? { heldItems: unpaidHoldEval.heldItems }
+                      : {}),
+                    ...(unpaidHoldEval.needsNoFilledConfirmed
+                      ? { noFilledUnitsHeldConfirmed: true }
+                      : {}),
+                  },
+            )
+          }
+        >
+          {cancellingUnpaid ? "Cancelling unpaid checkout…" : "Cancel unpaid checkout"}
+        </button>
+      </div>
+    );
+  }
 
   return (
     <div className="pos-layout">
@@ -214,6 +307,25 @@ export function CheckoutRecovery({
                   <dt>Settled by</dt>
                   <dd>{presentation.settlement.settledBy}</dd>
                 </div>
+              </>
+            )}
+            {presentation.resolution && (
+              <>
+                <div className="detail-list__row">
+                  <dt>Resolution date (Manila)</dt>
+                  <dd>{presentation.resolution.resolutionDate}</dd>
+                </div>
+                <div className="detail-list__row">
+                  <dt>Resolved by</dt>
+                  <dd>{presentation.resolution.resolvedBy}</dd>
+                </div>
+                {presentation.resolution.outcome === "FULL_REFUND" &&
+                  presentation.resolution.refundedAmountCentavos !== null && (
+                    <div className="detail-list__row">
+                      <dt>Refunded amount</dt>
+                      <dd>{formatCentavos(presentation.resolution.refundedAmountCentavos)}</dd>
+                    </div>
+                  )}
               </>
             )}
             <div className="detail-list__row">
@@ -336,27 +448,17 @@ export function CheckoutRecovery({
                 </button>
                 {presentation.needsOriginalBrowserForRetry &&
                   presentation.canCancelUnpaid &&
-                  onCancelUnpaid && (
-                    <div className="cancel-unpaid-box">
-                      <label className="checkbox-field">
-                        <input
-                          type="checkbox"
-                          checked={confirmNoCashUnpaid}
-                          disabled={checking || retrying || cancellingUnpaid}
-                          onChange={(event) => setConfirmNoCashUnpaid(event.target.checked)}
-                        />
-                        <span>Confirm no cash was received from the customer</span>
-                      </label>
-                      <button
-                        type="button"
-                        className="button button--ghost button--block"
-                        disabled={!confirmNoCashUnpaid || checking || retrying || cancellingUnpaid}
-                        onClick={() => onCancelUnpaid(record.reference)}
-                      >
-                        {cancellingUnpaid ? "Cancelling unpaid checkout…" : "Cancel unpaid checkout"}
-                      </button>
-                    </div>
-                  )}
+                  renderCancelUnpaidBox()}
+                {presentation.canResolveFullRefund && onOpenResolveFullRefund && (
+                  <button
+                    type="button"
+                    className="button button--ghost button--block"
+                    disabled={checking || retrying || cancellingUnpaid}
+                    onClick={() => onOpenResolveFullRefund(record)}
+                  >
+                    Record full refund (undelivered)
+                  </button>
+                )}
                 {presentation.needsOriginalBrowserForRetry && onCloseServerInspection && (
                   <button
                     type="button"
@@ -370,8 +472,22 @@ export function CheckoutRecovery({
               </>
             )}
 
+            {presentation.screen === "UNKNOWN" &&
+              presentation.canResolveFullRefund &&
+              onOpenResolveFullRefund && (
+                <button
+                  type="button"
+                  className="button button--ghost button--block"
+                  disabled={checking || retrying}
+                  onClick={() => onOpenResolveFullRefund(record)}
+                >
+                  Record full refund (undelivered)
+                </button>
+              )}
+
             {presentation.screen === "REVIEW_REQUIRED" && (
               <>
+                {presentation.canCancelUnpaid && renderCancelUnpaidBox()}
                 {presentation.canSettlePriorDay && onOpenPriorDaySettle && (
                   <button
                     type="button"
@@ -379,9 +495,32 @@ export function CheckoutRecovery({
                     disabled={checking || retrying}
                     onClick={() => onOpenPriorDaySettle(record)}
                   >
-                    {isPriorDayMerchandiseOnly(presentation.amounts.items)
-                      ? "Review & settle prior-day merchandise"
-                      : "Review & settle prior-day refill"}
+                    {(() => {
+                      const comp = classifyCheckoutComposition(presentation.amounts.items);
+                      if (comp === "MIXED") return "Review & settle prior-day mixed order";
+                      if (comp === "MERCHANDISE_ONLY") return "Review & settle prior-day merchandise";
+                      return "Review & settle prior-day refill";
+                    })()}
+                  </button>
+                )}
+                {presentation.canResolveNoCashPriorDay && onOpenResolveNoCash && (
+                  <button
+                    type="button"
+                    className="button button--ghost button--block"
+                    disabled={checking || retrying}
+                    onClick={() => onOpenResolveNoCash(record)}
+                  >
+                    Cancel prior-day checkout (no cash)
+                  </button>
+                )}
+                {presentation.canResolveFullRefund && onOpenResolveFullRefund && (
+                  <button
+                    type="button"
+                    className="button button--ghost button--block"
+                    disabled={checking || retrying}
+                    onClick={() => onOpenResolveFullRefund(record)}
+                  >
+                    Record full refund (undelivered)
                   </button>
                 )}
                 <button
@@ -404,11 +543,13 @@ export function CheckoutRecovery({
                   </button>
                 )}
                 <p className="muted-sm">
-                  {currentUserRole === "CASHIER" &&
-                  effectiveTodayDate &&
-                  record.businessDate < effectiveTodayDate
-                    ? "Keep this reference for Owner review. Only the Owner can settle a confirmed paid-and-delivered prior-day checkout; other outcomes remain pending."
-                    : "Keep this reference for Owner review. Automated refunds and backdated sales are not performed in this version."}
+                  {presentation.canCancelUnpaid
+                    ? "Record the filled-container disposition and confirm no cash was received above to cancel this unpaid draft so the station day can close."
+                    : currentUserRole === "CASHIER" &&
+                        effectiveTodayDate &&
+                        record.businessDate < effectiveTodayDate
+                      ? "Keep this reference for Owner review. Only the Owner can settle or resolve a prior-day checkout; partial and uncertain outcomes remain pending."
+                      : "Keep this reference for Owner review. Leave partial or uncertain outcomes pending."}
                 </p>
               </>
             )}
@@ -423,6 +564,36 @@ export function CheckoutRecovery({
                 >
                   Continue with settled record
                 </button>
+              )}
+
+            {(presentation.screen === "CANCELLED_NO_CASH" ||
+              presentation.screen === "REFUNDED_UNSAVED") &&
+              presentation.resolution &&
+              onContinueResolved && (
+                <>
+                  {presentation.resolution.heldItems.length > 0 && (
+                    <div className="callout callout--warning" role="status">
+                      <p className="callout__title">Held / unavailable stock recorded</p>
+                      <ul className="conflict-list">
+                        {presentation.resolution.heldItems.map((hold) => (
+                          <li key={hold.id}>
+                            <strong>
+                              {hold.quantity} {hold.unit}
+                            </strong>{" "}
+                            {hold.itemName} — {hold.reason}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  <button
+                    type="button"
+                    className="button button--primary button--block"
+                    onClick={() => onContinueResolved(record.reference, presentation.resolution!)}
+                  >
+                    Return to New Sale
+                  </button>
+                </>
               )}
 
             {presentation.screen === "CANCELLED" &&

@@ -1,6 +1,19 @@
 import type { Queryable } from "../../db/database.js";
 import {
+  deriveCashDirection,
+  formatSaleActionReference,
+  type SaleActionInterveningCount,
+  type SaleActionMerchandisePlan,
+  type SaleActionMerchandisePlanItem,
+  type SaleActionRequestView,
+  type SaleActionStatus,
+  type SaleActionType,
+  type SaleCashEventChain,
+} from "./saleActions.js";
+import {
   aggregateMerchandiseDemand,
+  type CheckoutHoldView,
+  type CheckoutResolutionView,
   type CheckoutStatus,
   type CheckoutView,
   type CatalogRefill,
@@ -45,6 +58,7 @@ export interface MerchandiseCatalogDbRow {
   faucetReportingType: FaucetReportingType | null;
   currentQuantity: number | string | null;
   activeCommitted: number | string;
+  activeHeld: number | string;
 }
 
 export interface LockedMerchandiseItem {
@@ -62,6 +76,7 @@ export interface LockedMerchandiseItem {
   currentQuantity: number | null;
   archivedAt: string | null;
   otherActiveCommitted: number;
+  activeHeld: number;
 }
 
 export interface DayDbRow {
@@ -114,8 +129,8 @@ export interface CheckoutDbRow {
 interface SaleDbRow {
   id: string;
   reference: string;
-  checkoutId: string;
-  checkoutReference: string;
+  checkoutId: string | null;
+  checkoutReference: string | null;
   businessDayId: string;
   businessDate: string;
   status: SaleStatus;
@@ -127,6 +142,44 @@ interface SaleDbRow {
   createdByUserId: string;
   createdByUsername: string;
   createdAt: Date | string;
+  correctedFromSaleReference: string | null;
+  replacedBySaleReference: string | null;
+}
+
+export interface SaleActionRequestDbRow {
+  id: string;
+  reference: string;
+  prepareKey: string | null;
+  originalSaleId: string;
+  originalSaleReference: string;
+  originalSaleIsReplacement: boolean;
+  originalBusinessDayId: string;
+  originalBusinessDate: string;
+  actionType: SaleActionType;
+  status: SaleActionStatus;
+  reason: string;
+  originalTotalCentavos: number | string;
+  originalCashReceivedCentavos: number | string;
+  originalChangeCentavos: number | string;
+  correctedTotalCentavos: number | string;
+  cashDifferenceCentavos: number | string;
+  correctedItemsSnapshot: unknown;
+  merchandisePlan: unknown;
+  cashTenderedCentavos: number | string | null;
+  cashChangeCentavos: number | string | null;
+  cashRefundedCentavos: number | string | null;
+  replacementSaleId: string | null;
+  replacementSaleReference: string | null;
+  createdByUserId: string;
+  createdByUsername: string;
+  createdAt: Date | string;
+  completedByUsername: string | null;
+  completedAt: Date | string | null;
+  cancelledByUsername: string | null;
+  cancelledAt: Date | string | null;
+  cancelReason: string | null;
+  updatedAt: Date | string;
+  dayClosedAt: Date | string | null;
 }
 
 interface SaleItemDbRow {
@@ -175,8 +228,30 @@ interface PriorDaySettlementDbRow {
   originalPaymentRecordedAt: Date | string | null;
   paymentKeptConfirmed: boolean;
   refillDeliveredConfirmed: boolean;
+  itemsHandedOverConfirmed: boolean;
   settledByUsername: string;
   settledAt: Date | string;
+  note: string | null;
+}
+
+interface CheckoutResolutionDbRow {
+  id: string;
+  checkoutId: string;
+  checkoutReference: string;
+  originalBusinessDayId: string;
+  originalBusinessDate: string;
+  resolutionDate: string;
+  outcome: "NO_CASH_CANCELLED" | "FULL_REFUND";
+  quoteTotalCentavos: number | string;
+  cashReceivedCentavos: number | string | null;
+  changeAlreadyGiven: boolean | null;
+  changeGivenCentavos: number | string | null;
+  refundedAmountCentavos: number | string | null;
+  itemsSnapshot: unknown;
+  originalActorUsername: string;
+  resolvedByUsername: string;
+  resolvedAt: Date | string;
+  reason: string;
   note: string | null;
 }
 
@@ -206,8 +281,9 @@ export function toCatalogRefill(row: CatalogDbRow): CatalogRefill {
 export function toPosMerchandiseItem(row: MerchandiseCatalogDbRow): PosMerchandiseItem {
   const currentQuantity = row.currentQuantity === null ? null : Number(row.currentQuantity);
   const activeCommitted = Number(row.activeCommitted ?? 0);
+  const activeHeld = Number(row.activeHeld ?? 0);
   const availableQuantity =
-    currentQuantity === null ? null : Math.max(0, currentQuantity - activeCommitted);
+    currentQuantity === null ? null : Math.max(0, currentQuantity - activeCommitted - activeHeld);
   const stockStatus =
     currentQuantity === null
       ? "NOT_SET"
@@ -312,10 +388,38 @@ export function toPriorDaySettlementView(row: PriorDaySettlementDbRow): PriorDay
       ? formatManilaIso(toDate(row.originalPaymentRecordedAt))
       : null,
     paymentKeptConfirmed: true,
-    refillDeliveredConfirmed: true,
+    refillDeliveredConfirmed: Boolean(row.refillDeliveredConfirmed),
+    itemsHandedOverConfirmed: Boolean(row.itemsHandedOverConfirmed),
     settledBy: row.settledByUsername,
     settledAt: formatManilaIso(toDate(row.settledAt)),
     note: row.note,
+  };
+}
+
+function toCheckoutResolutionView(
+  row: CheckoutResolutionDbRow,
+  heldItems: CheckoutHoldView[],
+): CheckoutResolutionView {
+  return {
+    checkoutReference: row.checkoutReference,
+    originalBusinessDate: row.originalBusinessDate,
+    resolutionDate: row.resolutionDate,
+    outcome: row.outcome,
+    quoteTotalCentavos: Number(row.quoteTotalCentavos),
+    cashReceivedCentavos:
+      row.cashReceivedCentavos === null ? null : Number(row.cashReceivedCentavos),
+    changeAlreadyGiven: row.changeAlreadyGiven === null ? null : Boolean(row.changeAlreadyGiven),
+    changeGivenCentavos:
+      row.changeGivenCentavos === null ? null : Number(row.changeGivenCentavos),
+    refundedAmountCentavos:
+      row.refundedAmountCentavos === null ? null : Number(row.refundedAmountCentavos),
+    items: parseQuoteSnapshot(row.itemsSnapshot),
+    originalActor: row.originalActorUsername,
+    resolvedBy: row.resolvedByUsername,
+    resolvedAt: formatManilaIso(toDate(row.resolvedAt)),
+    reason: row.reason,
+    note: row.note,
+    heldItems,
   };
 }
 
@@ -385,10 +489,105 @@ const SALE_SELECT = `
          s.total_volume_ml AS "totalVolumeMl",
          s.created_by_user_id AS "createdByUserId",
          creator.username AS "createdByUsername",
-         s.created_at AS "createdAt"
+         s.created_at AS "createdAt",
+         orig.reference AS "correctedFromSaleReference",
+         repl.reference AS "replacedBySaleReference"
     FROM pos_sales s
-    JOIN pos_checkouts c ON c.id = s.checkout_id
+    LEFT JOIN pos_checkouts c ON c.id = s.checkout_id
+    LEFT JOIN pos_sales orig ON orig.id = s.corrected_from_sale_id
+    LEFT JOIN pos_sales repl ON repl.corrected_from_sale_id = s.id
     JOIN app_users creator ON creator.id = s.created_by_user_id`;
+
+const SALE_ACTION_SELECT = `
+  SELECT r.id,
+         r.reference,
+         r.prepare_key AS "prepareKey",
+         r.original_sale_id AS "originalSaleId",
+         r.original_sale_reference AS "originalSaleReference",
+         (orig_sale.corrected_from_sale_id IS NOT NULL) AS "originalSaleIsReplacement",
+         r.original_business_day_id AS "originalBusinessDayId",
+         to_char(r.original_business_date, 'YYYY-MM-DD') AS "originalBusinessDate",
+         r.action_type AS "actionType",
+         r.status,
+         r.reason,
+         r.original_total_centavos AS "originalTotalCentavos",
+         r.original_cash_received_centavos AS "originalCashReceivedCentavos",
+         r.original_change_centavos AS "originalChangeCentavos",
+         r.corrected_total_centavos AS "correctedTotalCentavos",
+         r.cash_difference_centavos AS "cashDifferenceCentavos",
+         r.corrected_items_snapshot AS "correctedItemsSnapshot",
+         r.merchandise_plan AS "merchandisePlan",
+         r.cash_tendered_centavos AS "cashTenderedCentavos",
+         r.cash_change_centavos AS "cashChangeCentavos",
+         r.cash_refunded_centavos AS "cashRefundedCentavos",
+         r.replacement_sale_id AS "replacementSaleId",
+         r.replacement_sale_reference AS "replacementSaleReference",
+         r.created_by_user_id AS "createdByUserId",
+         creator.username AS "createdByUsername",
+         r.created_at AS "createdAt",
+         completer.username AS "completedByUsername",
+         r.completed_at AS "completedAt",
+         canceller.username AS "cancelledByUsername",
+         r.cancelled_at AS "cancelledAt",
+         r.cancel_reason AS "cancelReason",
+         r.updated_at AS "updatedAt",
+         d.closed_at AS "dayClosedAt"
+    FROM pos_sale_action_requests r
+    JOIN pos_sales orig_sale ON orig_sale.id = r.original_sale_id
+    JOIN pos_business_days d ON d.id = r.original_business_day_id
+    JOIN app_users creator ON creator.id = r.created_by_user_id
+    LEFT JOIN app_users completer ON completer.id = r.completed_by_user_id
+    LEFT JOIN app_users canceller ON canceller.id = r.cancelled_by_user_id`;
+
+export function toSaleActionRequestView(row: SaleActionRequestDbRow): SaleActionRequestView {
+  const cashDifferenceCentavos = Number(row.cashDifferenceCentavos);
+  const originalSaleIsReplacement = Boolean(row.originalSaleIsReplacement);
+  const rawPlan = (row.merchandisePlan ?? {}) as Partial<SaleActionMerchandisePlan>;
+  return {
+    reference: row.reference,
+    originalSaleReference: row.originalSaleReference,
+    originalSaleIsReplacement,
+    originalBusinessDate: row.originalBusinessDate,
+    actionType: row.actionType,
+    status: row.status,
+    reason: row.reason,
+    originalTotalCentavos: Number(row.originalTotalCentavos),
+    originalCashReceivedCentavos: originalSaleIsReplacement
+      ? null
+      : Number(row.originalCashReceivedCentavos),
+    originalChangeCentavos: originalSaleIsReplacement
+      ? null
+      : Number(row.originalChangeCentavos),
+    correctedTotalCentavos: Number(row.correctedTotalCentavos),
+    cashDifferenceCentavos,
+    cashDirection: deriveCashDirection(cashDifferenceCentavos),
+    correctedItems: row.correctedItemsSnapshot ? parseQuoteSnapshot(row.correctedItemsSnapshot) : null,
+    merchandisePlan: {
+      hasMerchandise: Boolean(rawPlan.hasMerchandise),
+      requiresInventoryReview: Boolean(rawPlan.requiresInventoryReview),
+      ...(Array.isArray(rawPlan.submittedMerchandiseLines)
+        ? { submittedMerchandiseLines: rawPlan.submittedMerchandiseLines }
+        : {}),
+      items: Array.isArray(rawPlan.items) ? (rawPlan.items as SaleActionMerchandisePlanItem[]) : [],
+      retained: Array.isArray(rawPlan.retained) ? rawPlan.retained : [],
+      added: Array.isArray(rawPlan.added) ? rawPlan.added : [],
+      returned: Array.isArray(rawPlan.returned) ? rawPlan.returned : [],
+      held: Array.isArray(rawPlan.held) ? rawPlan.held : [],
+    },
+    cashTenderedCentavos: row.cashTenderedCentavos === null ? null : Number(row.cashTenderedCentavos),
+    cashChangeCentavos: row.cashChangeCentavos === null ? null : Number(row.cashChangeCentavos),
+    cashRefundedCentavos: row.cashRefundedCentavos === null ? null : Number(row.cashRefundedCentavos),
+    replacementSaleReference: row.replacementSaleReference,
+    createdBy: row.createdByUsername,
+    createdAt: formatManilaIso(toDate(row.createdAt)),
+    completedBy: row.completedByUsername,
+    completedAt: row.completedAt ? formatManilaIso(toDate(row.completedAt)) : null,
+    cancelledBy: row.cancelledByUsername,
+    cancelledAt: row.cancelledAt ? formatManilaIso(toDate(row.cancelledAt)) : null,
+    cancelReason: row.cancelReason,
+    updatedAt: formatManilaIso(toDate(row.updatedAt)),
+  };
+}
 
 const SETTLEMENT_SELECT = `
   SELECT p.id,
@@ -409,12 +608,36 @@ const SETTLEMENT_SELECT = `
          p.original_payment_recorded_at AS "originalPaymentRecordedAt",
          p.payment_kept_confirmed AS "paymentKeptConfirmed",
          p.refill_delivered_confirmed AS "refillDeliveredConfirmed",
+         p.items_handed_over_confirmed AS "itemsHandedOverConfirmed",
          settler.username AS "settledByUsername",
          p.settled_at AS "settledAt",
          p.note
     FROM pos_prior_day_settlements p
     JOIN app_users orig ON orig.id = p.original_actor_user_id
     JOIN app_users settler ON settler.id = p.settled_by_user_id`;
+
+const CHECKOUT_RESOLUTION_SELECT = `
+  SELECT r.id,
+         r.checkout_id AS "checkoutId",
+         r.checkout_reference AS "checkoutReference",
+         r.original_business_day_id AS "originalBusinessDayId",
+         to_char(r.original_business_date, 'YYYY-MM-DD') AS "originalBusinessDate",
+         to_char(r.resolution_date, 'YYYY-MM-DD') AS "resolutionDate",
+         r.outcome,
+         r.quote_total_centavos AS "quoteTotalCentavos",
+         r.cash_received_centavos AS "cashReceivedCentavos",
+         r.change_already_given AS "changeAlreadyGiven",
+         r.change_given_centavos AS "changeGivenCentavos",
+         r.refunded_amount_centavos AS "refundedAmountCentavos",
+         r.items_snapshot AS "itemsSnapshot",
+         orig.username AS "originalActorUsername",
+         resolver.username AS "resolvedByUsername",
+         r.resolved_at AS "resolvedAt",
+         r.reason,
+         r.note
+    FROM pos_checkout_resolutions r
+    JOIN app_users orig ON orig.id = r.original_actor_user_id
+    JOIN app_users resolver ON resolver.id = r.resolved_by_user_id`;
 
 async function loadPriorDaySettlements(
   db: Queryable,
@@ -428,6 +651,59 @@ async function loadPriorDaySettlements(
   return rows.map(toPriorDaySettlementView);
 }
 
+async function loadHoldsByWhereSql(
+  db: Queryable,
+  whereSql: string,
+  params: unknown[],
+): Promise<CheckoutHoldView[]> {
+  const { rows } = await db.query<{
+    id: string;
+    itemId: string;
+    itemName: string;
+    quantity: number | string;
+    unit: string;
+    reason: string;
+    posReference: string;
+    recordedBy: string;
+    recordedAt: Date | string;
+  }>(
+    `SELECT h.id,
+            h.item_id AS "itemId",
+            i.name AS "itemName",
+            h.quantity,
+            h.unit,
+            h.reason,
+            h.pos_reference AS "posReference",
+            u.username AS "recordedBy",
+            h.recorded_at AS "recordedAt"
+       FROM inventory_stock_holds h
+       JOIN inventory_items i ON i.id = h.item_id
+       JOIN app_users u ON u.id = h.actor_user_id
+      WHERE ${whereSql}
+        AND h.status = 'ACTIVE'
+      ORDER BY i.name ASC, h.id ASC`,
+    params,
+  );
+  return rows.map((row) => ({
+    id: row.id,
+    itemId: row.itemId,
+    itemName: row.itemName,
+    quantity: Number(row.quantity),
+    unit: row.unit,
+    reason: row.reason,
+    posReference: row.posReference,
+    recordedBy: row.recordedBy,
+    recordedAt: formatManilaIso(toDate(row.recordedAt)),
+  }));
+}
+
+async function loadHoldsForResolution(
+  db: Queryable,
+  resolutionId: string,
+): Promise<CheckoutHoldView[]> {
+  return loadHoldsByWhereSql(db, "h.resolution_id = $1", [resolutionId]);
+}
+
 async function loadSaleViews(
   db: Queryable,
   whereAndOrderSql: string,
@@ -437,7 +713,7 @@ async function loadSaleViews(
   if (saleRows.length === 0) return [];
 
   const saleIds = saleRows.map((row) => row.id);
-  const [{ rows: itemRows }, { rows: actionRows }] = await Promise.all([
+  const [{ rows: itemRows }, { rows: actionRows }, { rows: requestRows }] = await Promise.all([
     db.query<SaleItemDbRow>(
       `SELECT sale_id AS "saleId",
               line_index AS "lineIndex",
@@ -472,6 +748,13 @@ async function loadSaleViews(
         ORDER BY a.recorded_at ASC, a.id ASC`,
       [saleIds],
     ),
+    db.query<SaleActionRequestDbRow>(
+      `${SALE_ACTION_SELECT}
+        WHERE (r.original_sale_id = ANY($1::uuid[]) OR r.replacement_sale_id = ANY($1::uuid[]))
+          AND r.status IN ('PENDING', 'COMPLETED')
+        ORDER BY r.created_at DESC, r.id DESC`,
+      [saleIds],
+    ),
   ]);
 
   const itemsBySale = new Map<string, QuoteLineItem[]>();
@@ -485,17 +768,17 @@ async function loadSaleViews(
       waterType: row.waterType,
       ...(row.itemKind === "MERCHANDISE" || row.itemKind === "CONTAINER_PACKAGE"
         ? {
-            productId: row.productId,
-            stockUnit: row.stockUnit,
-            posSection: row.posSection,
-            ...(row.itemKind === "MERCHANDISE" &&
+          productId: row.productId,
+          stockUnit: row.stockUnit,
+          posSection: row.posSection,
+          ...(row.itemKind === "MERCHANDISE" &&
             (row.faucetReportingType === "PUSH_TYPE" || row.faucetReportingType === "TWIST_TYPE")
-              ? { faucetReportingType: row.faucetReportingType }
-              : {}),
-            ...(row.itemKind === "CONTAINER_PACKAGE"
-              ? { includedGripo: row.includedGripo }
-              : {}),
-          }
+            ? { faucetReportingType: row.faucetReportingType }
+            : {}),
+          ...(row.itemKind === "CONTAINER_PACKAGE"
+            ? { includedGripo: row.includedGripo }
+            : {}),
+        }
         : {}),
       displayLabel: row.displayLabel,
       unitVolumeMl,
@@ -530,11 +813,155 @@ async function loadSaleViews(
     }
   }
 
+  const pendingActionBySale = new Map<string, SaleActionRequestView>();
+  const completedActionBySale = new Map<string, SaleActionRequestView>();
+  const sourceActionByReplacementSale = new Map<string, SaleActionRequestView>();
+  const saleIdSet = new Set(saleIds);
+  for (const reqRow of requestRows) {
+    const view = toSaleActionRequestView(reqRow);
+    if (
+      saleIdSet.has(reqRow.originalSaleId) &&
+      reqRow.status === "PENDING" &&
+      !pendingActionBySale.has(reqRow.originalSaleId)
+    ) {
+      pendingActionBySale.set(reqRow.originalSaleId, view);
+    } else if (
+      saleIdSet.has(reqRow.originalSaleId) &&
+      reqRow.status === "COMPLETED" &&
+      !completedActionBySale.has(reqRow.originalSaleId)
+    ) {
+      completedActionBySale.set(reqRow.originalSaleId, view);
+    }
+    if (
+      reqRow.replacementSaleId &&
+      saleIdSet.has(reqRow.replacementSaleId) &&
+      reqRow.status === "COMPLETED" &&
+      !sourceActionByReplacementSale.has(reqRow.replacementSaleId)
+    ) {
+      sourceActionByReplacementSale.set(reqRow.replacementSaleId, view);
+    }
+  }
+
+  const cashEventChainBySale = new Map<string, SaleCashEventChain>();
+  const replacementSaleIds = saleRows
+    .filter((row) => row.correctedFromSaleReference !== null)
+    .map((row) => row.id);
+
+  if (replacementSaleIds.length > 0) {
+    const { rows: ancestryRows } = await db.query<{
+      startSaleId: string;
+      depth: number | string;
+      saleId: string;
+      reference: string;
+      correctedFromSaleId: string | null;
+      totalCentavos: number | string;
+      cashReceivedCentavos: number | string;
+      changeCentavos: number | string;
+    }>(
+      `WITH RECURSIVE ancestry AS (
+         SELECT s.id AS start_sale_id,
+                s.id AS sale_id,
+                s.corrected_from_sale_id,
+                0 AS depth
+           FROM pos_sales s
+          WHERE s.id = ANY($1::uuid[])
+         UNION ALL
+         SELECT a.start_sale_id,
+                parent.id AS sale_id,
+                parent.corrected_from_sale_id,
+                a.depth + 1 AS depth
+           FROM ancestry a
+           JOIN pos_sales parent ON parent.id = a.corrected_from_sale_id
+       )
+       SELECT a.start_sale_id AS "startSaleId",
+              a.depth,
+              s.id AS "saleId",
+              s.reference,
+              s.corrected_from_sale_id AS "correctedFromSaleId",
+              s.total_centavos AS "totalCentavos",
+              s.cash_received_centavos AS "cashReceivedCentavos",
+              s.change_centavos AS "changeCentavos"
+         FROM ancestry a
+         JOIN pos_sales s ON s.id = a.sale_id
+        ORDER BY a.start_sale_id, a.depth DESC`,
+      [replacementSaleIds],
+    );
+
+    const chainReplacementIds = Array.from(
+      new Set(
+        ancestryRows
+          .filter((row) => row.correctedFromSaleId !== null)
+          .map((row) => row.saleId),
+      ),
+    );
+    const chainActionByReplacementId = new Map<string, SaleActionRequestDbRow>();
+    if (chainReplacementIds.length > 0) {
+      const { rows: chainActionRows } = await db.query<SaleActionRequestDbRow>(
+        `${SALE_ACTION_SELECT}
+          WHERE r.replacement_sale_id = ANY($1::uuid[])
+            AND r.status = 'COMPLETED'`,
+        [chainReplacementIds],
+      );
+      for (const actionRow of chainActionRows) {
+        if (actionRow.replacementSaleId) {
+          chainActionByReplacementId.set(actionRow.replacementSaleId, actionRow);
+        }
+      }
+    }
+
+    const ancestryByStart = new Map<string, typeof ancestryRows>();
+    for (const row of ancestryRows) {
+      const list = ancestryByStart.get(row.startSaleId);
+      if (list) {
+        list.push(row);
+      } else {
+        ancestryByStart.set(row.startSaleId, [row]);
+      }
+    }
+
+    for (const [startSaleId, path] of ancestryByStart.entries()) {
+      const rootNode = path.find((node) => node.correctedFromSaleId === null) ?? path[0];
+      if (!rootNode || rootNode.correctedFromSaleId !== null) continue;
+      const correctionEvents: SaleCashEventChain["correctionEvents"] = [];
+      for (const node of path) {
+        if (node.correctedFromSaleId === null) continue;
+        const act = chainActionByReplacementId.get(node.saleId);
+        if (!act) continue;
+        const cashDifferenceCentavos = Number(act.cashDifferenceCentavos);
+        correctionEvents.push({
+          actionReference: act.reference,
+          originalSaleReference: act.originalSaleReference,
+          replacementSaleReference: act.replacementSaleReference ?? node.reference,
+          originalTotalCentavos: Number(act.originalTotalCentavos),
+          correctedTotalCentavos: Number(act.correctedTotalCentavos),
+          cashDirection: deriveCashDirection(cashDifferenceCentavos),
+          cashDifferenceCentavos,
+          cashTenderedCentavos:
+            act.cashTenderedCentavos === null ? null : Number(act.cashTenderedCentavos),
+          cashChangeCentavos:
+            act.cashChangeCentavos === null ? null : Number(act.cashChangeCentavos),
+          cashRefundedCentavos:
+            act.cashRefundedCentavos === null ? null : Number(act.cashRefundedCentavos),
+          completedAt: act.completedAt ? formatManilaIso(toDate(act.completedAt)) : null,
+        });
+      }
+      cashEventChainBySale.set(startSaleId, {
+        rootCashSale: {
+          reference: rootNode.reference,
+          totalCentavos: Number(rootNode.totalCentavos),
+          cashReceivedCentavos: Number(rootNode.cashReceivedCentavos),
+          changeCentavos: Number(rootNode.changeCentavos),
+        },
+        correctionEvents,
+      });
+    }
+  }
+
   return saleRows.map((row) => {
     const totalVolumeMl = Number(row.totalVolumeMl);
     return {
       reference: row.reference,
-      checkoutReference: row.checkoutReference,
+      checkoutReference: row.checkoutReference ?? null,
       businessDate: row.businessDate,
       status: row.status,
       totalCentavos: Number(row.totalCentavos),
@@ -545,10 +972,61 @@ async function loadSaleViews(
       totalVolumeLiters: mlToLiters(totalVolumeMl),
       createdBy: row.createdByUsername,
       createdAt: formatManilaIso(toDate(row.createdAt)),
+      correctedFromSaleReference: row.correctedFromSaleReference ?? null,
+      replacedBySaleReference: row.replacedBySaleReference ?? null,
+      sourceAction: sourceActionByReplacementSale.get(row.id) ?? null,
+      cashEventChain: cashEventChainBySale.get(row.id) ?? null,
+      pendingAction: pendingActionBySale.get(row.id) ?? null,
+      completedAction: completedActionBySale.get(row.id) ?? null,
       items: itemsBySale.get(row.id) ?? [],
       actionHistory: actionsBySale.get(row.id) ?? [],
     };
   });
+}
+
+async function insertSaleItemRows(
+  tx: Queryable,
+  saleId: string,
+  items: readonly QuoteLineItem[],
+): Promise<void> {
+  for (const item of items) {
+    const dbFaucetReportingType =
+      item.kind !== "MERCHANDISE"
+        ? null
+        : item.faucetReportingType === "PUSH_TYPE" || item.faucetReportingType === "TWIST_TYPE"
+          ? item.faucetReportingType
+          : "faucetReportingType" in item
+            ? "NONE"
+            : null;
+
+    await tx.query(
+      `INSERT INTO pos_sale_items (
+         sale_id, line_index, item_kind, catalog_code, water_type,
+         inventory_item_id, stock_unit, pos_section, included_gripo, faucet_reporting_type,
+         display_label, unit_volume_ml, unit_price_centavos, quantity,
+         line_total_centavos, line_volume_ml
+       )
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
+      [
+        saleId,
+        item.lineIndex,
+        item.kind,
+        item.catalogCode,
+        item.waterType,
+        item.productId ?? null,
+        item.stockUnit ?? null,
+        item.posSection ?? null,
+        item.includedGripo ?? null,
+        dbFaucetReportingType,
+        item.displayLabel,
+        item.unitVolumeMl,
+        item.unitPriceCentavos,
+        item.quantity,
+        item.lineTotalCentavos,
+        item.lineVolumeMl,
+      ],
+    );
+  }
 }
 
 /** PostgreSQL persistence adapter for POS station days, checkouts, and sales. */
@@ -596,19 +1074,35 @@ export const posRepository = {
       unit: string;
       currentQuantity: number | string | null;
       activeCommitted: number | string;
+      activeHeld: number | string;
     }>(
       `SELECT i.id,
               i.container_shape AS "containerShape",
               i.unit,
               i.current_quantity AS "currentQuantity",
-              COALESCE(c.committed_qty, 0) AS "activeCommitted"
+              COALESCE(c.committed_qty, 0) AS "activeCommitted",
+              COALESCE(h.held_qty, 0) AS "activeHeld"
          FROM inventory_items i
          LEFT JOIN (
            SELECT item_id, SUM(quantity)::integer AS committed_qty
-             FROM pos_checkout_stock_commitments
-            WHERE status = 'ACTIVE'
+             FROM (
+               SELECT item_id, quantity
+                 FROM pos_checkout_stock_commitments
+                WHERE status = 'ACTIVE'
+               UNION ALL
+               SELECT item_id, quantity
+                 FROM pos_sale_action_stock_commitments
+                WHERE status = 'ACTIVE'
+             ) all_commitments
             GROUP BY item_id
          ) c ON c.item_id = i.id
+         LEFT JOIN (
+           SELECT item_id, SUM(quantity)::integer AS held_qty
+             FROM inventory_stock_holds
+            WHERE status = 'ACTIVE'
+              AND reduces_availability = true
+            GROUP BY item_id
+         ) h ON h.item_id = i.id
         WHERE i.category = 'CONTAINER'
           AND i.show_in_pos = true
           AND i.archived_at IS NULL
@@ -629,8 +1123,11 @@ export const posRepository = {
     for (const row of rows) {
       const currentQuantity = row.currentQuantity === null ? null : Number(row.currentQuantity);
       const activeCommitted = Number(row.activeCommitted ?? 0);
+      const activeHeld = Number(row.activeHeld ?? 0);
       const availableQuantity =
-        currentQuantity === null ? null : Math.max(0, currentQuantity - activeCommitted);
+        currentQuantity === null
+          ? null
+          : Math.max(0, currentQuantity - activeCommitted - activeHeld);
       const stockStatus =
         currentQuantity === null
           ? "NOT_SET"
@@ -681,15 +1178,30 @@ export const posRepository = {
               i.pos_section AS "posSection",
               i.faucet_reporting_type AS "faucetReportingType",
               i.current_quantity AS "currentQuantity",
-              COALESCE(c.committed_qty, 0) AS "activeCommitted"
+              COALESCE(c.committed_qty, 0) AS "activeCommitted",
+              COALESCE(h.held_qty, 0) AS "activeHeld"
          FROM inventory_items i
          LEFT JOIN inventory_pos_sections s ON s.code = i.pos_section
          LEFT JOIN (
            SELECT item_id, SUM(quantity)::integer AS committed_qty
-             FROM pos_checkout_stock_commitments
-            WHERE status = 'ACTIVE'
+             FROM (
+               SELECT item_id, quantity
+                 FROM pos_checkout_stock_commitments
+                WHERE status = 'ACTIVE'
+               UNION ALL
+               SELECT item_id, quantity
+                 FROM pos_sale_action_stock_commitments
+                WHERE status = 'ACTIVE'
+             ) all_commitments
             GROUP BY item_id
          ) c ON c.item_id = i.id
+         LEFT JOIN (
+           SELECT item_id, SUM(quantity)::integer AS held_qty
+             FROM inventory_stock_holds
+            WHERE status = 'ACTIVE'
+              AND reduces_availability = true
+            GROUP BY item_id
+         ) h ON h.item_id = i.id
         WHERE i.category = 'MERCHANDISE'
           AND i.show_in_pos = true
           AND i.archived_at IS NULL
@@ -705,6 +1217,7 @@ export const posRepository = {
     tx: Queryable,
     productIds: string[],
     excludeCheckoutId?: string,
+    excludeSaleActionId?: string,
   ): Promise<Map<string, LockedMerchandiseItem>> {
     const uniqueSorted = Array.from(new Set(productIds)).sort();
     const map = new Map<string, LockedMerchandiseItem>();
@@ -745,28 +1258,44 @@ export const posRepository = {
       [uniqueSorted],
     );
 
-    const committedRes = excludeCheckoutId
-      ? await tx.query<{ itemId: string; committedQty: number | string }>(
-          `SELECT item_id AS "itemId", SUM(quantity)::integer AS "committedQty"
-             FROM pos_checkout_stock_commitments
-            WHERE item_id = ANY($1::uuid[])
-              AND status = 'ACTIVE'
-              AND checkout_id <> $2
-            GROUP BY item_id`,
-          [uniqueSorted, excludeCheckoutId],
-        )
-      : await tx.query<{ itemId: string; committedQty: number | string }>(
-          `SELECT item_id AS "itemId", SUM(quantity)::integer AS "committedQty"
-             FROM pos_checkout_stock_commitments
-            WHERE item_id = ANY($1::uuid[])
-              AND status = 'ACTIVE'
-            GROUP BY item_id`,
-          [uniqueSorted],
-        );
+    const [committedRes, heldRes] = await Promise.all([
+      tx.query<{ itemId: string; committedQty: number | string }>(
+        `SELECT item_id AS "itemId", SUM(quantity)::integer AS "committedQty"
+           FROM (
+             SELECT item_id, quantity
+               FROM pos_checkout_stock_commitments
+              WHERE item_id = ANY($1::uuid[])
+                AND status = 'ACTIVE'
+                AND ($2::uuid IS NULL OR checkout_id <> $2)
+             UNION ALL
+             SELECT item_id, quantity
+               FROM pos_sale_action_stock_commitments
+              WHERE item_id = ANY($1::uuid[])
+                AND status = 'ACTIVE'
+                AND ($3::uuid IS NULL OR sale_action_id <> $3)
+           ) active_commitments
+          GROUP BY item_id`,
+        [uniqueSorted, excludeCheckoutId ?? null, excludeSaleActionId ?? null],
+      ),
+      tx.query<{ itemId: string; heldQty: number | string }>(
+        `SELECT item_id AS "itemId", SUM(quantity)::integer AS "heldQty"
+           FROM inventory_stock_holds
+          WHERE item_id = ANY($1::uuid[])
+            AND status = 'ACTIVE'
+            AND reduces_availability = true
+          GROUP BY item_id`,
+        [uniqueSorted],
+      ),
+    ]);
 
     const committedByItem = new Map<string, number>();
     for (const c of committedRes.rows) {
       committedByItem.set(c.itemId, Number(c.committedQty));
+    }
+
+    const heldByItem = new Map<string, number>();
+    for (const h of heldRes.rows) {
+      heldByItem.set(h.itemId, Number(h.heldQty));
     }
 
     for (const row of rows) {
@@ -786,6 +1315,7 @@ export const posRepository = {
         currentQuantity: row.currentQuantity === null ? null : Number(row.currentQuantity),
         archivedAt: row.archivedAt ? formatManilaIso(toDate(row.archivedAt)) : null,
         otherActiveCommitted: committedByItem.get(row.id) ?? 0,
+        activeHeld: heldByItem.get(row.id) ?? 0,
       });
     }
     return map;
@@ -817,6 +1347,62 @@ export const posRepository = {
       }
     }
     return byShape;
+  },
+
+  async listContainerItemIdsByShape(
+    db: Queryable,
+    shapes: ContainerShape[],
+  ): Promise<Map<ContainerShape, string>> {
+    const uniqueSorted = Array.from(new Set(shapes)).sort();
+    const map = new Map<ContainerShape, string>();
+    if (uniqueSorted.length === 0) return map;
+    const { rows } = await db.query<{ id: string; containerShape: ContainerShape }>(
+      `SELECT id, container_shape AS "containerShape"
+         FROM inventory_items
+        WHERE category = 'CONTAINER'
+          AND container_shape = ANY($1::text[])
+        ORDER BY id ASC`,
+      [uniqueSorted],
+    );
+    for (const row of rows) {
+      map.set(row.containerShape, row.id);
+    }
+    return map;
+  },
+
+  async listLatestReconciliationsSince(
+    tx: Queryable,
+    productIds: string[],
+    sinceAt: Date,
+  ): Promise<Map<string, SaleActionInterveningCount>> {
+    const uniqueSorted = Array.from(new Set(productIds)).sort();
+    const map = new Map<string, SaleActionInterveningCount>();
+    if (uniqueSorted.length === 0) return map;
+    const { rows } = await tx.query<{
+      itemId: string;
+      reconciliationId: string;
+      physicalCount: number | string;
+      recordedAt: Date | string;
+    }>(
+      `SELECT DISTINCT ON (item_id)
+              item_id AS "itemId",
+              id AS "reconciliationId",
+              physical_count AS "physicalCount",
+              recorded_at AS "recordedAt"
+         FROM inventory_reconciliations
+        WHERE item_id = ANY($1::uuid[])
+          AND recorded_at >= $2
+        ORDER BY item_id, recorded_at DESC, id DESC`,
+      [uniqueSorted, sinceAt],
+    );
+    for (const row of rows) {
+      map.set(row.itemId, {
+        reconciliationId: row.reconciliationId,
+        physicalCount: Number(row.physicalCount),
+        recordedAt: formatManilaIso(toDate(row.recordedAt)),
+      });
+    }
+    return map;
   },
 
   async upsertActiveCommitments(
@@ -1197,9 +1783,25 @@ export const posRepository = {
     return (await this.findCheckoutByReference(tx, input.reference))!;
   },
 
+  async listHoldsForCheckout(db: Queryable, checkoutId: string): Promise<CheckoutHoldView[]> {
+    return loadHoldsByWhereSql(db, "h.checkout_id = $1", [checkoutId]);
+  },
+
   async markCheckoutCancelled(
     tx: Queryable,
-    input: { checkoutId: string; reference: string; reason: string; now: Date },
+    input: {
+      checkoutId: string;
+      reference: string;
+      reason: string;
+      now: Date;
+      actorUserId?: string;
+      heldItems?: Array<{
+        productId: string;
+        quantity: number;
+        unit: string;
+        reason: string;
+      }>;
+    },
   ): Promise<CheckoutDbRow> {
     await tx.query(
       `UPDATE pos_checkouts
@@ -1211,19 +1813,56 @@ export const posRepository = {
       [input.checkoutId, input.reason, input.now],
     );
     await this.releaseCommitmentsForCheckout(tx, input.checkoutId, input.now);
+    if (input.heldItems && input.heldItems.length > 0) {
+      if (!input.actorUserId) {
+        throw new Error("Missing actorUserId for checkout cancellation holds");
+      }
+      for (const hold of input.heldItems) {
+        await tx.query(
+          `INSERT INTO inventory_stock_holds (
+             item_id, quantity, unit, reason, source_kind, status,
+             reduces_availability, checkout_id, resolution_id, pos_sale_id,
+             pos_reference, actor_user_id, recorded_at
+           )
+           VALUES (
+             $1, $2, $3, $4, 'CHECKOUT_CANCEL', 'ACTIVE',
+             true, $5, NULL, NULL,
+             $6, $7, $8
+           )`,
+          [
+            hold.productId,
+            hold.quantity,
+            hold.unit,
+            hold.reason,
+            input.checkoutId,
+            input.reference,
+            input.actorUserId,
+            input.now,
+          ],
+        );
+      }
+    }
     return (await this.findCheckoutByReference(tx, input.reference))!;
   },
 
-  async clearUnpaidDraftsForDay(tx: Queryable, dayId: string, now: Date): Promise<string[]> {
+  async clearUnpaidDraftsForDay(
+    tx: Queryable,
+    dayId: string,
+    draftIds: readonly string[],
+    now: Date,
+  ): Promise<string[]> {
+    if (draftIds.length === 0) {
+      return [];
+    }
     const { rows } = await tx.query<{ id: string; reference: string }>(
       `UPDATE pos_checkouts
           SET status = 'CANCELLED_DRAFT',
               resolution_reason = 'CLEARED_ON_END_DAY',
               cancellation_origin = 'AUTO_END_DAY',
-              updated_at = $2
-        WHERE business_day_id = $1 AND status = 'DRAFT'
+              updated_at = $3
+        WHERE business_day_id = $1 AND status = 'DRAFT' AND id = ANY($2::uuid[])
         RETURNING id, reference`,
-      [dayId, now],
+      [dayId, draftIds, now],
     );
     if (rows.length > 0) {
       await tx.query(
@@ -1278,45 +1917,7 @@ export const posRepository = {
       ],
     );
     const saleId = saleInserted[0]!.id;
-
-    for (const item of input.items) {
-      const dbFaucetReportingType =
-        item.kind !== "MERCHANDISE"
-          ? null
-          : item.faucetReportingType === "PUSH_TYPE" || item.faucetReportingType === "TWIST_TYPE"
-            ? item.faucetReportingType
-            : "faucetReportingType" in item
-              ? "NONE"
-              : null;
-
-      await tx.query(
-        `INSERT INTO pos_sale_items (
-           sale_id, line_index, item_kind, catalog_code, water_type,
-           inventory_item_id, stock_unit, pos_section, included_gripo, faucet_reporting_type,
-           display_label, unit_volume_ml, unit_price_centavos, quantity,
-           line_total_centavos, line_volume_ml
-         )
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)`,
-        [
-          saleId,
-          item.lineIndex,
-          item.kind,
-          item.catalogCode,
-          item.waterType,
-          item.productId ?? null,
-          item.stockUnit ?? null,
-          item.posSection ?? null,
-          item.includedGripo ?? null,
-          dbFaucetReportingType,
-          item.displayLabel,
-          item.unitVolumeMl,
-          item.unitPriceCentavos,
-          item.quantity,
-          item.lineTotalCentavos,
-          item.lineVolumeMl,
-        ],
-      );
-    }
+    await insertSaleItemRows(tx, saleId, input.items);
 
     const demandMap = aggregateMerchandiseDemand(input.items);
     if (demandMap.size > 0) {
@@ -1505,6 +2106,7 @@ export const posRepository = {
       originalActorUserId: string;
       originalPaymentStartedAt: Date | null;
       originalPaymentRecordedAt: Date | null;
+      itemsHandedOverConfirmed: boolean;
       settledByUserId: string;
       settledAt: Date;
       note: string | null;
@@ -1518,12 +2120,12 @@ export const posRepository = {
          net_amount_kept_centavos, cash_received_centavos, change_centavos,
          total_containers, total_volume_ml, items_snapshot,
          original_actor_user_id, original_payment_started_at, original_payment_recorded_at,
-         payment_kept_confirmed, refill_delivered_confirmed,
+         payment_kept_confirmed, refill_delivered_confirmed, items_handed_over_confirmed,
          settled_by_user_id, settled_at, note
        )
        VALUES (
          $1, $2, $3, $4::date, $5::date, 'PAID_AND_DELIVERED',
-         $6, $7, $8, $9, $10, $11::jsonb, $12, $13, $14, true, true, $15, $16, $17
+         $6, $7, $8, $9, $10, $11::jsonb, $12, $13, $14, true, true, $15, $16, $17, $18
        )
        RETURNING id`,
       [
@@ -1541,6 +2143,7 @@ export const posRepository = {
         input.originalActorUserId,
         input.originalPaymentStartedAt,
         input.originalPaymentRecordedAt,
+        input.itemsHandedOverConfirmed,
         input.settledByUserId,
         input.settledAt,
         input.note,
@@ -1625,5 +2228,679 @@ export const posRepository = {
     ]);
 
     return { settlement: settlement!, checkout: toCheckoutView(checkout!) };
+  },
+
+  async findCheckoutResolutionByCheckoutId(
+    db: Queryable,
+    checkoutId: string,
+  ): Promise<CheckoutResolutionView | undefined> {
+    const { rows } = await db.query<CheckoutResolutionDbRow>(
+      `${CHECKOUT_RESOLUTION_SELECT} WHERE r.checkout_id = $1`,
+      [checkoutId],
+    );
+    const row = rows[0];
+    if (!row) return undefined;
+    const heldItems = await loadHoldsForResolution(db, row.id);
+    return toCheckoutResolutionView(row, heldItems);
+  },
+
+  async findCheckoutResolutionByReference(
+    db: Queryable,
+    reference: string,
+  ): Promise<CheckoutResolutionView | undefined> {
+    const { rows } = await db.query<CheckoutResolutionDbRow>(
+      `${CHECKOUT_RESOLUTION_SELECT} WHERE r.checkout_reference = $1`,
+      [reference],
+    );
+    const row = rows[0];
+    if (!row) return undefined;
+    const heldItems = await loadHoldsForResolution(db, row.id);
+    return toCheckoutResolutionView(row, heldItems);
+  },
+
+  async insertCheckoutResolutionAtomic(
+    tx: Queryable,
+    input: {
+      checkoutId: string;
+      checkoutReference: string;
+      originalBusinessDayId: string;
+      originalBusinessDate: string;
+      resolutionDate: string;
+      outcome: "NO_CASH_CANCELLED" | "FULL_REFUND";
+      quoteTotalCentavos: number;
+      cashReceivedCentavos: number | null;
+      changeAlreadyGiven: boolean | null;
+      changeGivenCentavos: number | null;
+      refundedAmountCentavos: number | null;
+      items: QuoteLineItem[];
+      originalActorUserId: string;
+      resolvedByUserId: string;
+      resolvedAt: Date;
+      reason: string;
+      note: string | null;
+      heldItems: Array<{
+        productId: string;
+        quantity: number;
+        unit: string;
+        reason: string;
+      }>;
+    },
+  ): Promise<{ resolution: CheckoutResolutionView; checkout: CheckoutView }> {
+    const { rows: inserted } = await tx.query<{ id: string }>(
+      `INSERT INTO pos_checkout_resolutions (
+         checkout_id, checkout_reference, original_business_day_id,
+         original_business_date, resolution_date, outcome,
+         quote_total_centavos, cash_received_centavos, change_already_given,
+         change_given_centavos, refunded_amount_centavos, items_snapshot,
+         original_actor_user_id, resolved_by_user_id, resolved_at, reason, note
+       )
+       VALUES (
+         $1, $2, $3, $4::date, $5::date, $6,
+         $7, $8, $9, $10, $11, $12::jsonb,
+         $13, $14, $15, $16, $17
+       )
+       RETURNING id`,
+      [
+        input.checkoutId,
+        input.checkoutReference,
+        input.originalBusinessDayId,
+        input.originalBusinessDate,
+        input.resolutionDate,
+        input.outcome,
+        input.quoteTotalCentavos,
+        input.cashReceivedCentavos,
+        input.changeAlreadyGiven,
+        input.changeGivenCentavos,
+        input.refundedAmountCentavos,
+        JSON.stringify(input.items),
+        input.originalActorUserId,
+        input.resolvedByUserId,
+        input.resolvedAt,
+        input.reason,
+        input.note,
+      ],
+    );
+    const resolutionId = inserted[0]!.id;
+
+    const nextStatus: CheckoutStatus =
+      input.outcome === "NO_CASH_CANCELLED" ? "CANCELLED_NO_CASH" : "REFUNDED_UNSAVED";
+
+    await tx.query(
+      `UPDATE pos_checkouts
+          SET status = $2,
+              resolution_reason = $3,
+              updated_at = $4
+        WHERE id = $1`,
+      [input.checkoutId, nextStatus, input.reason, input.resolvedAt],
+    );
+
+    await this.releaseCommitmentsForCheckout(tx, input.checkoutId, input.resolvedAt);
+
+    if (input.heldItems.length > 0) {
+      const sourceKind =
+        input.outcome === "NO_CASH_CANCELLED" ? "CHECKOUT_CANCEL" : "CHECKOUT_REFUND";
+      for (const hold of input.heldItems) {
+        await tx.query(
+          `INSERT INTO inventory_stock_holds (
+             item_id, quantity, unit, reason, source_kind, status,
+             reduces_availability, checkout_id, resolution_id, pos_sale_id,
+             pos_reference, actor_user_id, recorded_at
+           )
+           VALUES (
+             $1, $2, $3, $4, $5, 'ACTIVE',
+             true, $6, $7, NULL,
+             $8, $9, $10
+           )`,
+          [
+            hold.productId,
+            hold.quantity,
+            hold.unit,
+            hold.reason,
+            sourceKind,
+            input.checkoutId,
+            resolutionId,
+            input.checkoutReference,
+            input.resolvedByUserId,
+            input.resolvedAt,
+          ],
+        );
+      }
+    }
+
+    const [resolution, checkout] = await Promise.all([
+      this.findCheckoutResolutionByCheckoutId(tx, input.checkoutId),
+      this.findCheckoutByReference(tx, input.checkoutReference),
+    ]);
+    return { resolution: resolution!, checkout: toCheckoutView(checkout!) };
+  },
+
+  async allocateNextActionReference(
+    tx: Queryable,
+    dayId: string,
+    businessDate: string,
+  ): Promise<string> {
+    const { rows: seqRows } = await tx.query<{ nextActionSeq: number | string }>(
+      `SELECT next_action_seq AS "nextActionSeq" FROM pos_business_days WHERE id = $1 FOR UPDATE`,
+      [dayId],
+    );
+    let seq = Number(seqRows[0]!.nextActionSeq) + 1;
+    while (true) {
+      const candidate = formatSaleActionReference(businessDate, seq);
+      const { rows: existsRows } = await tx.query<{ exists: boolean }>(
+        `SELECT EXISTS(SELECT 1 FROM pos_sale_action_requests WHERE reference = $1) AS exists`,
+        [candidate],
+      );
+      if (!existsRows[0]?.exists) {
+        await tx.query(`UPDATE pos_business_days SET next_action_seq = $2 WHERE id = $1`, [
+          dayId,
+          seq,
+        ]);
+        return candidate;
+      }
+      seq += 1;
+    }
+  },
+
+  async findSaleDayIdByReference(
+    db: Queryable,
+    reference: string,
+  ): Promise<{ id: string; businessDayId: string } | undefined> {
+    const { rows } = await db.query<{ id: string; businessDayId: string }>(
+      `SELECT id, business_day_id AS "businessDayId" FROM pos_sales WHERE reference = $1`,
+      [reference],
+    );
+    return rows[0];
+  },
+
+  async lockSaleRawByReference(
+    tx: Queryable,
+    reference: string,
+  ): Promise<(SaleDbRow & { items: QuoteLineItem[]; dayClosedAt: Date | string | null }) | undefined> {
+    const { rows } = await tx.query<SaleDbRow & { dayClosedAt: Date | string | null }>(
+      `SELECT s.id,
+              s.reference,
+              s.checkout_id AS "checkoutId",
+              c.reference AS "checkoutReference",
+              s.business_day_id AS "businessDayId",
+              to_char(s.business_date, 'YYYY-MM-DD') AS "businessDate",
+              s.status,
+              s.total_centavos AS "totalCentavos",
+              s.cash_received_centavos AS "cashReceivedCentavos",
+              s.change_centavos AS "changeCentavos",
+              s.total_containers AS "totalContainers",
+              s.total_volume_ml AS "totalVolumeMl",
+              s.created_by_user_id AS "createdByUserId",
+              creator.username AS "createdByUsername",
+              s.created_at AS "createdAt",
+              orig.reference AS "correctedFromSaleReference",
+              repl.reference AS "replacedBySaleReference",
+              d.closed_at AS "dayClosedAt"
+         FROM pos_sales s
+         JOIN pos_business_days d ON d.id = s.business_day_id
+         LEFT JOIN pos_checkouts c ON c.id = s.checkout_id
+         LEFT JOIN pos_sales orig ON orig.id = s.corrected_from_sale_id
+         LEFT JOIN pos_sales repl ON repl.corrected_from_sale_id = s.id
+         JOIN app_users creator ON creator.id = s.created_by_user_id
+        WHERE s.reference = $1
+        FOR UPDATE OF s`,
+      [reference],
+    );
+    const row = rows[0];
+    if (!row) return undefined;
+    const views = await loadSaleViews(tx, `WHERE s.id = $1`, [row.id]);
+    return { ...row, items: views[0]?.items ?? [] };
+  },
+
+  async findSaleActionRowByReference(
+    db: Queryable,
+    reference: string,
+  ): Promise<SaleActionRequestDbRow | undefined> {
+    const { rows } = await db.query<SaleActionRequestDbRow>(
+      `${SALE_ACTION_SELECT} WHERE r.reference = $1`,
+      [reference],
+    );
+    return rows[0];
+  },
+
+  async lockSaleActionRowByReference(
+    tx: Queryable,
+    reference: string,
+  ): Promise<SaleActionRequestDbRow | undefined> {
+    const { rows } = await tx.query<SaleActionRequestDbRow>(
+      `${SALE_ACTION_SELECT} WHERE r.reference = $1 FOR UPDATE OF r`,
+      [reference],
+    );
+    return rows[0];
+  },
+
+  async findSaleActionByPrepareKey(
+    tx: Queryable,
+    prepareKey: string,
+  ): Promise<SaleActionRequestDbRow | undefined> {
+    const { rows } = await tx.query<SaleActionRequestDbRow>(
+      `${SALE_ACTION_SELECT} WHERE r.prepare_key = $1 FOR UPDATE OF r`,
+      [prepareKey],
+    );
+    return rows[0];
+  },
+
+  async findPendingSaleActionForSale(
+    tx: Queryable,
+    saleId: string,
+  ): Promise<SaleActionRequestView | undefined> {
+    const { rows } = await tx.query<SaleActionRequestDbRow>(
+      `${SALE_ACTION_SELECT} WHERE r.original_sale_id = $1 AND r.status = 'PENDING' FOR UPDATE OF r`,
+      [saleId],
+    );
+    return rows[0] ? toSaleActionRequestView(rows[0]) : undefined;
+  },
+
+  async listPendingSaleActionsForDay(
+    db: Queryable,
+    dayId: string,
+  ): Promise<SaleActionRequestView[]> {
+    const { rows } = await db.query<SaleActionRequestDbRow>(
+      `${SALE_ACTION_SELECT}
+        WHERE r.original_business_day_id = $1 AND r.status = 'PENDING'
+        ORDER BY r.created_at ASC, r.reference ASC`,
+      [dayId],
+    );
+    return rows.map(toSaleActionRequestView);
+  },
+
+  async lockPendingSaleActionsForDay(
+    tx: Queryable,
+    dayId: string,
+  ): Promise<SaleActionRequestView[]> {
+    const { rows } = await tx.query<SaleActionRequestDbRow>(
+      `${SALE_ACTION_SELECT}
+        WHERE r.original_business_day_id = $1 AND r.status = 'PENDING'
+        ORDER BY r.created_at ASC, r.reference ASC
+        FOR UPDATE OF r`,
+      [dayId],
+    );
+    return rows.map(toSaleActionRequestView);
+  },
+
+  async insertSaleActionRequest(
+    tx: Queryable,
+    input: {
+      reference: string;
+      prepareKey: string | null;
+      originalSaleId: string;
+      originalSaleReference: string;
+      originalBusinessDayId: string;
+      originalBusinessDate: string;
+      actionType: SaleActionType;
+      reason: string;
+      originalTotalCentavos: number;
+      originalCashReceivedCentavos: number;
+      originalChangeCentavos: number;
+      correctedTotalCentavos: number;
+      cashDifferenceCentavos: number;
+      correctedItems: QuoteLineItem[] | null;
+      merchandisePlan: SaleActionMerchandisePlan;
+      addedStockDemand?: ReadonlyMap<string, number>;
+      createdByUserId: string;
+      now: Date;
+    },
+  ): Promise<SaleActionRequestView> {
+    const { rows } = await tx.query<{ id: string }>(
+      `INSERT INTO pos_sale_action_requests (
+         reference, prepare_key, original_sale_id, original_sale_reference,
+         original_business_day_id, original_business_date, action_type, status, reason,
+         original_total_centavos, original_cash_received_centavos, original_change_centavos,
+         corrected_total_centavos, cash_difference_centavos, corrected_items_snapshot,
+         merchandise_plan, created_by_user_id, created_at, updated_at
+       )
+       VALUES (
+         $1, $2, $3, $4,
+         $5, $6::date, $7, 'PENDING', $8,
+         $9, $10, $11,
+         $12, $13, $14::jsonb,
+         $15::jsonb, $16, $17, $17
+       )
+       RETURNING id`,
+      [
+        input.reference,
+        input.prepareKey,
+        input.originalSaleId,
+        input.originalSaleReference,
+        input.originalBusinessDayId,
+        input.originalBusinessDate,
+        input.actionType,
+        input.reason,
+        input.originalTotalCentavos,
+        input.originalCashReceivedCentavos,
+        input.originalChangeCentavos,
+        input.correctedTotalCentavos,
+        input.cashDifferenceCentavos,
+        input.correctedItems ? JSON.stringify(input.correctedItems) : null,
+        JSON.stringify(input.merchandisePlan),
+        input.createdByUserId,
+        input.now,
+      ],
+    );
+    const actionId = rows[0]!.id;
+    if (input.addedStockDemand && input.addedStockDemand.size > 0) {
+      const sortedEntries = Array.from(input.addedStockDemand.entries())
+        .filter(([, qty]) => qty > 0)
+        .sort(([a], [b]) => a.localeCompare(b));
+      for (const [itemId, qty] of sortedEntries) {
+        await tx.query(
+          `INSERT INTO pos_sale_action_stock_commitments
+             (sale_action_id, item_id, quantity, status, created_at, resolved_at)
+           VALUES ($1, $2, $3, 'ACTIVE', $4, NULL)
+           ON CONFLICT (sale_action_id, item_id)
+           DO UPDATE SET quantity = EXCLUDED.quantity,
+                         status = 'ACTIVE',
+                         resolved_at = NULL`,
+          [actionId, itemId, qty, input.now],
+        );
+      }
+    }
+    const { rows: loaded } = await tx.query<SaleActionRequestDbRow>(
+      `${SALE_ACTION_SELECT} WHERE r.id = $1`,
+      [actionId],
+    );
+    return toSaleActionRequestView(loaded[0]!);
+  },
+
+  async completeSaleActionAtomic(
+    tx: Queryable,
+    input: {
+      actionId: string;
+      actionReference: string;
+      actionType: SaleActionType;
+      reason: string;
+      originalSaleId: string;
+      originalSaleReference: string;
+      originalBusinessDayId: string;
+      originalBusinessDate: string;
+      correctedItems: QuoteLineItem[] | null;
+      merchandisePlan: SaleActionMerchandisePlan;
+      correctedTotalCentavos: number;
+      cashTenderedCentavos: number | null;
+      cashChangeCentavos: number | null;
+      cashRefundedCentavos: number | null;
+      completedByUserId: string;
+      now: Date;
+    },
+  ): Promise<{
+    action: SaleActionRequestView;
+    originalSale: SaleView;
+    replacementSale: SaleView | null;
+  }> {
+    await tx.query(
+      `UPDATE pos_sale_action_stock_commitments
+          SET status = 'CONSUMED',
+              resolved_at = $2
+        WHERE sale_action_id = $1 AND status = 'ACTIVE'`,
+      [input.actionId, input.now],
+    );
+
+    const sortedPlanItems = [...(input.merchandisePlan.items ?? [])].sort((a, b) =>
+      a.productId.localeCompare(b.productId),
+    );
+    const movementNote = `${input.actionType === "VOID" ? "Void" : "Correct"} ${input.originalSaleReference} (${input.actionReference}): ${input.reason}`;
+
+    for (const planItem of sortedPlanItems) {
+      if (
+        planItem.restoredQuantity === 0 &&
+        planItem.addedQuantity === 0 &&
+        planItem.heldQuantity === 0
+      ) {
+        continue;
+      }
+
+      const { rows: itemRows } = await tx.query<{
+        currentQuantity: number | string | null;
+        unit: string;
+      }>(
+        `SELECT current_quantity AS "currentQuantity", unit
+           FROM inventory_items
+          WHERE id = $1`,
+        [planItem.productId],
+      );
+      const itemRow = itemRows[0];
+      if (!itemRow || itemRow.currentQuantity === null) {
+        throw new Error(`Missing initialized stock balance for sale-action item ${planItem.productId}`);
+      }
+      let currentQty = Number(itemRow.currentQuantity);
+      const unit = itemRow.unit;
+
+      if (planItem.restoredQuantity > 0) {
+        const balanceBefore = currentQty;
+        const balanceAfter = balanceBefore + planItem.restoredQuantity;
+        await tx.query(
+          `INSERT INTO inventory_stock_movements (
+             item_id, movement_type, quantity_delta, balance_before, balance_after,
+             unit, pos_sale_id, pos_reference, sale_action_id, note, actor_user_id, recorded_at
+           )
+           VALUES ($1, 'SALE_ACTION_RESTORATION', $2, $3, $4, $5, NULL, $6, $7, $8, $9, $10)`,
+          [
+            planItem.productId,
+            planItem.restoredQuantity,
+            balanceBefore,
+            balanceAfter,
+            unit,
+            input.actionReference,
+            input.actionId,
+            movementNote,
+            input.completedByUserId,
+            input.now,
+          ],
+        );
+        await tx.query(
+          `UPDATE inventory_items
+              SET current_quantity = $2,
+                  stock_revision = stock_revision + 1
+            WHERE id = $1`,
+          [planItem.productId, balanceAfter],
+        );
+        currentQty = balanceAfter;
+      }
+
+      if (planItem.addedQuantity > 0) {
+        const balanceBefore = currentQty;
+        const balanceAfter = balanceBefore - planItem.addedQuantity;
+        if (balanceAfter < 0) {
+          throw new Error(`Negative stock balance prevented for sale-action item ${planItem.productId}`);
+        }
+        await tx.query(
+          `INSERT INTO inventory_stock_movements (
+             item_id, movement_type, quantity_delta, balance_before, balance_after,
+             unit, pos_sale_id, pos_reference, sale_action_id, note, actor_user_id, recorded_at
+           )
+           VALUES ($1, 'SALE_ACTION_DEDUCTION', $2, $3, $4, $5, NULL, $6, $7, $8, $9, $10)`,
+          [
+            planItem.productId,
+            -planItem.addedQuantity,
+            balanceBefore,
+            balanceAfter,
+            unit,
+            input.actionReference,
+            input.actionId,
+            movementNote,
+            input.completedByUserId,
+            input.now,
+          ],
+        );
+        await tx.query(
+          `UPDATE inventory_items
+              SET current_quantity = $2,
+                  stock_revision = stock_revision + 1
+            WHERE id = $1`,
+          [planItem.productId, balanceAfter],
+        );
+        currentQty = balanceAfter;
+      }
+
+      if (planItem.heldQuantity > 0) {
+        const holdReason = planItem.holdReason?.trim() || input.reason;
+        await tx.query(
+          `INSERT INTO inventory_stock_holds (
+             item_id, checkout_id, pos_sale_id, sale_action_id, source_kind,
+             reduces_availability, pos_reference, quantity, unit, reason,
+             status, actor_user_id, recorded_at
+           )
+           VALUES ($1, NULL, $2, $3, 'SALE_ACTION', false, $4, $5, $6, $7, 'ACTIVE', $8, $9)`,
+          [
+            planItem.productId,
+            input.originalSaleId,
+            input.actionId,
+            input.actionReference,
+            planItem.heldQuantity,
+            unit,
+            holdReason,
+            input.completedByUserId,
+            input.now,
+          ],
+        );
+      }
+    }
+    await tx.query(`UPDATE pos_sales SET status = 'VOIDED' WHERE id = $1`, [input.originalSaleId]);
+
+    const voidNote =
+      input.actionType === "VOID"
+        ? `Voided (${input.actionReference}): ${input.reason}`
+        : `Corrected (${input.actionReference}): ${input.reason}`;
+    await tx.query(
+      `INSERT INTO pos_sale_actions (sale_id, action, actor_user_id, note, recorded_at)
+       VALUES ($1, 'SALE_VOIDED', $2, $3, $4)`,
+      [input.originalSaleId, input.completedByUserId, voidNote, input.now],
+    );
+
+    let replacementSaleId: string | null = null;
+    let replacementSaleReference: string | null = null;
+
+    if (input.actionType === "CORRECT") {
+      if (!input.correctedItems || input.correctedItems.length === 0) {
+        throw new Error("Missing corrected items when completing CORRECT action");
+      }
+      replacementSaleReference = await this.allocateNextReference(
+        tx,
+        input.originalBusinessDayId,
+        input.originalBusinessDate,
+      );
+      const totalContainers = input.correctedItems.reduce(
+        (sum, item) => (item.kind === "MERCHANDISE" ? sum : sum + item.quantity),
+        0,
+      );
+      const totalVolumeMl = input.correctedItems.reduce(
+        (sum, item) => sum + item.lineVolumeMl,
+        0,
+      );
+
+      const { rows: replInserted } = await tx.query<{ id: string }>(
+        `INSERT INTO pos_sales (
+           reference, checkout_id, corrected_from_sale_id, business_day_id, business_date, status,
+           total_centavos, cash_received_centavos, change_centavos,
+           total_containers, total_volume_ml, created_by_user_id, created_at
+         )
+         VALUES ($1, NULL, $2, $3, $4::date, 'ACTIVE', $5, $5, 0, $6, $7, $8, $9)
+         RETURNING id`,
+        [
+          replacementSaleReference,
+          input.originalSaleId,
+          input.originalBusinessDayId,
+          input.originalBusinessDate,
+          input.correctedTotalCentavos,
+          totalContainers,
+          totalVolumeMl,
+          input.completedByUserId,
+          input.now,
+        ],
+      );
+      replacementSaleId = replInserted[0]!.id;
+      await insertSaleItemRows(tx, replacementSaleId, input.correctedItems);
+
+      await tx.query(
+        `INSERT INTO pos_sale_actions (sale_id, action, actor_user_id, note, recorded_at)
+         VALUES ($1, 'SALE_SAVED', $2, $3, $4)`,
+        [
+          replacementSaleId,
+          input.completedByUserId,
+          `Replacement for ${input.originalSaleReference} (${input.actionReference}): ${input.reason}`,
+          input.now,
+        ],
+      );
+    }
+
+    await tx.query(
+      `UPDATE pos_sale_action_requests
+          SET status = 'COMPLETED',
+              cash_tendered_centavos = $2,
+              cash_change_centavos = $3,
+              cash_refunded_centavos = $4,
+              replacement_sale_id = $5,
+              replacement_sale_reference = $6,
+              completed_by_user_id = $7,
+              completed_at = $8,
+              updated_at = $8,
+              merchandise_plan = $9::jsonb
+        WHERE id = $1`,
+      [
+        input.actionId,
+        input.cashTenderedCentavos,
+        input.cashChangeCentavos,
+        input.cashRefundedCentavos,
+        replacementSaleId,
+        replacementSaleReference,
+        input.completedByUserId,
+        input.now,
+        JSON.stringify(input.merchandisePlan),
+      ],
+    );
+
+    const [actionRow, originalSale, replacementSale] = await Promise.all([
+      this.findSaleActionRowByReference(tx, input.actionReference),
+      this.findSaleByReference(tx, input.originalSaleReference),
+      replacementSaleReference ? this.findSaleByReference(tx, replacementSaleReference) : Promise.resolve(undefined),
+    ]);
+
+    return {
+      action: toSaleActionRequestView(actionRow!),
+      originalSale: originalSale!,
+      replacementSale: replacementSale ?? null,
+    };
+  },
+
+  async cancelSaleActionNoCash(
+    tx: Queryable,
+    input: {
+      actionId: string;
+      actionReference: string;
+      originalSaleReference: string;
+      cancelledByUserId: string;
+      cancelReason: string;
+      now: Date;
+    },
+  ): Promise<{ action: SaleActionRequestView; originalSale: SaleView }> {
+    await tx.query(
+      `UPDATE pos_sale_action_stock_commitments
+          SET status = 'RELEASED',
+              resolved_at = $2
+        WHERE sale_action_id = $1 AND status = 'ACTIVE'`,
+      [input.actionId, input.now],
+    );
+    await tx.query(
+      `UPDATE pos_sale_action_requests
+          SET status = 'CANCELLED_NO_CASH',
+              cancelled_by_user_id = $2,
+              cancelled_at = $3,
+              cancel_reason = $4,
+              updated_at = $3
+        WHERE id = $1`,
+      [input.actionId, input.cancelledByUserId, input.now, input.cancelReason],
+    );
+    const [actionRow, originalSale] = await Promise.all([
+      this.findSaleActionRowByReference(tx, input.actionReference),
+      this.findSaleByReference(tx, input.originalSaleReference),
+    ]);
+    return {
+      action: toSaleActionRequestView(actionRow!),
+      originalSale: originalSale!,
+    };
   },
 };

@@ -24,7 +24,9 @@ export type CheckoutStatus =
   | "SAVED"
   | "REVIEW_REQUIRED"
   | "SETTLED_PRIOR_DAY"
-  | "CANCELLED_DRAFT";
+  | "CANCELLED_DRAFT"
+  | "CANCELLED_NO_CASH"
+  | "REFUNDED_UNSAVED";
 export type SaleStatus = "ACTIVE" | "VOIDED";
 export type RecoveryState =
   | "SAVED"
@@ -32,7 +34,9 @@ export type RecoveryState =
   | "UNRESOLVED"
   | "REVIEW_REQUIRED"
   | "SETTLED_PRIOR_DAY"
-  | "CANCELLED";
+  | "CANCELLED"
+  | "CANCELLED_NO_CASH"
+  | "REFUNDED_UNSAVED";
 
 export interface CatalogRefill {
   code: string;
@@ -178,8 +182,120 @@ export interface PosDayResponse {
   day: DayView | null;
   unresolvedCheckouts: CheckoutView[];
   unpaidDrafts: CheckoutView[];
+  pendingSaleActions?: SaleActionRequestView[];
   priorDayReviewCheckouts?: CheckoutView[];
   replayed?: boolean;
+}
+
+export type SaleActionType = "VOID" | "CORRECT";
+export type SaleActionStatus = "PENDING" | "COMPLETED" | "CANCELLED_NO_CASH";
+export type SaleActionCashDirection = "REFUND" | "COLLECT" | "NONE";
+
+export interface SaleCashEventChain {
+  rootCashSale: {
+    reference: string;
+    totalCentavos: number;
+    cashReceivedCentavos: number;
+    changeCentavos: number;
+  };
+  correctionEvents: Array<{
+    actionReference: string;
+    originalSaleReference: string;
+    replacementSaleReference: string;
+    originalTotalCentavos: number;
+    correctedTotalCentavos: number;
+    cashDirection: SaleActionCashDirection;
+    cashDifferenceCentavos: number;
+    cashTenderedCentavos: number | null;
+    cashChangeCentavos: number | null;
+    cashRefundedCentavos: number | null;
+    completedAt: string | null;
+  }>;
+}
+
+export type SaleActionCountCoverage = "COVERED_BY_COUNT" | "UNCOVERED" | "UNCLEAR" | "PARTIAL";
+
+export interface SaleActionStockDispositionInput {
+  productId: string;
+  exchangedQuantity?: number;
+  eligibleReturnedQuantity?: number;
+  heldQuantity?: number;
+  notReturnedQuantity?: number;
+  holdReason?: string;
+  countCoverage?: SaleActionCountCoverage;
+  uncoveredReturnedQuantity?: number;
+  coveredByCountQuantity?: number;
+  unclearCoverageQuantity?: number;
+}
+
+export interface SaleActionMerchandisePlanItem {
+  productId: string;
+  productName: string;
+  unit: string;
+  originalQuantity: number;
+  correctedQuantity: number;
+  retainedQuantity: number;
+  exchangedQuantity: number;
+  addedQuantity: number;
+  returningFromSaleQuantity: number;
+  returningFilledQuantity?: number;
+  eligibleReturnedQuantity?: number;
+  notReturnedQuantity?: number;
+  restoredQuantity: number;
+  heldQuantity: number;
+  holdReason: string | null;
+  countCoveredQuantity: number;
+  unclearCoverageQuantity: number;
+  interveningReconciliationId: string | null;
+  interveningReconciliationAt: string | null;
+  interveningPhysicalCount: number | null;
+  countCoverage: SaleActionCountCoverage | null;
+}
+
+export interface SaleActionRequestView {
+  reference: string;
+  originalSaleReference: string;
+  originalSaleIsReplacement: boolean;
+  originalBusinessDate: string;
+  actionType: SaleActionType;
+  status: SaleActionStatus;
+  reason: string;
+  originalTotalCentavos: number;
+  originalCashReceivedCentavos: number | null;
+  originalChangeCentavos: number | null;
+  correctedTotalCentavos: number;
+  cashDifferenceCentavos: number;
+  cashDirection: SaleActionCashDirection;
+  correctedItems: QuoteLineItem[] | null;
+  merchandisePlan: {
+    hasMerchandise: boolean;
+    requiresInventoryReview?: boolean;
+    items?: SaleActionMerchandisePlanItem[];
+    retained: Array<{ productId: string; quantity: number }>;
+    added: Array<{ productId: string; quantity: number }>;
+    returned: Array<{ productId: string; quantity: number }>;
+    held: Array<{ productId: string; quantity: number; reason?: string | null }>;
+  };
+  cashTenderedCentavos: number | null;
+  cashChangeCentavos: number | null;
+  cashRefundedCentavos: number | null;
+  replacementSaleReference: string | null;
+  createdBy: string;
+  createdAt: string;
+  completedBy: string | null;
+  completedAt: string | null;
+  cancelledBy: string | null;
+  cancelledAt: string | null;
+  cancelReason: string | null;
+  updatedAt: string;
+}
+
+export interface SaleActionLookupResponse {
+  action: SaleActionRequestView;
+  originalSale: SaleView | null;
+  replacementSale: SaleView | null;
+  canConfirm: boolean;
+  canCancelNoCash: boolean;
 }
 
 export interface SaleActionView {
@@ -191,7 +307,7 @@ export interface SaleActionView {
 
 export interface SaleView {
   reference: string;
-  checkoutReference: string;
+  checkoutReference: string | null;
   businessDate: string;
   status: SaleStatus;
   totalCentavos: number;
@@ -202,6 +318,12 @@ export interface SaleView {
   totalVolumeLiters: number;
   createdBy: string;
   createdAt: string;
+  correctedFromSaleReference?: string | null;
+  replacedBySaleReference?: string | null;
+  sourceAction?: SaleActionRequestView | null;
+  cashEventChain?: SaleCashEventChain | null;
+  pendingAction?: SaleActionRequestView | null;
+  completedAction?: SaleActionRequestView | null;
   items: QuoteLineItem[];
   actionHistory: SaleActionView[];
 }
@@ -222,10 +344,42 @@ export interface PriorDaySettlementView {
   originalPaymentStartedAt?: string | null;
   originalPaymentRecordedAt: string | null;
   paymentKeptConfirmed: true;
-  refillDeliveredConfirmed: true;
+  refillDeliveredConfirmed: boolean;
+  itemsHandedOverConfirmed?: boolean;
   settledBy: string;
   settledAt: string;
   note: string | null;
+}
+
+export interface CheckoutHoldView {
+  id: string;
+  itemId: string;
+  itemName: string;
+  quantity: number;
+  unit: string;
+  reason: string;
+  posReference: string;
+  recordedBy: string;
+  recordedAt: string;
+}
+
+export interface CheckoutResolutionView {
+  checkoutReference: string;
+  originalBusinessDate: string;
+  resolutionDate: string;
+  outcome: "NO_CASH_CANCELLED" | "FULL_REFUND";
+  quoteTotalCentavos: number;
+  cashReceivedCentavos: number | null;
+  changeAlreadyGiven: boolean | null;
+  changeGivenCentavos: number | null;
+  refundedAmountCentavos: number | null;
+  items: QuoteLineItem[];
+  originalActor: string;
+  resolvedBy: string;
+  resolvedAt: string;
+  reason: string;
+  note: string | null;
+  heldItems: CheckoutHoldView[];
 }
 
 export interface CheckoutLookupView {
@@ -235,11 +389,23 @@ export interface CheckoutLookupView {
   canCancelUnpaid?: boolean;
   canSettlePriorDay?: boolean;
   canDismissCancelled?: boolean;
+  canResolveNoCashPriorDay?: boolean;
+  canResolveFullRefund?: boolean;
   ownedByCurrentUser: boolean;
   checkedAt: string;
   checkout: CheckoutView;
   sale: SaleView | null;
   settlement?: PriorDaySettlementView | null;
+  resolution?: CheckoutResolutionView | null;
+}
+
+export interface ResolveCheckoutResponse {
+  outcome: "RESOLVED";
+  replayed: boolean;
+  resolution: CheckoutResolutionView;
+  sale: null;
+  settlement: null;
+  checkout: CheckoutView;
 }
 
 export interface SettlePriorDayResponse {
@@ -360,7 +526,9 @@ export type RecoveryScreen =
   | "SAFE_TO_RETRY"
   | "REVIEW_REQUIRED"
   | "SETTLED_PRIOR_DAY"
-  | "CANCELLED";
+  | "CANCELLED"
+  | "CANCELLED_NO_CASH"
+  | "REFUNDED_UNSAVED";
 export type RecoveryTone = "warning" | "success" | "danger" | "neutral";
 
 export interface RecoveryPresentation {
@@ -374,6 +542,9 @@ export interface RecoveryPresentation {
   canContinueSettled: boolean;
   canSettlePriorDay: boolean;
   canDismissCancelled: boolean;
+  canResolveNoCashPriorDay: boolean;
+  canResolveFullRefund: boolean;
+  canContinueResolved: boolean;
   blocksNewSale: boolean;
   statusPillLabel: string;
   statusPillTone: RecoveryTone;
@@ -393,6 +564,7 @@ export interface RecoveryPresentation {
   checkedAt: string | null;
   sale: SaleView | null;
   settlement: PriorDaySettlementView | null;
+  resolution: CheckoutResolutionView | null;
 }
 
 export interface StorageLike {
@@ -792,24 +964,26 @@ export function clearUnpaidCartIfMatchesReference(
   return true;
 }
 
-export function isPriorDayMerchandiseOnly(items: QuoteLineItem[]): boolean {
+export function classifyCheckoutComposition(
+  items: QuoteLineItem[],
+): "REFILL_ONLY" | "MERCHANDISE_ONLY" | "MIXED" {
   const hasMerchandise = items.some(
     (item) => item.kind === "MERCHANDISE" || item.kind === "CONTAINER_PACKAGE",
   );
   const hasRefill = items.some(
     (item) => item.kind === "STANDARD" || item.kind === "CUSTOM",
   );
-  return hasMerchandise && !hasRefill;
+  if (hasMerchandise && hasRefill) return "MIXED";
+  if (hasMerchandise) return "MERCHANDISE_ONLY";
+  return "REFILL_ONLY";
 }
 
-export function isPriorDaySettleableComposition(items: QuoteLineItem[]): boolean {
-  const hasMerchandise = items.some(
-    (item) => item.kind === "MERCHANDISE" || item.kind === "CONTAINER_PACKAGE",
-  );
-  const hasRefill = items.some(
-    (item) => item.kind === "STANDARD" || item.kind === "CUSTOM",
-  );
-  return !(hasMerchandise && hasRefill);
+export function isPriorDayMerchandiseOnly(items: QuoteLineItem[]): boolean {
+  return classifyCheckoutComposition(items) === "MERCHANDISE_ONLY";
+}
+
+export function isPriorDaySettleableComposition(_items: QuoteLineItem[]): boolean {
+  return true;
 }
 
 export function createServerRecoveryRecord(
@@ -838,7 +1012,10 @@ export function createServerRecoveryRecord(
 function isTerminalLookup(lookup: CheckoutLookupView | null): boolean {
   return (
     lookup !== null &&
-    (lookup.recoveryState === "SAVED" || lookup.recoveryState === "SETTLED_PRIOR_DAY")
+    (lookup.recoveryState === "SAVED" ||
+      lookup.recoveryState === "SETTLED_PRIOR_DAY" ||
+      lookup.recoveryState === "CANCELLED_NO_CASH" ||
+      lookup.recoveryState === "REFUNDED_UNSAVED")
   );
 }
 
@@ -902,6 +1079,9 @@ export function resolveRecoveryPresentation(
       canContinueSettled: false,
       canSettlePriorDay: false,
       canDismissCancelled: false,
+      canResolveNoCashPriorDay: false,
+      canResolveFullRefund: false,
+      canContinueResolved: false,
       blocksNewSale: true,
       statusPillLabel: "Saved · verified",
       statusPillTone: "success",
@@ -923,12 +1103,15 @@ export function resolveRecoveryPresentation(
       checkedAt: lookup.checkedAt,
       sale,
       settlement: null,
+      resolution: null,
     };
   }
 
   if (lookup && lookup.recoveryState === "SETTLED_PRIOR_DAY" && lookup.settlement) {
     const settlement = lookup.settlement;
-    const isMerchOnly = isPriorDayMerchandiseOnly(settlement.items);
+    const composition = classifyCheckoutComposition(settlement.items);
+    const isMerchOnly = composition === "MERCHANDISE_ONLY";
+    const isMixed = composition === "MIXED";
     const cashReceived = settlement.cashReceivedCentavos ?? localCash;
     const change =
       settlement.changeCentavos ??
@@ -944,15 +1127,24 @@ export function resolveRecoveryPresentation(
       canContinueSettled: true,
       canSettlePriorDay: false,
       canDismissCancelled: false,
+      canResolveNoCashPriorDay: false,
+      canResolveFullRefund: false,
+      canContinueResolved: false,
       blocksNewSale: true,
       statusPillLabel: "Settled · prior day",
       statusPillTone: "success",
-      headline: isMerchOnly ? "Prior-day merchandise settled" : "Prior-day refill settled",
+      headline: isMixed
+        ? "Prior-day mixed order settled"
+        : isMerchOnly
+          ? "Prior-day merchandise settled"
+          : "Prior-day refill settled",
       subline: `Settlement recorded on ${settlement.settlementDate} · checked at ${formatManilaTimeWithSeconds(lookup.checkedAt)}.`,
       calloutTitle: "No further payment collected",
-      calloutBody: isMerchOnly
-        ? `Confirmed paid and handed over from ${settlement.originalBusinessDate}. Recorded separately from today's sales.`
-        : `Confirmed paid and delivered from ${settlement.originalBusinessDate}. Recorded separately from today's refill sales.`,
+      calloutBody: isMixed
+        ? `Confirmed paid and all refills and merchandise handed over from ${settlement.originalBusinessDate}. Recorded separately from today's sales.`
+        : isMerchOnly
+          ? `Confirmed paid and handed over from ${settlement.originalBusinessDate}. Recorded separately from today's sales.`
+          : `Confirmed paid and delivered from ${settlement.originalBusinessDate}. Recorded separately from today's refill sales.`,
       calloutTone: "success",
       amounts: {
         totalCentavos: settlement.netAmountKeptCentavos,
@@ -965,6 +1157,97 @@ export function resolveRecoveryPresentation(
       checkedAt: lookup.checkedAt,
       sale: null,
       settlement,
+      resolution: null,
+    };
+  }
+
+  if (lookup && lookup.recoveryState === "CANCELLED_NO_CASH" && lookup.resolution) {
+    const res = lookup.resolution;
+    const heldCount = res.heldItems.reduce((sum, item) => sum + item.quantity, 0);
+    return {
+      screen: "CANCELLED_NO_CASH",
+      isDifferentAccount,
+      needsOriginalBrowserForRetry: false,
+      canCheckStatus: false,
+      canRetry: false,
+      canCancelUnpaid: false,
+      canContinueSaved: false,
+      canContinueSettled: false,
+      canSettlePriorDay: false,
+      canDismissCancelled: false,
+      canResolveNoCashPriorDay: false,
+      canResolveFullRefund: false,
+      canContinueResolved: true,
+      blocksNewSale: true,
+      statusPillLabel: "Cancelled · no cash",
+      statusPillTone: "neutral",
+      headline: "Prior-day checkout cancelled (no cash)",
+      subline: `Resolved on ${res.resolutionDate} · checked at ${formatManilaTimeWithSeconds(lookup.checkedAt)}.`,
+      calloutTitle: "No cash received and no sale created",
+      calloutBody: `Confirmed by ${res.resolvedBy} that no cash was received for this ${res.originalBusinessDate} checkout. Ordinary stock reservations were released${
+        heldCount > 0
+          ? `, and ${heldCount} held unit${heldCount === 1 ? " remains" : "s remain"} unavailable in Inventory and POS`
+          : ""
+      }; do not collect payment, refund, or hand over items.`,
+      calloutTone: "warning",
+      amounts: {
+        totalCentavos: res.quoteTotalCentavos,
+        cashReceivedCentavos: null,
+        changeCentavos: null,
+        totalContainers: lookup.checkout.totalContainers,
+        totalVolumeLiters: lookup.checkout.totalVolumeLiters,
+        items: res.items,
+      },
+      checkedAt: lookup.checkedAt,
+      sale: null,
+      settlement: null,
+      resolution: res,
+    };
+  }
+
+  if (lookup && lookup.recoveryState === "REFUNDED_UNSAVED" && lookup.resolution) {
+    const res = lookup.resolution;
+    const refundedLabel =
+      res.refundedAmountCentavos !== null ? formatCentavos(res.refundedAmountCentavos) : "full cash";
+    const heldCount = res.heldItems.reduce((sum, item) => sum + item.quantity, 0);
+    return {
+      screen: "REFUNDED_UNSAVED",
+      isDifferentAccount,
+      needsOriginalBrowserForRetry: false,
+      canCheckStatus: false,
+      canRetry: false,
+      canCancelUnpaid: false,
+      canContinueSaved: false,
+      canContinueSettled: false,
+      canSettlePriorDay: false,
+      canDismissCancelled: false,
+      canResolveNoCashPriorDay: false,
+      canResolveFullRefund: false,
+      canContinueResolved: true,
+      blocksNewSale: true,
+      statusPillLabel: "Refunded · unsaved",
+      statusPillTone: "neutral",
+      headline: "Unsaved checkout refunded in full",
+      subline: `Resolved on ${res.resolutionDate} · checked at ${formatManilaTimeWithSeconds(lookup.checkedAt)}.`,
+      calloutTitle: `${refundedLabel} refunded — no sale created`,
+      calloutBody: `Confirmed by ${res.resolvedBy} that the order was undelivered and ${refundedLabel} was returned to the customer.${
+        heldCount > 0
+          ? ` ${heldCount} held unit${heldCount === 1 ? " remains" : "s remain"} unavailable in Inventory and POS.`
+          : ""
+      } Do not collect payment, refund again, or hand over items.`,
+      calloutTone: "warning",
+      amounts: {
+        totalCentavos: res.quoteTotalCentavos,
+        cashReceivedCentavos: res.cashReceivedCentavos,
+        changeCentavos: res.changeGivenCentavos,
+        totalContainers: lookup.checkout.totalContainers,
+        totalVolumeLiters: lookup.checkout.totalVolumeLiters,
+        items: res.items,
+      },
+      checkedAt: lookup.checkedAt,
+      sale: null,
+      settlement: null,
+      resolution: res,
     };
   }
 
@@ -989,6 +1272,9 @@ export function resolveRecoveryPresentation(
       canContinueSettled: false,
       canSettlePriorDay: false,
       canDismissCancelled: true,
+      canResolveNoCashPriorDay: false,
+      canResolveFullRefund: false,
+      canContinueResolved: false,
       blocksNewSale: true,
       statusPillLabel: "Cancelled",
       statusPillTone: "neutral",
@@ -1008,6 +1294,7 @@ export function resolveRecoveryPresentation(
       checkedAt: lookup.checkedAt,
       sale: null,
       settlement: null,
+      resolution: null,
     };
   }
 
@@ -1023,12 +1310,26 @@ export function resolveRecoveryPresentation(
     const isPriorDay = effectiveTodayDate
       ? lookup.checkout.businessDate < effectiveTodayDate
       : lookup.reason === "BUSINESS_DATE_CROSSED";
+    const isEligibleStatus =
+      lookup.checkout.status === "REVIEW_REQUIRED" ||
+      lookup.checkout.status === "PAYMENT_PENDING";
     const canSettlePriorDay =
-      isPriorDaySettleableComposition(lookup.checkout.items) &&
+      currentUserRole === "OWNER" && isPriorDay && isEligibleStatus;
+    const canResolveNoCashPriorDay =
       currentUserRole === "OWNER" &&
-      isPriorDay &&
-      (lookup.checkout.status === "REVIEW_REQUIRED" ||
-        lookup.checkout.status === "PAYMENT_PENDING");
+      (lookup.canResolveNoCashPriorDay ??
+        (isPriorDay &&
+          lookup.checkout.status === "PAYMENT_PENDING" &&
+          lookup.checkout.cashReceivedCentavos === null &&
+          lookup.checkout.paymentRecordedAt === null));
+    const canResolveFullRefund =
+      currentUserRole === "OWNER" && (lookup.canResolveFullRefund ?? isEligibleStatus);
+    const canCancelUnpaid =
+      !isDifferentAccount &&
+      lookup.canCancelUnpaid === true &&
+      lookup.checkout.status === "DRAFT" &&
+      lookup.checkout.cashReceivedCentavos === null &&
+      lookup.checkout.paymentRecordedAt === null;
 
     return {
       screen: "REVIEW_REQUIRED",
@@ -1036,24 +1337,31 @@ export function resolveRecoveryPresentation(
       needsOriginalBrowserForRetry: false,
       canCheckStatus: true,
       canRetry: false,
-      canCancelUnpaid: false,
+      canCancelUnpaid,
       canContinueSaved: false,
       canContinueSettled: false,
       canSettlePriorDay,
       canDismissCancelled: false,
+      canResolveNoCashPriorDay,
+      canResolveFullRefund,
+      canContinueResolved: false,
       blocksNewSale: true,
       statusPillLabel: "Review required",
       statusPillTone: "danger",
       headline: "Owner review required",
       subline: `Transaction status checked at ${formatManilaTimeWithSeconds(lookup.checkedAt)}.`,
-      calloutTitle: isDateCrossed
-        ? "Business date changed before save"
-        : isDayClosed
-          ? "Station day closed before save"
-          : "Manual review required",
-      calloutBody: isDateCrossed
-        ? "This checkout crossed the Manila midnight boundary and cannot be saved automatically as a backdated sale. Keep this reference and payment amounts for Owner review."
-        : "This checkout cannot be saved automatically. Keep this reference and payment details for Owner review; no automatic refund is issued.",
+      calloutTitle: canCancelUnpaid
+        ? "Unpaid filled draft crossed Manila midnight"
+        : isDateCrossed
+          ? "Business date changed before save"
+          : isDayClosed
+            ? "Station day closed before save"
+            : "Manual review required",
+      calloutBody: canCancelUnpaid
+        ? "This unpaid filled-container draft has not started cash payment and crossed Manila midnight while the station day is still open. Record the affected filled-container disposition and confirm no cash was received to cancel it."
+        : isDateCrossed
+          ? "This checkout crossed the Manila midnight boundary and cannot be saved automatically as a backdated sale. Keep this reference and payment amounts for Owner review."
+          : "This checkout cannot be saved automatically. Keep this reference and payment details for Owner review.",
       calloutTone: "danger",
       amounts: {
         totalCentavos: serverTotal,
@@ -1066,15 +1374,19 @@ export function resolveRecoveryPresentation(
       checkedAt: lookup.checkedAt,
       sale: null,
       settlement: null,
+      resolution: null,
     };
   }
 
   if (lookup && lookup.recoveryState === "SAFE_TO_RETRY" && lookup.canRetry && !isDifferentAccount) {
     const serverTotal = lookup.checkout.totalCentavos;
+    const canResolveFullRefund =
+      currentUserRole === "OWNER" &&
+      (lookup.canResolveFullRefund ?? lookup.checkout.status === "PAYMENT_PENDING");
     if (!hasLocalTender) {
       const canCancelUnpaid =
         lookup.canCancelUnpaid === true &&
-        lookup.checkout.status === "PAYMENT_PENDING" &&
+        (lookup.checkout.status === "PAYMENT_PENDING" || lookup.checkout.status === "DRAFT") &&
         lookup.checkout.cashReceivedCentavos === null &&
         lookup.checkout.paymentRecordedAt === null;
       return {
@@ -1088,14 +1400,22 @@ export function resolveRecoveryPresentation(
         canContinueSettled: false,
         canSettlePriorDay: false,
         canDismissCancelled: false,
+        canResolveNoCashPriorDay: false,
+        canResolveFullRefund,
+        canContinueResolved: false,
         blocksNewSale: true,
         statusPillLabel: "Not saved · verified",
         statusPillTone: "warning",
-        headline: "Not saved. Check original device.",
+        headline:
+          lookup.checkout.status === "DRAFT"
+            ? "Unpaid filled draft found."
+            : "Not saved. Check original device.",
         subline: `Transaction status checked at ${formatManilaTimeWithSeconds(lookup.checkedAt)}.`,
         calloutTitle: "Do not take payment again.",
         calloutBody: canCancelUnpaid
-          ? "A server check confirmed this transaction was not saved, and the original cash tender is not stored on this device. Sign back in on the original browser to check status and resume recovery, or confirm no cash was received to cancel this unpaid checkout."
+          ? lookup.checkout.status === "DRAFT"
+            ? "This unpaid filled-container draft has not started cash payment on this browser. Record the affected filled-container disposition and confirm no cash was received to cancel it."
+            : "A server check confirmed this transaction was not saved, and the original cash tender is not stored on this device. Sign back in on the original browser to check status and resume recovery, or confirm no cash was received to cancel this unpaid checkout."
           : "A server check confirmed this transaction was not saved, and the original cash tender is not stored on this device. Sign back in on the original browser to check status and resume the existing recovery flow.",
         calloutTone: "warning",
         amounts: {
@@ -1109,6 +1429,7 @@ export function resolveRecoveryPresentation(
         checkedAt: lookup.checkedAt,
         sale: null,
         settlement: null,
+        resolution: null,
       };
     }
 
@@ -1123,6 +1444,9 @@ export function resolveRecoveryPresentation(
       canContinueSettled: false,
       canSettlePriorDay: false,
       canDismissCancelled: false,
+      canResolveNoCashPriorDay: false,
+      canResolveFullRefund,
+      canContinueResolved: false,
       blocksNewSale: true,
       statusPillLabel: "Not saved · verified",
       statusPillTone: "neutral",
@@ -1143,6 +1467,7 @@ export function resolveRecoveryPresentation(
       checkedAt: lookup.checkedAt,
       sale: null,
       settlement: null,
+      resolution: null,
     };
   }
 
@@ -1163,6 +1488,15 @@ export function resolveRecoveryPresentation(
       items: serverCheckout.items,
     }
     : localAmounts;
+  const canResolveFullRefundUnknown =
+    currentUserRole === "OWNER" &&
+    Boolean(
+      lookup &&
+      !inProgress &&
+      (lookup.canResolveFullRefund ??
+        (lookup.checkout.status === "PAYMENT_PENDING" ||
+          lookup.checkout.status === "REVIEW_REQUIRED")),
+    );
 
   return {
     screen: "UNKNOWN",
@@ -1175,6 +1509,9 @@ export function resolveRecoveryPresentation(
     canContinueSettled: false,
     canSettlePriorDay: false,
     canDismissCancelled: false,
+    canResolveNoCashPriorDay: false,
+    canResolveFullRefund: canResolveFullRefundUnknown,
+    canContinueResolved: false,
     blocksNewSale: true,
     statusPillLabel: isDifferentAccount
       ? "Pending · other account"
@@ -1203,6 +1540,7 @@ export function resolveRecoveryPresentation(
     checkedAt: lookup?.checkedAt ?? null,
     sale: null,
     settlement: null,
+    resolution: null,
   };
 }
 
@@ -1217,6 +1555,10 @@ export function formatRecoveryCheckFeedback(
       return `Status confirmed (${checkedTime}) — sale is already saved.`;
     case "SETTLED_PRIOR_DAY":
       return `Status confirmed (${checkedTime}) — prior-day settlement is already recorded.`;
+    case "CANCELLED_NO_CASH":
+      return `Status confirmed (${checkedTime}) — prior-day checkout was cancelled with no cash received.`;
+    case "REFUNDED_UNSAVED":
+      return `Status confirmed (${checkedTime}) — unsaved checkout was resolved with a full refund.`;
     case "CANCELLED":
       return `Status confirmed (${checkedTime}) — checkout was cancelled with no payment recorded.`;
     case "SAFE_TO_RETRY":
@@ -1294,6 +1636,7 @@ export function evaluateEndDayGuard(input: {
   businessDate: string | null;
   serverUnresolved: CheckoutView[];
   serverUnpaidDrafts: CheckoutView[];
+  serverPendingSaleActions?: SaleActionRequestView[];
   localPendingRecoveries: PendingCheckoutRecovery[];
   activeConfirming: PendingCheckoutRecovery | null;
 }): EndDayGuardResult {
@@ -1333,6 +1676,17 @@ export function evaluateEndDayGuard(input: {
     blockingEntries.push({
       reference: checkout.reference,
       label,
+      source: "server",
+    });
+    blockingRefs.add(refKey);
+  }
+
+  for (const action of input.serverPendingSaleActions ?? []) {
+    const refKey = action.reference.trim().toUpperCase();
+    if (blockingRefs.has(refKey)) continue;
+    blockingEntries.push({
+      reference: action.reference,
+      label: `${action.actionType === "VOID" ? "Pending Void Sale" : "Pending Correct Sale"} on ${action.originalSaleReference} (${action.createdBy})`,
       source: "server",
     });
     blockingRefs.add(refKey);

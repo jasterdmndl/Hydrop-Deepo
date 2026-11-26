@@ -438,5 +438,7 @@ describe("dashboardView helpers", () => {
       });
 
       expect(formatStockMovementTypeLabel("PRIOR_DAY_SETTLEMENT")).toBe("Prior-Day Settlement");
+      expect(formatStockMovementTypeLabel("SALE_ACTION_DEDUCTION")).toBe("Sale Correction Deduction");
+      expect(formatStockMovementTypeLabel("SALE_ACTION_RESTORATION")).toBe("Sale Return Restoration");
     });
   });

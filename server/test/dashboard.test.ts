@@ -1902,4 +1902,317 @@ describe("Final Dashboard Sales comparison, breakdowns, and recommendations (DEC
       { balanceAfter: 10, recordedAt: "2026-11-17T12:00:00.400+08:00" },
     ]);
   });
+
+  it("places Active corrected replacements in matched partial-day comparisons by original purchase time (Task 4 Finding 1)", async () => {
+    ctx.clock.set("2026-11-18T08:50:00+08:00");
+    owner = await reauth(ctx, "owner1", owner);
+    expect((await startDay(ctx, owner, "f1-day1-start")).status).toBe(201);
+
+    // Pre-cutoff Day 1 sales (09:01, 09:05, 09:10 Manila)
+    ctx.clock.set("2026-11-18T09:01:00+08:00");
+    const saleA = await sellCart(
+      ctx,
+      owner,
+      [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 1 }],
+      2500,
+      "f1-sale-a",
+    ); // ₱25
+
+    ctx.clock.set("2026-11-18T09:05:00+08:00");
+    const saleB = await sellCart(
+      ctx,
+      owner,
+      [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 1 }],
+      2500,
+      "f1-sale-b",
+    ); // ₱25
+
+    ctx.clock.set("2026-11-18T09:10:00+08:00");
+    const saleVoid = await sellCart(
+      ctx,
+      owner,
+      [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 1 }],
+      2500,
+      "f1-sale-void",
+    ); // ₱25
+
+    // Post-cutoff Day 1 sale (14:00 Manila, after 10:05 comparison cutoff)
+    ctx.clock.set("2026-11-18T14:00:00+08:00");
+    owner = await reauth(ctx, "owner1", owner);
+    const saleLate = await sellCart(
+      ctx,
+      owner,
+      [{ kind: "STANDARD", waterType: "ALKALINE", quantity: 1 }],
+      3500,
+      "f1-sale-late",
+    ); // ₱35
+
+    // Unresolved PAYMENT_PENDING checkout on Day 1 for separate Day 2 settlement check
+    ctx.clock.set("2026-11-18T14:30:00+08:00");
+    owner = await reauth(ctx, "owner1", owner);
+    const prepPending = await request(ctx.app)
+      .post("/api/pos/checkouts")
+      .set("Cookie", owner.cookie)
+      .set("X-CSRF-Token", owner.csrfToken)
+      .send({
+        prepareKey: "f1-pending-prior",
+        items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 1 }],
+      });
+    expect(prepPending.status).toBe(201);
+    const pendingRef = prepPending.body.checkout.reference as string;
+    expect(
+      (
+        await request(ctx.app)
+          .post(`/api/pos/checkouts/${encodeURIComponent(pendingRef)}/begin-payment`)
+          .set("Cookie", owner.cookie)
+          .set("X-CSRF-Token", owner.csrfToken)
+          .send({})
+      ).status,
+    ).toBe(200);
+
+    // Same-day late correction on 09:01 saleA at 15:00 (₱25 -> ₱50), then chained at 16:00 (₱50 -> ₱75)
+    ctx.clock.set("2026-11-18T15:00:00+08:00");
+    owner = await reauth(ctx, "owner1", owner);
+    const prepA1 = await request(ctx.app)
+      .post(`/api/pos/sales/${encodeURIComponent(saleA.reference)}/actions`)
+      .set("Cookie", owner.cookie)
+      .set("X-CSRF-Token", owner.csrfToken)
+      .send({
+        actionType: "CORRECT",
+        reason: "First correction after cutoff",
+        prepareKey: "f1-corr-a1",
+        items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 2 }],
+      });
+    expect(prepA1.status).toBe(201);
+    const confA1 = await request(ctx.app)
+      .post(`/api/pos/sale-actions/${encodeURIComponent(prepA1.body.action.reference)}/confirm`)
+      .set("Cookie", owner.cookie)
+      .set("X-CSRF-Token", owner.csrfToken)
+      .send({ cashConfirmed: true, cashTenderedCentavos: 2500 });
+    expect(confA1.status).toBe(201);
+    const saleA1Ref = confA1.body.replacementSale.reference as string;
+
+    // Same-day late correction on 14:00 post-cutoff saleLate at 15:30 (₱35 -> ₱70)
+    ctx.clock.set("2026-11-18T15:30:00+08:00");
+    owner = await reauth(ctx, "owner1", owner);
+    const prepLate = await request(ctx.app)
+      .post(`/api/pos/sales/${encodeURIComponent(saleLate.reference)}/actions`)
+      .set("Cookie", owner.cookie)
+      .set("X-CSRF-Token", owner.csrfToken)
+      .send({
+        actionType: "CORRECT",
+        reason: "Correction on post-cutoff purchase",
+        prepareKey: "f1-corr-late",
+        items: [{ kind: "STANDARD", waterType: "ALKALINE", quantity: 2 }],
+      });
+    expect(prepLate.status).toBe(201);
+    expect(
+      (
+        await request(ctx.app)
+          .post(`/api/pos/sale-actions/${encodeURIComponent(prepLate.body.action.reference)}/confirm`)
+          .set("Cookie", owner.cookie)
+          .set("X-CSRF-Token", owner.csrfToken)
+          .send({ cashConfirmed: true, cashTenderedCentavos: 3500 })
+      ).status,
+    ).toBe(201);
+
+    // Void the 09:10 sale at 15:45 (must remain ₱0)
+    ctx.clock.set("2026-11-18T15:45:00+08:00");
+    owner = await reauth(ctx, "owner1", owner);
+    const prepVoid = await request(ctx.app)
+      .post(`/api/pos/sales/${encodeURIComponent(saleVoid.reference)}/actions`)
+      .set("Cookie", owner.cookie)
+      .set("X-CSRF-Token", owner.csrfToken)
+      .send({
+        actionType: "VOID",
+        reason: "Void after cutoff",
+        prepareKey: "f1-void",
+      });
+    expect(prepVoid.status).toBe(201);
+    expect(
+      (
+        await request(ctx.app)
+          .post(`/api/pos/sale-actions/${encodeURIComponent(prepVoid.body.action.reference)}/confirm`)
+          .set("Cookie", owner.cookie)
+          .set("X-CSRF-Token", owner.csrfToken)
+          .send({ cashConfirmed: true })
+      ).status,
+    ).toBe(201);
+
+    // Chained second correction on saleA1 at 16:00 (₱50 -> ₱75)
+    ctx.clock.set("2026-11-18T16:00:00+08:00");
+    owner = await reauth(ctx, "owner1", owner);
+    const prepA2 = await request(ctx.app)
+      .post(`/api/pos/sales/${encodeURIComponent(saleA1Ref)}/actions`)
+      .set("Cookie", owner.cookie)
+      .set("X-CSRF-Token", owner.csrfToken)
+      .send({
+        actionType: "CORRECT",
+        reason: "Chained correction after cutoff",
+        prepareKey: "f1-corr-a2",
+        items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 3 }],
+      });
+    expect(prepA2.status).toBe(201);
+    expect(
+      (
+        await request(ctx.app)
+          .post(`/api/pos/sale-actions/${encodeURIComponent(prepA2.body.action.reference)}/confirm`)
+          .set("Cookie", owner.cookie)
+          .set("X-CSRF-Token", owner.csrfToken)
+          .send({ cashConfirmed: true, cashTenderedCentavos: 2500 })
+      ).status,
+    ).toBe(201);
+
+    // Prepare cross-midnight correction on 09:05 saleB before midnight (₱25 -> ₱50)
+    ctx.clock.set("2026-11-18T23:55:00+08:00");
+    owner = await reauth(ctx, "owner1", owner);
+    const prepB1 = await request(ctx.app)
+      .post(`/api/pos/sales/${encodeURIComponent(saleB.reference)}/actions`)
+      .set("Cookie", owner.cookie)
+      .set("X-CSRF-Token", owner.csrfToken)
+      .send({
+        actionType: "CORRECT",
+        reason: "Prepared before midnight",
+        prepareKey: "f1-corr-b1",
+        items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 2 }],
+      });
+    expect(prepB1.status).toBe(201);
+
+    // Complete cross-midnight correction on 2026-11-19 at 10:00 Manila, settle pending checkout, close Day 1, start Day 2
+    ctx.clock.set("2026-11-19T10:00:00+08:00");
+    owner = await reauth(ctx, "owner1", owner);
+    const confB1 = await request(ctx.app)
+      .post(`/api/pos/sale-actions/${encodeURIComponent(prepB1.body.action.reference)}/confirm`)
+      .set("Cookie", owner.cookie)
+      .set("X-CSRF-Token", owner.csrfToken)
+      .send({ cashConfirmed: true, cashTenderedCentavos: 2500 });
+    expect(confB1.status).toBe(201);
+    const saleB1Ref = confB1.body.replacementSale.reference as string;
+    expect(confB1.body.replacementSale.createdAt).toBe("2026-11-19T10:00:00+08:00");
+
+    expect(
+      (
+        await request(ctx.app)
+          .post(`/api/pos/checkouts/${encodeURIComponent(pendingRef)}/settle`)
+          .set("Cookie", owner.cookie)
+          .set("X-CSRF-Token", owner.csrfToken)
+          .send({
+            paymentKeptConfirmed: true,
+            refillDeliveredConfirmed: true,
+          })
+      ).status,
+    ).toBe(201);
+
+    expect((await endDay(ctx, owner, "f1-day1-end")).status).toBe(200);
+    expect((await startDay(ctx, owner, "f1-day2-start")).status).toBe(201);
+
+    // Day 2 pre-cutoff purchase at 10:02 (₱35)
+    ctx.clock.set("2026-11-19T10:02:00+08:00");
+    const day2PreSale = await sellCart(
+      ctx,
+      owner,
+      [{ kind: "STANDARD", waterType: "ALKALINE", quantity: 1 }],
+      5000,
+      "f1-day2-pre",
+    ); // ₱35
+
+    // Query Today at 2026-11-19 10:05 Manila -> matched comparison vs 2026-11-18 through 10:05
+    // Must include chained saleA2 (₱75, origin 09:01) + cross-midnight saleB1 (₱50, origin 09:05) = ₱125,
+    // while excluding 14:00 saleLate correction (₱70), voided 09:10 saleVoid (₱0), and separate prior-day settlement (₱25).
+    ctx.clock.set("2026-11-19T10:05:00+08:00");
+    const day2Today = await request(ctx.app)
+      .get("/api/dashboard/sales?period=today")
+      .set("Cookie", owner.cookie);
+    expect(day2Today.status).toBe(200);
+    expect(day2Today.body.totals.salesCentavos).toBe(3500);
+    expect(day2Today.body.comparison).toMatchObject({
+      available: true,
+      currentTotalSalesCentavos: 3500,
+      previousTotalSalesCentavos: 12500,
+      amountChangeCentavos: -9000,
+      previousRange: {
+        from: "2026-11-18",
+        to: "2026-11-18",
+      },
+    });
+    expect(day2Today.body.priorDaySettlements).toHaveLength(1);
+    expect(day2Today.body.priorDaySettlements[0].netAmountKeptCentavos).toBe(2500);
+
+    // Full-day 2026-11-18 report still includes all three Active sales (₱75 + ₱50 + ₱70 = ₱195)
+    const day1Full = await request(ctx.app)
+      .get("/api/dashboard/sales?period=custom&from=2026-11-18&to=2026-11-18")
+      .set("Cookie", owner.cookie);
+    expect(day1Full.status).toBe(200);
+    expect(day1Full.body.totals).toEqual({
+      salesCentavos: 19500,
+      containersRefilled: 7,
+      waterVolumeMl: 175000,
+      transactions: 3,
+    });
+
+    // Audit timestamp on replacement saleB1 stays its actual completion time (2026-11-19T10:00:00+08:00)
+    const day1History = await request(ctx.app)
+      .get("/api/pos/sales?date=2026-11-18")
+      .set("Cookie", owner.cookie);
+    expect(day1History.status).toBe(200);
+    const histB1 = day1History.body.sales.find((s: { reference: string }) => s.reference === saleB1Ref);
+    expect(histB1).toBeDefined();
+    expect(histB1.createdAt).toBe("2026-11-19T10:00:00+08:00");
+
+    // Current-day late correction on Day 2 (10:02 corrected at 14:00 -> ₱70) + post-cutoff purchase at 14:30 (₱25)
+    // stays placed at 10:02 when Day 3 (2026-11-20 10:05) compares against Day 2 through 10:05.
+    ctx.clock.set("2026-11-19T14:00:00+08:00");
+    owner = await reauth(ctx, "owner1", owner);
+    const prepDay2Late = await request(ctx.app)
+      .post(`/api/pos/sales/${encodeURIComponent(day2PreSale.reference)}/actions`)
+      .set("Cookie", owner.cookie)
+      .set("X-CSRF-Token", owner.csrfToken)
+      .send({
+        actionType: "CORRECT",
+        reason: "Current-day correction after morning hour",
+        prepareKey: "f1-day2-corr",
+        items: [{ kind: "STANDARD", waterType: "ALKALINE", quantity: 2 }],
+      });
+    expect(prepDay2Late.status).toBe(201);
+    expect(
+      (
+        await request(ctx.app)
+          .post(`/api/pos/sale-actions/${encodeURIComponent(prepDay2Late.body.action.reference)}/confirm`)
+          .set("Cookie", owner.cookie)
+          .set("X-CSRF-Token", owner.csrfToken)
+          .send({ cashConfirmed: true, cashTenderedCentavos: 3500 })
+      ).status,
+    ).toBe(201);
+
+    ctx.clock.set("2026-11-19T14:30:00+08:00");
+    owner = await reauth(ctx, "owner1", owner);
+    await sellCart(
+      ctx,
+      owner,
+      [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 1 }],
+      2500,
+      "f1-day2-post",
+    ); // ₱25 (must stay outside 10:05 cutoff)
+
+    expect((await endDay(ctx, owner, "f1-day2-end")).status).toBe(200);
+    ctx.clock.set("2026-11-20T10:05:00+08:00");
+    owner = await reauth(ctx, "owner1", owner);
+    expect((await startDay(ctx, owner, "f1-day3-start")).status).toBe(201);
+
+    const day3Today = await request(ctx.app)
+      .get("/api/dashboard/sales?period=today")
+      .set("Cookie", owner.cookie);
+    expect(day3Today.status).toBe(200);
+    expect(day3Today.body.totals.salesCentavos).toBe(0);
+    expect(day3Today.body.comparison).toMatchObject({
+      available: true,
+      currentTotalSalesCentavos: 0,
+      previousTotalSalesCentavos: 7000,
+      amountChangeCentavos: -7000,
+      previousRange: {
+        from: "2026-11-19",
+        to: "2026-11-19",
+      },
+    });
+  });
 });

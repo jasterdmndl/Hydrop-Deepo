@@ -1087,4 +1087,117 @@ describe("Inventory Round/Slim opening stock and merchandise products (DEC-065, 
     );
     expect(movRows[0]!.count).toBe("0");
   });
+
+  it("exposes pre-sale holds and reduced availableQuantity in Inventory items and blocks reconciling below active holds", async () => {
+    expect(
+      (
+        await request(ctx.app)
+          .patch("/api/inventory/containers/ROUND")
+          .set("Cookie", owner.cookie)
+          .set("X-CSRF-Token", owner.csrfToken)
+          .send({ showInPos: true })
+      ).status,
+    ).toBe(200);
+    const opening = await postOpeningStock(ctx, owner, "ROUND", { quantity: 4 });
+    expect(opening.status).toBe(201);
+    const roundId = opening.body.item.id as string;
+    const revision = opening.body.item.stockRevision as number;
+
+    expect(
+      (
+        await request(ctx.app)
+          .post("/api/pos/day/start")
+          .set("Cookie", owner.cookie)
+          .set("X-CSRF-Token", owner.csrfToken)
+          .send({ requestKey: "inv-hold-day" })
+      ).status,
+    ).toBe(201);
+
+    const prep = await request(ctx.app)
+      .post("/api/pos/checkouts")
+      .set("Cookie", cashier.cookie)
+      .set("X-CSRF-Token", cashier.csrfToken)
+      .send({
+        prepareKey: "inv-hold-prep",
+        items: [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_PURIFIED",
+            includedGripo: "PUSH_TYPE",
+            quantity: 2,
+          },
+        ],
+      });
+    expect(prep.status).toBe(201);
+    const ref = prep.body.checkout.reference as string;
+
+    expect(
+      (
+        await request(ctx.app)
+          .post(`/api/pos/checkouts/${encodeURIComponent(ref)}/begin-payment`)
+          .set("Cookie", cashier.cookie)
+          .set("X-CSRF-Token", cashier.csrfToken)
+          .send({})
+      ).status,
+    ).toBe(200);
+
+    const holdReason = "Cancelled filled order held for health office check";
+    expect(
+      (
+        await request(ctx.app)
+          .post(`/api/pos/checkouts/${encodeURIComponent(ref)}/resolve`)
+          .set("Cookie", owner.cookie)
+          .set("X-CSRF-Token", owner.csrfToken)
+          .send({
+            outcome: "FULL_REFUND",
+            undeliveredConfirmed: true,
+            fullRefundConfirmed: true,
+            cashReceivedCentavos: 40000,
+            changeAlreadyGiven: false,
+            heldItems: [{ productId: roundId, quantity: 2, reason: holdReason }],
+          })
+      ).status,
+    ).toBe(201);
+
+    const listRes = await request(ctx.app).get("/api/inventory/items").set("Cookie", cashier.cookie);
+    expect(listRes.status).toBe(200);
+    const roundItem = listRes.body.items.find((item: any) => item.id === roundId);
+    expect(roundItem).toMatchObject({
+      currentQuantity: 4,
+      heldQuantity: 2,
+      availableQuantity: 2,
+    });
+    expect(roundItem.activeHolds).toHaveLength(1);
+    expect(roundItem.activeHolds[0]).toMatchObject({
+      quantity: 2,
+      reason: holdReason,
+      posReference: ref,
+    });
+
+    // Cannot reconcile physical count below the 2 held units
+    const blockedRec = await postReconciliation(ctx, owner, "ROUND", {
+      physicalCount: 1,
+      reason: "Attempting count below active holds",
+      expectedRevision: revision,
+      expectedCurrentQuantity: 4,
+      requestKey: "rec-below-hold",
+    });
+    expect(blockedRec.status).toBe(409);
+    expect(blockedRec.body.error.code).toBe("ACTIVE_STOCK_HOLD");
+
+    // Reconciling to >= held units succeeds
+    const validRec = await postReconciliation(ctx, owner, "ROUND", {
+      physicalCount: 3,
+      reason: "Found 3 physical containers including 2 held filled",
+      expectedRevision: revision,
+      expectedCurrentQuantity: 4,
+      requestKey: "rec-above-hold",
+    });
+    expect(validRec.status).toBe(201);
+    expect(validRec.body.item).toMatchObject({
+      currentQuantity: 3,
+      heldQuantity: 2,
+      availableQuantity: 1,
+    });
+  });
 });

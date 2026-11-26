@@ -10,7 +10,9 @@ export type StockTrendMovementType =
   | "OPENING_COUNT"
   | "POS_SALE"
   | "PRIOR_DAY_SETTLEMENT"
-  | "PHYSICAL_COUNT_RECONCILIATION";
+  | "PHYSICAL_COUNT_RECONCILIATION"
+  | "SALE_ACTION_DEDUCTION"
+  | "SALE_ACTION_RESTORATION";
 
 export interface StockTrendItemSummary {
   id: string;
@@ -35,7 +37,12 @@ export interface StockTrendOpeningInput {
 
 export interface StockTrendMovementInput {
   id: string;
-  movementType: "POS_SALE" | "PRIOR_DAY_SETTLEMENT" | "PHYSICAL_COUNT_RECONCILIATION";
+  movementType:
+    | "POS_SALE"
+    | "PRIOR_DAY_SETTLEMENT"
+    | "PHYSICAL_COUNT_RECONCILIATION"
+    | "SALE_ACTION_DEDUCTION"
+    | "SALE_ACTION_RESTORATION";
   quantityDelta: number;
   balanceBefore: number;
   balanceAfter: number;
