@@ -7,6 +7,8 @@ import {
   formatManilaIso,
   type InventoryCategory,
   type InventoryItemView,
+  type InventoryStockHoldView,
+  type PendingSaleActionStockReviewView,
   type PosSection,
   type PosSectionView,
   type StockReconciliationView,
@@ -26,6 +28,9 @@ export interface InventoryItemDbRow {
   lowStockLevel: number | string | null;
   faucetReportingType: FaucetReportingType | null;
   currentQuantity: number | string | null;
+  activeCommitted: number | string;
+  heldQty: number | string;
+  heldReducingQty: number | string;
   stockRevision: number | string;
   archivedAt: Date | string | null;
   archivedByUsername: string | null;
@@ -116,7 +121,11 @@ function toReconciliationView(row: ReconciliationDbRow): StockReconciliationView
   };
 }
 
-export function toInventoryItemView(row: InventoryItemDbRow): InventoryItemView {
+export function toInventoryItemView(
+  row: InventoryItemDbRow,
+  activeHolds: InventoryStockHoldView[] = [],
+  pendingStockReviews: PendingSaleActionStockReviewView[] = [],
+): InventoryItemView {
   const hasOpening =
     row.openingQuantity !== null &&
     row.openingUnit !== null &&
@@ -131,6 +140,15 @@ export function toInventoryItemView(row: InventoryItemDbRow): InventoryItemView 
         recordedAt: formatManilaIso(toDate(row.recordedAt!)),
       }
     : null;
+
+  const currentQuantity = openingStock ? toOptionalInt(row.currentQuantity) : null;
+  const activeCommitted = Number(row.activeCommitted ?? 0);
+  const heldQuantity = Number(row.heldQty ?? 0);
+  const heldReducingQty = Number(row.heldReducingQty ?? 0);
+  const availableQuantity =
+    currentQuantity === null
+      ? null
+      : Math.max(0, currentQuantity - activeCommitted - heldReducingQty);
 
   const latestReconciliation: StockReconciliationView | null =
     row.latestRecId !== null &&
@@ -170,7 +188,11 @@ export function toInventoryItemView(row: InventoryItemDbRow): InventoryItemView 
     lowStockLevel: toOptionalInt(row.lowStockLevel),
     faucetReportingType: row.faucetReportingType ?? null,
     status: openingStock ? "INITIALIZED" : "NOT_SET",
-    currentQuantity: openingStock ? toOptionalInt(row.currentQuantity) : null,
+    currentQuantity,
+    heldQuantity,
+    availableQuantity,
+    activeHolds,
+    pendingStockReviews,
     stockRevision: Number(row.stockRevision ?? 0),
     openingStock,
     latestReconciliation,
@@ -195,6 +217,9 @@ const ITEM_SELECT = `
          i.low_stock_level AS "lowStockLevel",
          i.faucet_reporting_type AS "faucetReportingType",
          i.current_quantity AS "currentQuantity",
+         COALESCE(c.committed_qty, 0) AS "activeCommitted",
+         COALESCE(h.held_qty, 0) AS "heldQty",
+         COALESCE(h.held_reducing_qty, 0) AS "heldReducingQty",
          i.stock_revision AS "stockRevision",
          i.archived_at AS "archivedAt",
          archiver.username AS "archivedByUsername",
@@ -219,6 +244,27 @@ const ITEM_SELECT = `
     LEFT JOIN inventory_opening_counts oc ON oc.item_id = i.id
     LEFT JOIN app_users u ON u.id = oc.recorded_by_user_id
     LEFT JOIN inventory_pos_sections ps ON ps.code = i.pos_section
+    LEFT JOIN (
+      SELECT item_id, SUM(quantity)::integer AS committed_qty
+        FROM (
+          SELECT item_id, quantity
+            FROM pos_checkout_stock_commitments
+           WHERE status = 'ACTIVE'
+          UNION ALL
+          SELECT item_id, quantity
+            FROM pos_sale_action_stock_commitments
+           WHERE status = 'ACTIVE'
+        ) all_commitments
+       GROUP BY item_id
+    ) c ON c.item_id = i.id
+    LEFT JOIN (
+      SELECT item_id,
+             SUM(quantity)::integer AS held_qty,
+             SUM(CASE WHEN reduces_availability THEN quantity ELSE 0 END)::integer AS held_reducing_qty
+        FROM inventory_stock_holds
+       WHERE status = 'ACTIVE'
+       GROUP BY item_id
+    ) h ON h.item_id = i.id
     LEFT JOIN (
       SELECT DISTINCT ON (r.item_id)
              r.item_id,
@@ -290,11 +336,165 @@ export type ReconcileStockResult =
   | { kind: "archived" }
   | { kind: "not-set" }
   | { kind: "stale"; item: InventoryItemView }
-  | { kind: "active-commitment"; activeCommitted: number; item: InventoryItemView };
+  | { kind: "active-commitment"; activeCommitted: number; item: InventoryItemView }
+  | {
+      kind: "active-hold";
+      activeCommitted: number;
+      activeHeld: number;
+      item: InventoryItemView;
+    }
+  | {
+      kind: "pending-sale-action";
+      saleActionReference: string;
+      item: InventoryItemView;
+    };
+
+async function loadActiveHoldsByItemIds(
+  db: Queryable,
+  itemIds: string[],
+): Promise<Map<string, InventoryStockHoldView[]>> {
+  const byItem = new Map<string, InventoryStockHoldView[]>();
+  if (itemIds.length === 0) return byItem;
+
+  const { rows } = await db.query<{
+    id: string;
+    itemId: string;
+    quantity: number | string;
+    unit: string;
+    reason: string;
+    sourceKind: "CHECKOUT_REFUND" | "CHECKOUT_CANCEL" | "SALE_ACTION";
+    reducesAvailability: boolean;
+    posReference: string;
+    recordedBy: string;
+    recordedAt: Date | string;
+  }>(
+    `SELECT h.id,
+            h.item_id AS "itemId",
+            h.quantity,
+            h.unit,
+            h.reason,
+            h.source_kind AS "sourceKind",
+            h.reduces_availability AS "reducesAvailability",
+            h.pos_reference AS "posReference",
+            u.username AS "recordedBy",
+            h.recorded_at AS "recordedAt"
+       FROM inventory_stock_holds h
+       JOIN app_users u ON u.id = h.actor_user_id
+      WHERE h.item_id = ANY($1::uuid[])
+        AND h.status = 'ACTIVE'
+      ORDER BY h.recorded_at DESC, h.id DESC`,
+    [itemIds],
+  );
+
+  for (const row of rows) {
+    const view: InventoryStockHoldView = {
+      id: row.id,
+      itemId: row.itemId,
+      quantity: Number(row.quantity),
+      unit: row.unit,
+      reason: row.reason,
+      sourceKind: row.sourceKind,
+      reducesAvailability: Boolean(row.reducesAvailability),
+      posReference: row.posReference,
+      recordedBy: row.recordedBy,
+      recordedAt: formatManilaIso(toDate(row.recordedAt)),
+    };
+    const bucket = byItem.get(row.itemId);
+    if (bucket) bucket.push(view);
+    else byItem.set(row.itemId, [view]);
+  }
+  return byItem;
+}
+
+async function loadPendingSaleActionReviewsByItemIds(
+  db: Queryable,
+  rows: ReadonlyArray<{ id: string; latestRecRecordedAt: Date | string | null }>,
+): Promise<Map<string, PendingSaleActionStockReviewView[]>> {
+  const byItem = new Map<string, PendingSaleActionStockReviewView[]>();
+  if (rows.length === 0) return byItem;
+
+  const latestRecByItem = new Map<string, number>();
+  const targetItemIds = new Set<string>();
+  for (const row of rows) {
+    targetItemIds.add(row.id);
+    if (row.latestRecRecordedAt) {
+      latestRecByItem.set(row.id, toDate(row.latestRecRecordedAt).getTime());
+    }
+  }
+
+  const { rows: actionRows } = await db.query<{
+    saleActionReference: string;
+    originalSaleReference: string;
+    actionType: "VOID" | "CORRECT";
+    completedAt: Date | string;
+    merchandisePlan: {
+      items?: Array<{
+        productId?: string;
+        productName?: string;
+        unit?: string;
+        unclearCoverageQuantity?: number;
+        interveningReconciliationAt?: string | null;
+      }>;
+    } | null;
+  }>(
+    `SELECT r.reference AS "saleActionReference",
+            r.original_sale_reference AS "originalSaleReference",
+            r.action_type AS "actionType",
+            r.completed_at AS "completedAt",
+            r.merchandise_plan AS "merchandisePlan"
+       FROM pos_sale_action_requests r
+      WHERE r.status = 'COMPLETED'
+        AND r.completed_at IS NOT NULL
+        AND COALESCE((r.merchandise_plan->>'requiresInventoryReview')::boolean, false) = true
+      ORDER BY r.completed_at DESC, r.reference DESC`,
+  );
+
+  for (const action of actionRows) {
+    const completedAtDate = toDate(action.completedAt);
+    const completedAtMs = completedAtDate.getTime();
+    const completedAtIso = formatManilaIso(completedAtDate);
+    for (const planItem of action.merchandisePlan?.items ?? []) {
+      const itemId = planItem.productId;
+      const unclearQty = Number(planItem.unclearCoverageQuantity ?? 0);
+      if (!itemId || !targetItemIds.has(itemId) || unclearQty <= 0) {
+        continue;
+      }
+      const latestRecMs = latestRecByItem.get(itemId);
+      // Resolved once an INV-009 physical-count reconciliation occurs at or after the action completed.
+      if (latestRecMs !== undefined && latestRecMs >= completedAtMs) {
+        continue;
+      }
+      const review: PendingSaleActionStockReviewView = {
+        saleActionReference: action.saleActionReference,
+        originalSaleReference: action.originalSaleReference,
+        actionType: action.actionType,
+        itemId,
+        itemName: planItem.productName ?? "Inventory item",
+        unclearQuantity: unclearQty,
+        unit: planItem.unit ?? "pcs",
+        interveningReconciliationAt: planItem.interveningReconciliationAt ?? null,
+        completedAt: completedAtIso,
+      };
+      const bucket = byItem.get(itemId);
+      if (bucket) bucket.push(review);
+      else byItem.set(itemId, [review]);
+    }
+  }
+  return byItem;
+}
 
 async function findItemById(db: Queryable, id: string): Promise<InventoryItemView | undefined> {
   const { rows } = await db.query<InventoryItemDbRow>(`${ITEM_SELECT} WHERE i.id = $1`, [id]);
-  return rows[0] ? toInventoryItemView(rows[0]) : undefined;
+  if (!rows[0]) return undefined;
+  const [holdsByItem, reviewsByItem] = await Promise.all([
+    loadActiveHoldsByItemIds(db, [rows[0].id]),
+    loadPendingSaleActionReviewsByItemIds(db, [rows[0]]),
+  ]);
+  return toInventoryItemView(
+    rows[0],
+    holdsByItem.get(rows[0].id) ?? [],
+    reviewsByItem.get(rows[0].id) ?? [],
+  );
 }
 
 async function findItemByTarget(db: Queryable, target: OpeningStockTarget): Promise<InventoryItemView | undefined> {
@@ -303,7 +503,16 @@ async function findItemByTarget(db: Queryable, target: OpeningStockTarget): Prom
       `${ITEM_SELECT} WHERE i.category = 'CONTAINER' AND i.container_shape = $1`,
       [target.shape],
     );
-    return rows[0] ? toInventoryItemView(rows[0]) : undefined;
+    if (!rows[0]) return undefined;
+    const [holdsByItem, reviewsByItem] = await Promise.all([
+      loadActiveHoldsByItemIds(db, [rows[0].id]),
+      loadPendingSaleActionReviewsByItemIds(db, [rows[0]]),
+    ]);
+    return toInventoryItemView(
+      rows[0],
+      holdsByItem.get(rows[0].id) ?? [],
+      reviewsByItem.get(rows[0].id) ?? [],
+    );
   }
   return findItemById(db, target.id);
 }
@@ -382,7 +591,17 @@ export const inventoryRepository = {
                  LOWER(i.name) ASC,
                  i.created_at ASC`,
     );
-    return rows.map(toInventoryItemView);
+    const [holdsByItem, reviewsByItem] = await Promise.all([
+      loadActiveHoldsByItemIds(db, rows.map((r) => r.id)),
+      loadPendingSaleActionReviewsByItemIds(db, rows),
+    ]);
+    return rows.map((row) =>
+      toInventoryItemView(
+        row,
+        holdsByItem.get(row.id) ?? [],
+        reviewsByItem.get(row.id) ?? [],
+      ),
+    );
   },
 
   async findMerchandiseById(db: Queryable, id: string): Promise<InventoryItemView | undefined> {
@@ -390,7 +609,16 @@ export const inventoryRepository = {
       `${ITEM_SELECT} WHERE i.id = $1 AND i.category = 'MERCHANDISE'`,
       [id],
     );
-    return rows[0] ? toInventoryItemView(rows[0]) : undefined;
+    if (!rows[0]) return undefined;
+    const [holdsByItem, reviewsByItem] = await Promise.all([
+      loadActiveHoldsByItemIds(db, [rows[0].id]),
+      loadPendingSaleActionReviewsByItemIds(db, [rows[0]]),
+    ]);
+    return toInventoryItemView(
+      rows[0],
+      holdsByItem.get(rows[0].id) ?? [],
+      reviewsByItem.get(rows[0].id) ?? [],
+    );
   },
 
   async createMerchandiseProduct(
@@ -812,19 +1040,68 @@ export const inventoryRepository = {
         return { kind: "stale" as const, item: latestItem! };
       }
 
-      const { rows: committedRows } = await tx.query<{ activeCommitted: number | string }>(
-        `SELECT COALESCE(SUM(quantity), 0)::integer AS "activeCommitted"
-           FROM pos_checkout_stock_commitments
-          WHERE item_id = $1
-            AND status = 'ACTIVE'`,
-        [locked.id],
-      );
+      const [{ rows: committedRows }, { rows: heldRows }] = await Promise.all([
+        tx.query<{ activeCommitted: number | string }>(
+          `SELECT COALESCE(SUM(quantity), 0)::integer AS "activeCommitted"
+             FROM (
+               SELECT quantity
+                 FROM pos_checkout_stock_commitments
+                WHERE item_id = $1
+                  AND status = 'ACTIVE'
+               UNION ALL
+               SELECT quantity
+                 FROM pos_sale_action_stock_commitments
+                WHERE item_id = $1
+                  AND status = 'ACTIVE'
+             ) active_commitments`,
+          [locked.id],
+        ),
+        tx.query<{ activeHeldReducing: number | string }>(
+          `SELECT COALESCE(SUM(CASE WHEN reduces_availability THEN quantity ELSE 0 END), 0)::integer AS "activeHeldReducing"
+             FROM inventory_stock_holds
+            WHERE item_id = $1
+              AND status = 'ACTIVE'`,
+          [locked.id],
+        ),
+      ]);
       const activeCommitted = Number(committedRows[0]?.activeCommitted ?? 0);
+      const activeHeldReducing = Number(heldRows[0]?.activeHeldReducing ?? 0);
       if (input.physicalCount < activeCommitted) {
         const latestItem = await findItemById(tx, locked.id);
         return {
           kind: "active-commitment" as const,
           activeCommitted,
+          item: latestItem!,
+        };
+      }
+      if (input.physicalCount < activeCommitted + activeHeldReducing) {
+        const latestItem = await findItemById(tx, locked.id);
+        return {
+          kind: "active-hold" as const,
+          activeCommitted,
+          activeHeld: activeHeldReducing,
+          item: latestItem!,
+        };
+      }
+
+      const { rows: pendingActionRows } = await tx.query<{ reference: string }>(
+        `SELECT reference
+           FROM pos_sale_action_requests
+          WHERE status = 'PENDING'
+            AND EXISTS (
+              SELECT 1
+                FROM jsonb_array_elements(COALESCE(merchandise_plan->'items', '[]'::jsonb)) elem
+               WHERE elem->>'productId' = $1
+            )
+          ORDER BY created_at ASC
+          LIMIT 1`,
+        [locked.id],
+      );
+      if (pendingActionRows[0]) {
+        const latestItem = await findItemById(tx, locked.id);
+        return {
+          kind: "pending-sale-action" as const,
+          saleActionReference: pendingActionRows[0].reference,
           item: latestItem!,
         };
       }

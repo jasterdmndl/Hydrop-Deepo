@@ -86,10 +86,12 @@ export function inventoryRoutes(db: Database): Router {
       repo.listItems(db, { includeArchived }),
       repo.listPosSections(db),
     ]);
+    const pendingStockReviews = items.flatMap((item) => item.pendingStockReviews ?? []);
     res.json({
       permissions: inventoryPermissions(req.auth!.user.role),
       items,
       posSections,
+      pendingStockReviews,
     });
   });
 
@@ -738,6 +740,29 @@ export function inventoryRoutes(db: Database): Router {
           message: `Cannot set stock for ${outcome.item.name} to ${physicalCount} ${outcome.item.unit} while ${outcome.activeCommitted} ${outcome.item.unit} are reserved by an in-progress POS cash payment. Finish or cancel the pending checkout first.`,
         },
         activeCommitted: outcome.activeCommitted,
+        item: outcome.item,
+      });
+      return;
+    }
+    if (outcome.kind === "active-hold") {
+      res.status(409).json({
+        error: {
+          code: "ACTIVE_STOCK_HOLD",
+          message: `Cannot set stock for ${outcome.item.name} to ${physicalCount} ${outcome.item.unit} while ${outcome.activeHeld} ${outcome.item.unit} are held/unavailable from cancelled POS orders${outcome.activeCommitted > 0 ? ` and ${outcome.activeCommitted} ${outcome.item.unit} are reserved by an in-progress POS cash payment` : ""}.`,
+        },
+        activeCommitted: outcome.activeCommitted,
+        activeHeld: outcome.activeHeld,
+        item: outcome.item,
+      });
+      return;
+    }
+    if (outcome.kind === "pending-sale-action") {
+      res.status(409).json({
+        error: {
+          code: "UNRESOLVED_SALE_ACTIONS",
+          message: `Cannot run a physical count for ${outcome.item.name} while POS sale action ${outcome.saleActionReference} is pending. Finish or cancel the pending void/correction first.`,
+        },
+        saleActionReference: outcome.saleActionReference,
         item: outcome.item,
       });
       return;

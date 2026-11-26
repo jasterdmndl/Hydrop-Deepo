@@ -36,7 +36,9 @@ export type StockTrendMovementType =
   | "OPENING_COUNT"
   | "POS_SALE"
   | "PRIOR_DAY_SETTLEMENT"
-  | "PHYSICAL_COUNT_RECONCILIATION";
+  | "PHYSICAL_COUNT_RECONCILIATION"
+  | "SALE_ACTION_DEDUCTION"
+  | "SALE_ACTION_RESTORATION";
 
 export const MAX_CUSTOM_RANGE_DAYS = 366;
 
@@ -729,5 +731,9 @@ export function formatStockMovementTypeLabel(type: StockTrendMovementType): stri
       return "Prior-Day Settlement";
     case "PHYSICAL_COUNT_RECONCILIATION":
       return "Physical Count Correction";
+    case "SALE_ACTION_DEDUCTION":
+      return "Sale Correction Deduction";
+    case "SALE_ACTION_RESTORATION":
+      return "Sale Return Restoration";
   }
 }

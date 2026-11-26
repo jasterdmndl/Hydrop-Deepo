@@ -1089,12 +1089,12 @@ describe("account-scoped unpaid cart and workstation recovery storage", () => {
       resolveRecoveryPresentation(pkgPending, "cashier1", "CASHIER", "2026-11-10").canSettlePriorDay,
     ).toBe(false);
 
-    // Mixed customer-owned refill + merchandise remains blocked pending a separate approval
+    // Mixed customer-owned refill + merchandise is now settleable by Owner (DEC-095)
     const mixedCheckout = makeLookup({
       recoveryState: "REVIEW_REQUIRED",
       reason: "BUSINESS_DATE_CROSSED",
       canRetry: false,
-      canSettlePriorDay: false,
+      canSettlePriorDay: true,
       checkout: {
         ...makeLookup({}).checkout,
         reference: "HD-1109-101",
@@ -1139,6 +1139,9 @@ describe("account-scoped unpaid cart and workstation recovery storage", () => {
 
     expect(
       resolveRecoveryPresentation(mixedPending, "owner1", "OWNER", "2026-11-10").canSettlePriorDay,
+    ).toBe(true);
+    expect(
+      resolveRecoveryPresentation(mixedPending, "cashier1", "CASHIER", "2026-11-10").canSettlePriorDay,
     ).toBe(false);
   });
 
@@ -1571,6 +1574,323 @@ describe("account-scoped unpaid cart and workstation recovery storage", () => {
       expect(mergeRecoveryLookup(pendingBase, olderRetry).lastLookup?.checkedAt).toBe(
         "2026-11-09T10:43:00+08:00",
       );
+    });
+
+    it("presents terminal CANCELLED_NO_CASH and REFUNDED_UNSAVED outcomes without payment, refund, or handover prompts", () => {
+      const noCashCheckout: CheckoutView = {
+        ...makeLookup({}).checkout,
+        reference: "HD-1109-201",
+        businessDate: "2026-11-09",
+        status: "CANCELLED_NO_CASH",
+        cashReceivedCentavos: null,
+        changeCentavos: null,
+        resolutionReason: "PRIOR_DAY_NO_CASH_CANCELLED",
+      };
+      const noCashLookup = makeLookup({
+        recoveryState: "CANCELLED_NO_CASH",
+        reason: "PRIOR_DAY_NO_CASH_CANCELLED",
+        canRetry: false,
+        canCancelUnpaid: false,
+        canSettlePriorDay: false,
+        canResolveNoCashPriorDay: false,
+        canResolveFullRefund: false,
+        checkedAt: "2026-11-10T09:00:00+08:00",
+        checkout: noCashCheckout,
+        resolution: {
+          checkoutReference: "HD-1109-201",
+          originalBusinessDate: "2026-11-09",
+          resolutionDate: "2026-11-10",
+          outcome: "NO_CASH_CANCELLED",
+          quoteTotalCentavos: 32500,
+          cashReceivedCentavos: null,
+          changeAlreadyGiven: null,
+          changeGivenCentavos: null,
+          refundedAmountCentavos: null,
+          items: noCashCheckout.items,
+          originalActor: "cashier1",
+          resolvedBy: "owner1",
+          resolvedAt: "2026-11-10T08:55:00+08:00",
+          reason: "PRIOR_DAY_NO_CASH_CANCELLED",
+          note: null,
+          heldItems: [],
+        },
+      });
+      const noCashPres = resolveRecoveryPresentation(
+        createServerRecoveryRecord(noCashCheckout, noCashLookup),
+        "owner1",
+        "OWNER",
+        "2026-11-10",
+      );
+      expect(noCashPres).toMatchObject({
+        screen: "CANCELLED_NO_CASH",
+        canContinueResolved: true,
+        canRetry: false,
+        canCancelUnpaid: false,
+        canSettlePriorDay: false,
+        canResolveNoCashPriorDay: false,
+        canResolveFullRefund: false,
+      });
+      expect(formatRecoveryCheckFeedback(noCashLookup, noCashPres)).toContain(
+        "cancelled with no cash received",
+      );
+
+      const refundedCheckout: CheckoutView = {
+        ...makeLookup({}).checkout,
+        reference: "HD-1109-202",
+        businessDate: "2026-11-09",
+        status: "REFUNDED_UNSAVED",
+        totalCentavos: 17500,
+        cashReceivedCentavos: 25000,
+        changeCentavos: 7500,
+        resolutionReason: "UNDELIVERED_FULL_REFUND",
+      };
+      const refundedLookup = makeLookup({
+        recoveryState: "REFUNDED_UNSAVED",
+        reason: "UNDELIVERED_FULL_REFUND",
+        canRetry: false,
+        canCancelUnpaid: false,
+        canSettlePriorDay: false,
+        canResolveNoCashPriorDay: false,
+        canResolveFullRefund: false,
+        checkedAt: "2026-11-10T09:05:00+08:00",
+        checkout: refundedCheckout,
+        resolution: {
+          checkoutReference: "HD-1109-202",
+          originalBusinessDate: "2026-11-09",
+          resolutionDate: "2026-11-10",
+          outcome: "FULL_REFUND",
+          quoteTotalCentavos: 17500,
+          cashReceivedCentavos: 25000,
+          changeAlreadyGiven: true,
+          changeGivenCentavos: 7500,
+          refundedAmountCentavos: 17500,
+          items: refundedCheckout.items,
+          originalActor: "cashier1",
+          resolvedBy: "owner1",
+          resolvedAt: "2026-11-10T09:04:00+08:00",
+          reason: "UNDELIVERED_FULL_REFUND",
+          note: null,
+          heldItems: [
+            {
+              id: "hold-1",
+              itemId: "round-1",
+              itemName: "Round Container",
+              quantity: 1,
+              unit: "containers",
+              reason: "Cancelled filled order held",
+              posReference: "HD-1109-202",
+              recordedBy: "owner1",
+              recordedAt: "2026-11-10T09:04:00+08:00",
+            },
+          ],
+        },
+      });
+      const refundedRecord = createServerRecoveryRecord(refundedCheckout, refundedLookup);
+      const refundedPres = resolveRecoveryPresentation(
+        refundedRecord,
+        "owner1",
+        "OWNER",
+        "2026-11-10",
+      );
+      expect(refundedPres).toMatchObject({
+        screen: "REFUNDED_UNSAVED",
+        canContinueResolved: true,
+        canRetry: false,
+        canSettlePriorDay: false,
+        canResolveNoCashPriorDay: false,
+        canResolveFullRefund: false,
+        amounts: {
+          totalCentavos: 17500,
+          cashReceivedCentavos: 25000,
+          changeCentavos: 7500,
+        },
+      });
+      expect(refundedPres.calloutTitle).toContain("₱175.00 refunded");
+
+      // Terminal REFUNDED_UNSAVED is protected from late non-terminal lookups
+      const staleLookup = makeLookup({
+        recoveryState: "REVIEW_REQUIRED",
+        checkedAt: "2026-11-10T09:06:00+08:00",
+      });
+      expect(mergeRecoveryLookup(refundedRecord, staleLookup).lastLookup?.recoveryState).toBe(
+        "REFUNDED_UNSAVED",
+      );
+
+      // Cashier cannot see Owner resolution actions on REVIEW_REQUIRED
+      const pendingPrior = createServerRecoveryRecord(
+        {
+          ...makeLookup({}).checkout,
+          reference: "HD-1109-203",
+          businessDate: "2026-11-09",
+          status: "PAYMENT_PENDING",
+          cashReceivedCentavos: null,
+          paymentRecordedAt: null,
+        },
+        makeLookup({
+          recoveryState: "REVIEW_REQUIRED",
+          reason: "BUSINESS_DATE_CROSSED",
+          canResolveNoCashPriorDay: true,
+          canResolveFullRefund: true,
+          checkout: {
+            ...makeLookup({}).checkout,
+            reference: "HD-1109-203",
+            businessDate: "2026-11-09",
+            status: "PAYMENT_PENDING",
+            cashReceivedCentavos: null,
+            paymentRecordedAt: null,
+          },
+        }),
+      );
+      expect(
+        resolveRecoveryPresentation(pendingPrior, "owner1", "OWNER", "2026-11-10"),
+      ).toMatchObject({
+        canResolveNoCashPriorDay: true,
+        canResolveFullRefund: true,
+      });
+      expect(
+        resolveRecoveryPresentation(pendingPrior, "cashier1", "CASHIER", "2026-11-10"),
+      ).toMatchObject({
+        canResolveNoCashPriorDay: false,
+        canResolveFullRefund: false,
+      });
+
+      // Fresh-browser owned filled DRAFT (same day) allows verified cancellation
+      const sameDayDraft = createServerRecoveryRecord(
+        {
+          ...makeLookup({}).checkout,
+          reference: "HD-1110-204",
+          businessDate: "2026-11-10",
+          status: "DRAFT",
+          cashReceivedCentavos: null,
+          paymentRecordedAt: null,
+        },
+        makeLookup({
+          recoveryState: "SAFE_TO_RETRY",
+          reason: "NOT_SAVED",
+          canRetry: true,
+          canCancelUnpaid: true,
+          checkout: {
+            ...makeLookup({}).checkout,
+            reference: "HD-1110-204",
+            businessDate: "2026-11-10",
+            status: "DRAFT",
+            cashReceivedCentavos: null,
+            paymentRecordedAt: null,
+          },
+        }),
+      );
+      expect(
+        resolveRecoveryPresentation(sameDayDraft, "cashier1", "CASHIER", "2026-11-10"),
+      ).toMatchObject({
+        screen: "SAFE_TO_RETRY",
+        needsOriginalBrowserForRetry: true,
+        canCancelUnpaid: true,
+      });
+
+      // Owned filled DRAFT recovered after midnight exposes canCancelUnpaid in REVIEW_REQUIRED
+      const midnightDraft = createServerRecoveryRecord(
+        {
+          ...makeLookup({}).checkout,
+          reference: "HD-1109-205",
+          businessDate: "2026-11-09",
+          status: "DRAFT",
+          cashReceivedCentavos: null,
+          paymentRecordedAt: null,
+        },
+        makeLookup({
+          recoveryState: "REVIEW_REQUIRED",
+          reason: "BUSINESS_DATE_CROSSED",
+          canRetry: false,
+          canCancelUnpaid: true,
+          checkout: {
+            ...makeLookup({}).checkout,
+            reference: "HD-1109-205",
+            businessDate: "2026-11-09",
+            status: "DRAFT",
+            cashReceivedCentavos: null,
+            paymentRecordedAt: null,
+          },
+        }),
+      );
+      expect(
+        resolveRecoveryPresentation(midnightDraft, "cashier1", "CASHIER", "2026-11-10"),
+      ).toMatchObject({
+        screen: "REVIEW_REQUIRED",
+        canCancelUnpaid: true,
+        canResolveNoCashPriorDay: false,
+        canResolveFullRefund: false,
+      });
+
+      // Prior-day PAYMENT_PENDING remains locked from Cashier unpaid cancellation even in REVIEW_REQUIRED
+      const midnightPending = createServerRecoveryRecord(
+        pendingPrior.lastLookup!.checkout,
+        makeLookup({
+          ...pendingPrior.lastLookup!,
+          canCancelUnpaid: true,
+        }),
+      );
+      expect(
+        resolveRecoveryPresentation(midnightPending, "cashier1", "CASHIER", "2026-11-10"),
+      ).toMatchObject({
+        screen: "REVIEW_REQUIRED",
+        canCancelUnpaid: false,
+      });
+    });
+
+    it("blocks End Day when a durable Owner sale action is still pending (Task 2)", () => {
+      const blocked = evaluateEndDayGuard({
+        businessDate: "2026-11-09",
+        serverUnresolved: [],
+        serverUnpaidDrafts: [],
+        serverPendingSaleActions: [
+          {
+            reference: "HDA-1109-001",
+            originalSaleReference: "HD-1109-010",
+            originalSaleIsReplacement: false,
+            originalBusinessDate: "2026-11-09",
+            actionType: "CORRECT",
+            status: "PENDING",
+            reason: "Customer added refills",
+            originalTotalCentavos: 10000,
+            originalCashReceivedCentavos: 10000,
+            originalChangeCentavos: 0,
+            correctedTotalCentavos: 17500,
+            cashDifferenceCentavos: 7500,
+            cashDirection: "COLLECT",
+            correctedItems: null,
+            merchandisePlan: {
+              hasMerchandise: false,
+              retained: [],
+              added: [],
+              returned: [],
+              held: [],
+            },
+            cashTenderedCentavos: null,
+            cashChangeCentavos: null,
+            cashRefundedCentavos: null,
+            replacementSaleReference: null,
+            createdBy: "owner1",
+            createdAt: "2026-11-09T14:00:00+08:00",
+            completedBy: null,
+            completedAt: null,
+            cancelledBy: null,
+            cancelledAt: null,
+            cancelReason: null,
+            updatedAt: "2026-11-09T14:00:00+08:00",
+          },
+        ],
+        localPendingRecoveries: [],
+        activeConfirming: null,
+      });
+
+      expect(blocked.blocked).toBe(true);
+      expect(blocked.blockingEntries).toEqual([
+        {
+          reference: "HDA-1109-001",
+          label: "Pending Correct Sale on HD-1109-010 (owner1)",
+          source: "server",
+        },
+      ]);
     });
   });
 });

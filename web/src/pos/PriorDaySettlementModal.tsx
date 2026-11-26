@@ -4,9 +4,9 @@ import { type NoticeEnvelope, wrapNotice } from "../notifications/noticeTiming";
 import { TemporaryNotice } from "../notifications/TemporaryNotice";
 import {
   type CheckoutView,
+  classifyCheckoutComposition,
   formatCentavos,
   formatLiters,
-  isPriorDayMerchandiseOnly,
   type PriorDaySettlementView,
   type SaleView,
   type SettlePriorDayResponse,
@@ -31,13 +31,23 @@ export function PriorDaySettlementModal({
 }: PriorDaySettlementModalProps) {
   const [paymentKeptConfirmed, setPaymentKeptConfirmed] = useState(false);
   const [refillDeliveredConfirmed, setRefillDeliveredConfirmed] = useState(false);
+  const [itemsHandedOverConfirmed, setItemsHandedOverConfirmed] = useState(false);
   const [note, setNote] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<NoticeEnvelope<string> | null>(null);
-  const isMerchandiseOnly = isPriorDayMerchandiseOnly(checkout.items);
+  const composition = classifyCheckoutComposition(checkout.items);
+  const isMerchandiseOnly = composition === "MERCHANDISE_ONLY";
+  const isMixed = composition === "MIXED";
   const merchQty = checkout.items
     .filter((item) => item.kind === "MERCHANDISE" || item.kind === "CONTAINER_PACKAGE")
     .reduce((sum, item) => sum + item.quantity, 0);
+  const allConfirmationsChecked =
+    paymentKeptConfirmed &&
+    (composition === "REFILL_ONLY"
+      ? refillDeliveredConfirmed
+      : composition === "MERCHANDISE_ONLY"
+        ? itemsHandedOverConfirmed
+        : refillDeliveredConfirmed && itemsHandedOverConfirmed);
 
   useEffect(() => {
     const onKeyDown = (event: KeyboardEvent) => {
@@ -57,7 +67,7 @@ export function PriorDaySettlementModal({
 
   async function handleSubmit(event: FormEvent) {
     event.preventDefault();
-    if (!paymentKeptConfirmed || !refillDeliveredConfirmed || submitting) return;
+    if (!allConfirmationsChecked || submitting) return;
 
     setSubmitting(true);
     setError(null);
@@ -70,9 +80,11 @@ export function PriorDaySettlementModal({
         note?: string;
       } = {
         paymentKeptConfirmed: true,
-        ...(isMerchandiseOnly
-          ? { itemsHandedOverConfirmed: true }
-          : { refillDeliveredConfirmed: true }),
+        ...(isMixed
+          ? { refillDeliveredConfirmed: true, itemsHandedOverConfirmed: true }
+          : isMerchandiseOnly
+            ? { itemsHandedOverConfirmed: true }
+            : { refillDeliveredConfirmed: true }),
       };
       if (
         checkout.cashReceivedCentavos === null &&
@@ -133,7 +145,11 @@ export function PriorDaySettlementModal({
         <div className="detail-card__header">
           <div>
             <h2 id="prior-day-settle-title">
-              {isMerchandiseOnly ? "Review prior-day merchandise" : "Review prior-day refill"}
+              {isMixed
+                ? "Review prior-day mixed order"
+                : isMerchandiseOnly
+                  ? "Review prior-day merchandise"
+                  : "Review prior-day refill"}
             </h2>
             <p className="muted-sm">
               Original reference <strong className="mono-ref">{checkout.reference}</strong> from{" "}
@@ -146,9 +162,11 @@ export function PriorDaySettlementModal({
         <div className="callout callout--info">
           <p className="callout__title">No further cash is collected</p>
           <p className="callout__body">
-            {isMerchandiseOnly
-              ? "Record this settlement only if the station kept the payment and the customer already received all merchandise items. Leave all other outcomes pending; this deducts stock once, records separately from today's sales, and leaves closed day summaries unchanged."
-              : "Record this settlement only if the station kept the payment and the customer already received the refill. Leave all other outcomes pending; this records separately from today's refill sales and leaves closed day summaries unchanged."}
+            {isMixed
+              ? "Record this settlement only if the station kept the payment and the customer already received all refills and all merchandise items. Leave partial or uncertain outcomes pending; this deducts reserved merchandise once, records separately from today's sales, and leaves closed day summaries unchanged."
+              : isMerchandiseOnly
+                ? "Record this settlement only if the station kept the payment and the customer already received all merchandise items. Leave all other outcomes pending; this deducts stock once, records separately from today's sales, and leaves closed day summaries unchanged."
+                : "Record this settlement only if the station kept the payment and the customer already received the refill. Leave all other outcomes pending; this records separately from today's refill sales and leaves closed day summaries unchanged."}
           </p>
         </div>
 
@@ -178,7 +196,7 @@ export function PriorDaySettlementModal({
               </dd>
             </div>
           )}
-          {isMerchandiseOnly && (
+          {(isMerchandiseOnly || isMixed) && (
             <div className="detail-list__row">
               <dt>Merchandise items</dt>
               <dd>
@@ -236,27 +254,45 @@ export function PriorDaySettlementModal({
                 }}
               />
               <span>
-                {isMerchandiseOnly
-                  ? "Confirm the station kept the payment for this checkout"
-                  : "Confirm the station kept the payment for this refill"}
+                {isMixed
+                  ? "Confirm the station kept the payment for this mixed checkout"
+                  : isMerchandiseOnly
+                    ? "Confirm the station kept the payment for this checkout"
+                    : "Confirm the station kept the payment for this refill"}
               </span>
             </label>
-            <label className="checkbox-field">
-              <input
-                type="checkbox"
-                checked={refillDeliveredConfirmed}
-                disabled={submitting}
-                onChange={(event) => {
-                  setRefillDeliveredConfirmed(event.target.checked);
-                  setError(null);
-                }}
-              />
-              <span>
-                {isMerchandiseOnly
-                  ? "Confirm the customer received all merchandise items"
-                  : "Confirm the customer received the refill"}
-              </span>
-            </label>
+            {(!isMerchandiseOnly || isMixed) && (
+              <label className="checkbox-field">
+                <input
+                  type="checkbox"
+                  checked={refillDeliveredConfirmed}
+                  disabled={submitting}
+                  onChange={(event) => {
+                    setRefillDeliveredConfirmed(event.target.checked);
+                    setError(null);
+                  }}
+                />
+                <span>
+                  {isMixed
+                    ? "Confirm the customer received all customer-owned refills"
+                    : "Confirm the customer received the refill"}
+                </span>
+              </label>
+            )}
+            {(isMerchandiseOnly || isMixed) && (
+              <label className="checkbox-field">
+                <input
+                  type="checkbox"
+                  checked={itemsHandedOverConfirmed}
+                  disabled={submitting}
+                  onChange={(event) => {
+                    setItemsHandedOverConfirmed(event.target.checked);
+                    setError(null);
+                  }}
+                />
+                <span>Confirm the customer received all merchandise items</span>
+              </label>
+            )}
           </div>
 
           <label className="field">
@@ -296,7 +332,7 @@ export function PriorDaySettlementModal({
             <button
               type="submit"
               className="button button--primary"
-              disabled={!paymentKeptConfirmed || !refillDeliveredConfirmed || submitting}
+              disabled={!allConfirmationsChecked || submitting}
             >
               {submitting ? "Recording settlement…" : "Record prior-day settlement"}
             </button>

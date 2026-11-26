@@ -9,16 +9,26 @@ import {
   formatManilaTimeOnly,
   formatManilaTimestamp,
   isPriorDayMerchandiseOnly,
+  type PosDayResponse,
   type PriorDaySettlementView,
+  type SaleActionRequestView,
   type SalesListResponse,
   type SaleView,
 } from "./posRecovery";
+import {
+  formatSaleActionCashExchange,
+  formatSaleActionStockItemSummary,
+} from "./saleActionView";
+import { SaleActionModal } from "./SaleActionModal";
 
 export interface SaleHistoryProps {
   todayDate: string;
+  currentUserRole?: "OWNER" | "CASHIER";
+  dayStatus?: PosDayResponse | null;
   initialReference?: string | null;
   initialSettlementRef?: string | null;
   refreshSignal?: number;
+  onSaleActionChanged?: () => void;
 }
 
 type StatusFilter = "ALL" | "ACTIVE" | "VOIDED";
@@ -56,9 +66,12 @@ function formatHistoryItemsSubtitle(
 
 export function SaleHistory({
   todayDate,
+  currentUserRole = "CASHIER",
+  dayStatus = null,
   initialReference,
   initialSettlementRef,
   refreshSignal = 0,
+  onSaleActionChanged,
 }: SaleHistoryProps) {
   const [dateFilter, setDateFilter] = useState(todayDate);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>("ALL");
@@ -70,6 +83,12 @@ export function SaleHistory({
   const [error, setError] = useState<string | null>(null);
   const [selectedItem, setSelectedItem] = useState<SelectedHistoryItem | null>(null);
   const [detailError, setDetailError] = useState<NoticeEnvelope<string> | null>(null);
+  const [actionModalState, setActionModalState] = useState<{
+    mode: "PREPARE_VOID" | "PREPARE_CORRECT" | "RECOVER_ACTION";
+    sale?: SaleView | null;
+    actionReference?: string | null;
+  } | null>(null);
+  const [actionNotice, setActionNotice] = useState<NoticeEnvelope<string> | null>(null);
 
   const listTrackerRef = useRef(createRequestTracker());
   const detailTrackerRef = useRef(createRequestTracker());
@@ -258,9 +277,66 @@ export function SaleHistory({
 
   const selectedSale = selectedItem?.kind === "sale" ? selectedItem.sale : null;
   const selectedSettlement = selectedItem?.kind === "settlement" ? selectedItem.settlement : null;
+  const pendingActions: SaleActionRequestView[] =
+    currentUserRole === "OWNER" ? dayStatus?.pendingSaleActions ?? [] : [];
+
+  const canStartNewOwnerAction = Boolean(
+    currentUserRole === "OWNER" &&
+    selectedSale &&
+    selectedSale.status === "ACTIVE" &&
+    !selectedSale.pendingAction &&
+    dayStatus?.day &&
+    dayStatus.day.closedAt === null &&
+    selectedSale.businessDate === dayStatus.todayDate &&
+    selectedSale.businessDate === dayStatus.day.businessDate,
+  );
 
   return (
     <section className="subview" aria-label="Transaction History">
+      {pendingActions.length > 0 && (
+        <div className="callout callout--warning" role="status">
+          <p className="callout__title">Pending Owner sale action(s)</p>
+          <div className="callout__body">
+            {pendingActions.map((act) => (
+              <div key={act.reference} className="pos-unresolved-row">
+                <span>
+                  <strong className="mono-ref">{act.reference}</strong> ·{" "}
+                  {act.actionType === "VOID" ? "Void Sale" : "Correct Sale"} on{" "}
+                  <span className="mono-ref">{act.originalSaleReference}</span> ({act.originalBusinessDate})
+                </span>
+                <span className="callout__actions">
+                  <button
+                    type="button"
+                    className="button button--primary button--sm"
+                    onClick={() =>
+                      setActionModalState({
+                        mode: "RECOVER_ACTION",
+                        actionReference: act.reference,
+                      })
+                    }
+                  >
+                    Resume {act.reference}
+                  </button>
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {actionNotice && (
+        <TemporaryNotice
+          occurrenceId={actionNotice.id}
+          duration="detailed"
+          className="callout callout--info"
+          role="status"
+          closeLabel="Close action confirmation"
+          onDismiss={() => setActionNotice(null)}
+        >
+          <p className="callout__body">{actionNotice.data}</p>
+        </TemporaryNotice>
+      )}
+
       <div className="card pos-history-filters">
         <div className="pos-history-filters__grid">
           <label className="field">
@@ -668,6 +744,34 @@ export function SaleHistory({
                     <dt>Operator</dt>
                     <dd>{selectedSale.createdBy}</dd>
                   </div>
+                  {selectedSale.correctedFromSaleReference && (
+                    <div className="detail-list__row">
+                      <dt>Replaces sale</dt>
+                      <dd>
+                        <button
+                          type="button"
+                          className="button button--ghost button--sm mono-ref"
+                          onClick={() => void selectSale(selectedSale.correctedFromSaleReference!)}
+                        >
+                          {selectedSale.correctedFromSaleReference}
+                        </button>
+                      </dd>
+                    </div>
+                  )}
+                  {selectedSale.replacedBySaleReference && (
+                    <div className="detail-list__row">
+                      <dt>Replaced by</dt>
+                      <dd>
+                        <button
+                          type="button"
+                          className="button button--ghost button--sm mono-ref"
+                          onClick={() => void selectSale(selectedSale.replacedBySaleReference!)}
+                        >
+                          {selectedSale.replacedBySaleReference}
+                        </button>
+                      </dd>
+                    </div>
+                  )}
                   <div className="detail-list__row">
                     <dt>Containers</dt>
                     <dd>{selectedSale.totalContainers}</dd>
@@ -697,20 +801,104 @@ export function SaleHistory({
                   ))}
                 </ul>
 
-                <dl className="detail-list">
-                  <div className="detail-list__row">
-                    <dt>Total amount</dt>
-                    <dd>{formatCentavos(selectedSale.totalCentavos)}</dd>
-                  </div>
-                  <div className="detail-list__row">
-                    <dt>Cash received</dt>
-                    <dd>{formatCentavos(selectedSale.cashReceivedCentavos)}</dd>
-                  </div>
-                  <div className="detail-list__row">
-                    <dt>Change</dt>
-                    <dd>{formatCentavos(selectedSale.changeCentavos)}</dd>
-                  </div>
-                </dl>
+                {selectedSale.correctedFromSaleReference ? (
+                  <dl className="detail-list">
+                    <div className="detail-list__row detail-list__row--total">
+                      <dt>Retained sale total</dt>
+                      <dd>{formatCentavos(selectedSale.totalCentavos)}</dd>
+                    </div>
+                    {selectedSale.sourceAction && (
+                      <>
+                        {selectedSale.sourceAction.originalSaleIsReplacement ? (
+                          <div className="detail-list__row">
+                            <dt>
+                              Prior replacement ({selectedSale.sourceAction.originalSaleReference})
+                              retained total
+                            </dt>
+                            <dd>{formatCentavos(selectedSale.sourceAction.originalTotalCentavos)}</dd>
+                          </div>
+                        ) : (
+                          <div className="detail-list__row">
+                            <dt>
+                              Original {selectedSale.sourceAction.originalSaleReference} tender /
+                              change
+                            </dt>
+                            <dd>
+                              {formatCentavos(
+                                selectedSale.sourceAction.originalCashReceivedCentavos ?? 0,
+                              )}{" "}
+                              tendered ·{" "}
+                              {formatCentavos(
+                                selectedSale.sourceAction.originalChangeCentavos ?? 0,
+                              )}{" "}
+                              change
+                            </dd>
+                          </div>
+                        )}
+                        <div className="detail-list__row">
+                          <dt>
+                            Correction ({selectedSale.sourceAction.reference}) cash exchange
+                          </dt>
+                          <dd>{formatSaleActionCashExchange(selectedSale.sourceAction)}</dd>
+                        </div>
+                      </>
+                    )}
+                    {selectedSale.cashEventChain &&
+                      (selectedSale.sourceAction?.originalSaleIsReplacement ||
+                        selectedSale.cashEventChain.correctionEvents.length > 1) && (
+                        <>
+                          <div className="detail-list__row">
+                            <dt>
+                              Original cash sale (
+                              <button
+                                type="button"
+                                className="button button--ghost button--sm mono-ref"
+                                onClick={() =>
+                                  void selectSale(selectedSale.cashEventChain!.rootCashSale.reference)
+                                }
+                              >
+                                {selectedSale.cashEventChain.rootCashSale.reference}
+                              </button>
+                              )
+                            </dt>
+                            <dd>
+                              {formatCentavos(
+                                selectedSale.cashEventChain.rootCashSale.cashReceivedCentavos,
+                              )}{" "}
+                              tendered ·{" "}
+                              {formatCentavos(
+                                selectedSale.cashEventChain.rootCashSale.changeCentavos,
+                              )}{" "}
+                              change
+                            </dd>
+                          </div>
+                          {selectedSale.cashEventChain.correctionEvents
+                            .filter((ev) => ev.actionReference !== selectedSale.sourceAction?.reference)
+                            .map((ev) => (
+                              <div key={ev.actionReference} className="detail-list__row">
+                                <dt>Prior correction ({ev.actionReference})</dt>
+                                <dd>{formatSaleActionCashExchange(ev)}</dd>
+                              </div>
+                            ))}
+                        </>
+                      )}
+                  </dl>
+                ) : (
+                  <dl className="detail-list">
+                    <div className="detail-list__row">
+                      <dt>Total amount</dt>
+                      <dd>{formatCentavos(selectedSale.totalCentavos)}</dd>
+                    </div>
+                    <div className="detail-list__row">
+                      <dt>Cash received</dt>
+                      <dd>{formatCentavos(selectedSale.cashReceivedCentavos)}</dd>
+                    </div>
+                    <div className="detail-list__row">
+                      <dt>Change</dt>
+                      <dd>{formatCentavos(selectedSale.changeCentavos)}</dd>
+                    </div>
+                  </dl>
+                )}
 
                 <div className="detail-notes">
                   <h3>Action history</h3>
@@ -724,11 +912,125 @@ export function SaleHistory({
                     ))}
                   </ul>
                 </div>
+
+                {selectedSale.completedAction && (
+                  <div className="callout callout--info">
+                    <p className="callout__title">
+                      {selectedSale.completedAction.actionType === "VOID" ? "Voided" : "Corrected"} ·{" "}
+                      {selectedSale.completedAction.reference}
+                    </p>
+                    <p className="callout__body">
+                      {selectedSale.completedAction.reason} ·{" "}
+                      {selectedSale.completedAction.cashDirection === "REFUND"
+                        ? `Refunded ${formatCentavos(selectedSale.completedAction.cashRefundedCentavos ?? 0)}`
+                        : selectedSale.completedAction.cashDirection === "COLLECT"
+                          ? `Collected ${formatCentavos(selectedSale.completedAction.cashDifferenceCentavos)}`
+                          : "No cash exchanged"}
+                      {selectedSale.completedAction.completedAt
+                        ? ` · ${formatManilaTimestamp(selectedSale.completedAction.completedAt)}`
+                        : ""}
+                    </p>
+                    {selectedSale.completedAction.merchandisePlan.hasMerchandise &&
+                      (selectedSale.completedAction.merchandisePlan.items?.length ?? 0) > 0 && (
+                        <ul className="pos-action-log">
+                          {selectedSale.completedAction.merchandisePlan.items!.map((item) => (
+                            <li key={item.productId}>
+                              <strong>{item.productName}:</strong>{" "}
+                              {formatSaleActionStockItemSummary(item)}
+                            </li>
+                          ))}
+                        </ul>
+                      )}
+                  </div>
+                )}
+
+                {currentUserRole === "OWNER" && selectedSale.pendingAction && (
+                  <div className="pos-summary-actions">
+                    <button
+                      type="button"
+                      className="button button--primary button--block"
+                      onClick={() =>
+                        setActionModalState({
+                          mode: "RECOVER_ACTION",
+                          actionReference: selectedSale.pendingAction!.reference,
+                        })
+                      }
+                    >
+                      Resume pending {selectedSale.pendingAction.actionType === "VOID" ? "Void" : "Correct"} (
+                      {selectedSale.pendingAction.reference})
+                    </button>
+                  </div>
+                )}
+
+                {canStartNewOwnerAction && (
+                  <div className="pos-summary-actions">
+                    <button
+                      type="button"
+                      className="button button--ghost button--block"
+                      onClick={() =>
+                        setActionModalState({
+                          mode: "PREPARE_CORRECT",
+                          sale: selectedSale,
+                        })
+                      }
+                    >
+                      Correct Sale
+                    </button>
+                    <button
+                      type="button"
+                      className="button button--ghost button--block"
+                      onClick={() =>
+                        setActionModalState({
+                          mode: "PREPARE_VOID",
+                          sale: selectedSale,
+                        })
+                      }
+                    >
+                      Void Sale
+                    </button>
+                  </div>
+                )}
               </>
             ) : null}
           </article>
         </aside>
       </div>
+
+      {actionModalState && (
+        <SaleActionModal
+          mode={actionModalState.mode}
+          sale={actionModalState.sale}
+          initialActionReference={actionModalState.actionReference}
+          onClose={() => setActionModalState(null)}
+          onCompleted={(result) => {
+            setActionModalState(null);
+            setSelectedItem({
+              kind: "sale",
+              sale: result.replacementSale ?? result.originalSale,
+            });
+            setActionNotice(
+              wrapNotice(
+                result.replacementSale
+                  ? `Saved correction ${result.action.reference}; replacement ${result.replacementSale.reference} is Active.`
+                  : `Saved void ${result.action.reference} for ${result.originalSale.reference}.`,
+              ),
+            );
+            void loadSales(dateFilter, statusFilter, appliedQuery);
+            onSaleActionChanged?.();
+          }}
+          onCancelledNoCash={(result) => {
+            setActionModalState(null);
+            setSelectedItem({ kind: "sale", sale: result.originalSale });
+            setActionNotice(
+              wrapNotice(
+                `Cancelled pending action ${result.action.reference} with no cash exchanged; ${result.originalSale.reference} stays Active.`,
+              ),
+            );
+            void loadSales(dateFilter, statusFilter, appliedQuery);
+            onSaleActionChanged?.();
+          }}
+        />
+      )}
     </section>
   );
 }

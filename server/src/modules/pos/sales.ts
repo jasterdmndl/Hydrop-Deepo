@@ -6,6 +6,8 @@ import { createHash } from "node:crypto";
  * (DEC-043, DEC-068 through DEC-070, DAY-001, DAY-002, POS-002, POS-003, POS-006 through POS-008).
  */
 
+import type { SaleActionRequestView, SaleCashEventChain } from "./saleActions.js";
+
 export type WaterType = "PURIFIED" | "ALKALINE";
 export type ItemKind = "STANDARD" | "CUSTOM" | "MERCHANDISE" | "CONTAINER_PACKAGE";
 export type PosSection = string;
@@ -30,7 +32,9 @@ export type CheckoutStatus =
   | "SAVED"
   | "REVIEW_REQUIRED"
   | "SETTLED_PRIOR_DAY"
-  | "CANCELLED_DRAFT";
+  | "CANCELLED_DRAFT"
+  | "CANCELLED_NO_CASH"
+  | "REFUNDED_UNSAVED";
 export type SaleStatus = "ACTIVE" | "VOIDED";
 export type RecoveryState =
   | "SAVED"
@@ -38,7 +42,9 @@ export type RecoveryState =
   | "UNRESOLVED"
   | "REVIEW_REQUIRED"
   | "SETTLED_PRIOR_DAY"
-  | "CANCELLED";
+  | "CANCELLED"
+  | "CANCELLED_NO_CASH"
+  | "REFUNDED_UNSAVED";
 
 export const MAX_ITEMS_PER_SALE = 50;
 export const MAX_QUANTITY_PER_LINE = 500;
@@ -300,7 +306,7 @@ export interface SaleActionView {
 
 export interface SaleView {
   reference: string;
-  checkoutReference: string;
+  checkoutReference: string | null;
   businessDate: string;
   status: SaleStatus;
   totalCentavos: number;
@@ -311,6 +317,12 @@ export interface SaleView {
   totalVolumeLiters: number;
   createdBy: string;
   createdAt: string;
+  correctedFromSaleReference?: string | null;
+  replacedBySaleReference?: string | null;
+  sourceAction?: SaleActionRequestView | null;
+  cashEventChain?: SaleCashEventChain | null;
+  pendingAction?: SaleActionRequestView | null;
+  completedAction?: SaleActionRequestView | null;
   items: QuoteLineItem[];
   actionHistory: SaleActionView[];
 }
@@ -331,10 +343,42 @@ export interface PriorDaySettlementView {
   originalPaymentStartedAt: string | null;
   originalPaymentRecordedAt: string | null;
   paymentKeptConfirmed: true;
-  refillDeliveredConfirmed: true;
+  refillDeliveredConfirmed: boolean;
+  itemsHandedOverConfirmed?: boolean;
   settledBy: string;
   settledAt: string;
   note: string | null;
+}
+
+export interface CheckoutHoldView {
+  id: string;
+  itemId: string;
+  itemName: string;
+  quantity: number;
+  unit: string;
+  reason: string;
+  posReference: string;
+  recordedBy: string;
+  recordedAt: string;
+}
+
+export interface CheckoutResolutionView {
+  checkoutReference: string;
+  originalBusinessDate: string;
+  resolutionDate: string;
+  outcome: "NO_CASH_CANCELLED" | "FULL_REFUND";
+  quoteTotalCentavos: number;
+  cashReceivedCentavos: number | null;
+  changeAlreadyGiven: boolean | null;
+  changeGivenCentavos: number | null;
+  refundedAmountCentavos: number | null;
+  items: QuoteLineItem[];
+  originalActor: string;
+  resolvedBy: string;
+  resolvedAt: string;
+  reason: string;
+  note: string | null;
+  heldItems: CheckoutHoldView[];
 }
 
 export interface CheckoutLookupView {
@@ -344,11 +388,14 @@ export interface CheckoutLookupView {
   canCancelUnpaid: boolean;
   canSettlePriorDay: boolean;
   canDismissCancelled: boolean;
+  canResolveNoCashPriorDay: boolean;
+  canResolveFullRefund: boolean;
   ownedByCurrentUser: boolean;
   checkedAt: string;
   checkout: CheckoutView;
   sale: SaleView | null;
   settlement: PriorDaySettlementView | null;
+  resolution: CheckoutResolutionView | null;
 }
 
 // Asia/Manila is fixed UTC+08:00 with no daylight saving transitions.
@@ -437,6 +484,33 @@ export function aggregateMerchandiseDemand(
   const raw = new Map<string, number>();
   for (const item of items) {
     if ((item.kind !== "MERCHANDISE" && item.kind !== "CONTAINER_PACKAGE") || !item.productId) {
+      continue;
+    }
+    raw.set(item.productId, (raw.get(item.productId) ?? 0) + item.quantity);
+  }
+  const sorted = new Map<string, number>();
+  for (const key of Array.from(raw.keys()).sort()) {
+    sorted.set(key, raw.get(key)!);
+  }
+  return sorted;
+}
+
+export function aggregateFilledContainerDemand(
+  items: readonly {
+    kind: ItemKind;
+    waterType?: WaterType | null;
+    productId?: string | null;
+    quantity: number;
+  }[],
+): Map<string, number> {
+  const raw = new Map<string, number>();
+  for (const item of items) {
+    if (
+      item.kind !== "CONTAINER_PACKAGE" ||
+      item.waterType === null ||
+      item.waterType === undefined ||
+      !item.productId
+    ) {
       continue;
     }
     raw.set(item.productId, (raw.get(item.productId) ?? 0) + item.quantity);
@@ -821,6 +895,7 @@ export function deriveCheckoutLookup(input: {
   cancellationOrigin?: "EXPLICIT_OPERATOR" | "AUTO_END_DAY" | null;
   sale: SaleView | null;
   settlement: PriorDaySettlementView | null;
+  resolution?: CheckoutResolutionView | null;
   todayDate: string;
   currentUserId: string;
   currentUserRole: "OWNER" | "CASHIER";
@@ -828,12 +903,22 @@ export function deriveCheckoutLookup(input: {
   inFlightEntry?: InFlightEntry;
 }): CheckoutLookupView {
   const ownedByCurrentUser = input.checkoutOwnerUserId === input.currentUserId;
-  const composition = classifyCheckoutComposition(input.checkout.items);
+  const resolution = input.resolution ?? null;
   const canSettlePriorDay =
-    composition !== "MIXED" &&
     input.currentUserRole === "OWNER" &&
     !input.inFlightEntry &&
     input.checkout.businessDate < input.todayDate &&
+    (input.checkout.status === "REVIEW_REQUIRED" || input.checkout.status === "PAYMENT_PENDING");
+  const canResolveNoCashPriorDay =
+    input.currentUserRole === "OWNER" &&
+    !input.inFlightEntry &&
+    input.checkout.businessDate < input.todayDate &&
+    input.checkout.status === "PAYMENT_PENDING" &&
+    input.checkout.cashReceivedCentavos === null &&
+    input.checkout.paymentRecordedAt === null;
+  const canResolveFullRefund =
+    input.currentUserRole === "OWNER" &&
+    !input.inFlightEntry &&
     (input.checkout.status === "REVIEW_REQUIRED" || input.checkout.status === "PAYMENT_PENDING");
 
   if (input.checkout.status === "SAVED" && input.sale) {
@@ -844,11 +929,14 @@ export function deriveCheckoutLookup(input: {
       canCancelUnpaid: false,
       canSettlePriorDay: false,
       canDismissCancelled: false,
+      canResolveNoCashPriorDay: false,
+      canResolveFullRefund: false,
       ownedByCurrentUser,
       checkedAt: input.checkedAt,
       checkout: input.checkout,
       sale: input.sale,
       settlement: null,
+      resolution: null,
     };
   }
 
@@ -860,11 +948,52 @@ export function deriveCheckoutLookup(input: {
       canCancelUnpaid: false,
       canSettlePriorDay: false,
       canDismissCancelled: false,
+      canResolveNoCashPriorDay: false,
+      canResolveFullRefund: false,
       ownedByCurrentUser,
       checkedAt: input.checkedAt,
       checkout: input.checkout,
       sale: null,
       settlement: input.settlement,
+      resolution: null,
+    };
+  }
+
+  if (input.checkout.status === "CANCELLED_NO_CASH" && resolution) {
+    return {
+      recoveryState: "CANCELLED_NO_CASH",
+      reason: resolution.reason,
+      canRetry: false,
+      canCancelUnpaid: false,
+      canSettlePriorDay: false,
+      canDismissCancelled: false,
+      canResolveNoCashPriorDay: false,
+      canResolveFullRefund: false,
+      ownedByCurrentUser,
+      checkedAt: input.checkedAt,
+      checkout: input.checkout,
+      sale: null,
+      settlement: null,
+      resolution,
+    };
+  }
+
+  if (input.checkout.status === "REFUNDED_UNSAVED" && resolution) {
+    return {
+      recoveryState: "REFUNDED_UNSAVED",
+      reason: resolution.reason,
+      canRetry: false,
+      canCancelUnpaid: false,
+      canSettlePriorDay: false,
+      canDismissCancelled: false,
+      canResolveNoCashPriorDay: false,
+      canResolveFullRefund: false,
+      ownedByCurrentUser,
+      checkedAt: input.checkedAt,
+      checkout: input.checkout,
+      sale: null,
+      settlement: null,
+      resolution,
     };
   }
 
@@ -876,11 +1005,14 @@ export function deriveCheckoutLookup(input: {
       canCancelUnpaid: false,
       canSettlePriorDay: false,
       canDismissCancelled: false,
+      canResolveNoCashPriorDay: false,
+      canResolveFullRefund: false,
       ownedByCurrentUser,
       checkedAt: input.checkedAt,
       checkout: input.inFlightEntry.checkoutView,
       sale: null,
       settlement: null,
+      resolution: null,
     };
   }
 
@@ -892,11 +1024,14 @@ export function deriveCheckoutLookup(input: {
       canCancelUnpaid: false,
       canSettlePriorDay,
       canDismissCancelled: false,
+      canResolveNoCashPriorDay: false,
+      canResolveFullRefund,
       ownedByCurrentUser,
       checkedAt: input.checkedAt,
       checkout: input.checkout,
       sale: null,
       settlement: null,
+      resolution: null,
     };
   }
 
@@ -913,11 +1048,14 @@ export function deriveCheckoutLookup(input: {
         canCancelUnpaid: false,
         canSettlePriorDay: false,
         canDismissCancelled: true,
+        canResolveNoCashPriorDay: false,
+        canResolveFullRefund: false,
         ownedByCurrentUser,
         checkedAt: input.checkedAt,
         checkout: input.checkout,
         sale: null,
         settlement: null,
+        resolution: null,
       };
     }
     return {
@@ -927,11 +1065,14 @@ export function deriveCheckoutLookup(input: {
       canCancelUnpaid: false,
       canSettlePriorDay: false,
       canDismissCancelled: false,
+      canResolveNoCashPriorDay: false,
+      canResolveFullRefund: false,
       ownedByCurrentUser,
       checkedAt: input.checkedAt,
       checkout: input.checkout,
       sale: null,
       settlement: null,
+      resolution: null,
     };
   }
 
@@ -943,27 +1084,39 @@ export function deriveCheckoutLookup(input: {
       canCancelUnpaid: false,
       canSettlePriorDay,
       canDismissCancelled: false,
+      canResolveNoCashPriorDay,
+      canResolveFullRefund,
       ownedByCurrentUser,
       checkedAt: input.checkedAt,
       checkout: input.checkout,
       sale: null,
       settlement: null,
+      resolution: null,
     };
   }
 
   if (input.checkout.businessDate !== input.todayDate) {
+    const canCancelPriorDayFilledDraft =
+      ownedByCurrentUser &&
+      input.checkout.status === "DRAFT" &&
+      input.checkout.cashReceivedCentavos === null &&
+      input.checkout.paymentRecordedAt === null &&
+      aggregateFilledContainerDemand(input.checkout.items).size > 0;
     return {
       recoveryState: "REVIEW_REQUIRED",
       reason: "BUSINESS_DATE_CROSSED",
       canRetry: false,
-      canCancelUnpaid: false,
+      canCancelUnpaid: canCancelPriorDayFilledDraft,
       canSettlePriorDay,
       canDismissCancelled: false,
+      canResolveNoCashPriorDay,
+      canResolveFullRefund,
       ownedByCurrentUser,
       checkedAt: input.checkedAt,
       checkout: input.checkout,
       sale: null,
       settlement: null,
+      resolution: null,
     };
   }
 
@@ -975,11 +1128,14 @@ export function deriveCheckoutLookup(input: {
       canCancelUnpaid: false,
       canSettlePriorDay: false,
       canDismissCancelled: false,
+      canResolveNoCashPriorDay: false,
+      canResolveFullRefund,
       ownedByCurrentUser,
       checkedAt: input.checkedAt,
       checkout: input.checkout,
       sale: null,
       settlement: null,
+      resolution: null,
     };
   }
 
@@ -988,15 +1144,20 @@ export function deriveCheckoutLookup(input: {
     reason: "NOT_SAVED",
     canRetry: true,
     canCancelUnpaid:
-      input.checkout.status === "PAYMENT_PENDING" &&
+      (input.checkout.status === "PAYMENT_PENDING" ||
+        (input.checkout.status === "DRAFT" &&
+          aggregateFilledContainerDemand(input.checkout.items).size > 0)) &&
       input.checkout.cashReceivedCentavos === null &&
       input.checkout.paymentRecordedAt === null,
     canSettlePriorDay: false,
     canDismissCancelled: false,
+    canResolveNoCashPriorDay: false,
+    canResolveFullRefund,
     ownedByCurrentUser,
     checkedAt: input.checkedAt,
     checkout: input.checkout,
     sale: null,
     settlement: null,
+    resolution: null,
   };
 }

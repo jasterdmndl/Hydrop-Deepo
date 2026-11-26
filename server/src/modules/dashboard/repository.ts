@@ -143,7 +143,38 @@ export const dashboardRepository = {
       previousBusinessDays: unknown;
       previousTotalSalesCentavos: number | string;
     }>(
-      `WITH business_days AS (
+      `WITH RECURSIVE sale_origin AS (
+         SELECT s.id AS active_sale_id,
+                s.business_date,
+                s.total_centavos,
+                s.id AS walk_id,
+                s.corrected_from_sale_id,
+                s.created_at AS origin_created_at
+           FROM pos_sales s
+          WHERE s.status = 'ACTIVE'
+            AND (
+              (s.business_date >= $1::date AND s.business_date <= $2::date)
+              OR ($5::boolean AND s.business_date >= $6::date AND s.business_date <= $7::date)
+            )
+         UNION ALL
+         SELECT so.active_sale_id,
+                so.business_date,
+                so.total_centavos,
+                parent.id AS walk_id,
+                parent.corrected_from_sale_id,
+                parent.created_at AS origin_created_at
+           FROM sale_origin so
+           JOIN pos_sales parent ON parent.id = so.corrected_from_sale_id
+       ),
+       active_sales_with_origin AS (
+         SELECT active_sale_id AS id,
+                business_date,
+                total_centavos,
+                origin_created_at
+           FROM sale_origin
+          WHERE corrected_from_sale_id IS NULL
+       ),
+       business_days AS (
          SELECT to_char(business_date, 'YYYY-MM-DD') AS "businessDate",
                 CASE
                   WHEN closed_at IS NOT NULL AND closed_at <= $10::timestamptz
@@ -157,11 +188,10 @@ export const dashboardRepository = {
        ),
        active_sales AS (
          SELECT id, business_date, total_centavos
-           FROM pos_sales
-          WHERE status = 'ACTIVE'
-            AND business_date >= $1::date
+           FROM active_sales_with_origin
+          WHERE business_date >= $1::date
             AND business_date <= $2::date
-            AND (NOT $3::boolean OR business_date < $2::date OR created_at <= $4::timestamptz)
+            AND (NOT $3::boolean OR business_date < $2::date OR origin_created_at <= $4::timestamptz)
        ),
        sales_by_date AS (
          SELECT to_char(business_date, 'YYYY-MM-DD') AS "businessDate",
@@ -219,12 +249,11 @@ export const dashboardRepository = {
        ),
        previous_active_sales AS (
          SELECT COALESCE(SUM(total_centavos), 0)::bigint AS "salesCentavos"
-           FROM pos_sales
+           FROM active_sales_with_origin
           WHERE $5::boolean
-            AND status = 'ACTIVE'
             AND business_date >= $6::date
             AND business_date <= $7::date
-            AND (NOT $8::boolean OR business_date < $7::date OR created_at <= $9::timestamptz)
+            AND (NOT $8::boolean OR business_date < $7::date OR origin_created_at <= $9::timestamptz)
        )
        SELECT COALESCE(
                 (
@@ -444,7 +473,12 @@ export const dashboardRepository = {
 
     const rawMovements = parseJsonArray<{
       id: string;
-      movementType: "POS_SALE" | "PRIOR_DAY_SETTLEMENT" | "PHYSICAL_COUNT_RECONCILIATION";
+      movementType:
+        | "POS_SALE"
+        | "PRIOR_DAY_SETTLEMENT"
+        | "PHYSICAL_COUNT_RECONCILIATION"
+        | "SALE_ACTION_DEDUCTION"
+        | "SALE_ACTION_RESTORATION";
       quantityDelta: number | string;
       balanceBefore: number | string;
       balanceAfter: number | string;
