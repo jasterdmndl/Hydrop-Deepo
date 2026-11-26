@@ -49,7 +49,7 @@ describe("Activity Calendar records and API", () => {
   beforeEach(async () => {
     ctx = await createTestContext({ clock: new ManualClock(BASE_MANILA) });
     owner = await activatedAccount(ctx, "owner1", "OWNER");
-    cashier = await activatedAccount(ctx, "cashier1", "CASHIER");
+    cashier = await activatedAccount(ctx, "cashier1", "EMPLOYEE");
   });
 
   afterEach(async () => {
@@ -232,7 +232,7 @@ describe("Activity Calendar records and API", () => {
 
         const second = await createTestContext({ dataDir: dir, clock });
         try {
-          const c2 = await activatedAccount(second, "cashier2", "CASHIER");
+          const c2 = await activatedAccount(second, "cashier2", "EMPLOYEE");
           const list = await request(second.app)
             .get("/api/calendar/activities?month=2026-11")
             .set("Cookie", c2.cookie);
@@ -577,7 +577,7 @@ describe("Activity Calendar records and API", () => {
       const octCtx = await createTestContext({ clock: new ManualClock("2026-10-31T23:00:00+08:00") });
       try {
         let octOwner = await activatedAccount(octCtx, "owner1", "OWNER");
-        let octCashier = await activatedAccount(octCtx, "cashier1", "CASHIER");
+        let octCashier = await activatedAccount(octCtx, "cashier1", "EMPLOYEE");
 
         // 2026-10-31 23:30+08:00 (15:30Z) scheduled in October Manila time.
         const created = await scheduleActivity(octCtx, octOwner, {

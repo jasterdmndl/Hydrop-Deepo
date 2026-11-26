@@ -4,7 +4,7 @@ import { advanceAuthGeneration, api, ApiError, onIdleExpiry, onSessionEnded, set
 import { nextNoticeId } from "../notifications/noticeTiming";
 import { clockOffsetMs, resolveLogoutOutcome, shouldSendHeartbeat } from "./idle";
 
-export type Role = "OWNER" | "CASHIER";
+export type Role = "OWNER" | "EMPLOYEE";
 
 export interface SessionUser {
   username: string;

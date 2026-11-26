@@ -898,7 +898,7 @@ export function deriveCheckoutLookup(input: {
   resolution?: CheckoutResolutionView | null;
   todayDate: string;
   currentUserId: string;
-  currentUserRole: "OWNER" | "CASHIER";
+  currentUserRole: "OWNER" | "EMPLOYEE";
   checkedAt: string;
   inFlightEntry?: InFlightEntry;
 }): CheckoutLookupView {

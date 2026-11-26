@@ -54,9 +54,9 @@ describe("shared sign-in and module entry", () => {
     });
 
     it("requires a password change before any module access", async () => {
-      const { temporaryPassword } = await provision(ctx.db, "cashier1", "CASHIER");
+      const { temporaryPassword } = await provision(ctx.db, "cashier1", "EMPLOYEE");
       const first = await signIn(ctx.app, "cashier1", temporaryPassword);
-      expect(first.body.user).toEqual({ username: "cashier1", role: "CASHIER", mustChangePassword: true });
+      expect(first.body.user).toEqual({ username: "cashier1", role: "EMPLOYEE", mustChangePassword: true });
 
       for (const url of ["/api/modules", "/api/calendar/access"]) {
         const res = await request(ctx.app).get(url).set("Cookie", first.cookie);
@@ -100,7 +100,7 @@ describe("shared sign-in and module entry", () => {
   describe("module entry", () => {
     it("lets both activated roles open Calendar, with role-based access from the server", async () => {
       const owner = await activatedAccount(ctx, "owner1", "OWNER");
-      const cashier = await activatedAccount(ctx, "cashier1", "CASHIER");
+      const cashier = await activatedAccount(ctx, "cashier1", "EMPLOYEE");
 
       const ownerModules = await request(ctx.app).get("/api/modules").set("Cookie", owner.cookie);
       const cashierModules = await request(ctx.app).get("/api/modules").set("Cookie", cashier.cookie);
@@ -151,7 +151,7 @@ describe("shared sign-in and module entry", () => {
     });
 
     it("takes the role from the server account, not from the request", async () => {
-      const cashier = await activatedAccount(ctx, "cashier1", "CASHIER");
+      const cashier = await activatedAccount(ctx, "cashier1", "EMPLOYEE");
       const res = await request(ctx.app)
         .get("/api/calendar/access")
         .set("Cookie", cashier.cookie)
@@ -274,7 +274,7 @@ describe("shared sign-in and module entry", () => {
 
     it("a successful sign-in replaces only earlier sessions for that account", async () => {
       const ownerA = await activatedAccount(ctx, "owner1", "OWNER");
-      const cashier = await activatedAccount(ctx, "cashier1", "CASHIER");
+      const cashier = await activatedAccount(ctx, "cashier1", "EMPLOYEE");
 
       // Failed password preserves the active session on Device A.
       const failed = await request(ctx.app)
@@ -402,12 +402,12 @@ describe("shared sign-in and module entry", () => {
     it("shared role guard denies a role outside the allowed list", async () => {
       const app = express();
       app.use((req, _res, next) => {
-        const role = req.get("x-test-role") as "OWNER" | "CASHIER";
+        const role = req.get("x-test-role") as "OWNER" | "EMPLOYEE";
         req.auth = { sessionId: "s", csrfToken: "c", user: { id: "u", username: "u", role, mustChangePassword: false }, timing: {} as any };
         next();
       });
       app.post("/owner-only", requireRole("OWNER"), (_req, res) => res.json({ ok: true }));
-      expect((await request(app).post("/owner-only").set("x-test-role", "CASHIER")).status).toBe(403);
+      expect((await request(app).post("/owner-only").set("x-test-role", "EMPLOYEE")).status).toBe(403);
       expect((await request(app).post("/owner-only").set("x-test-role", "OWNER")).status).toBe(200);
     });
   });

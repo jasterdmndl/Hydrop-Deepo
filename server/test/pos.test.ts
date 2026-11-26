@@ -94,7 +94,7 @@ describe("POS station day and refill sales", () => {
   beforeEach(async () => {
     ctx = await createTestContext({ clock: new ManualClock(BASE_MANILA) });
     owner = await activatedAccount(ctx, "owner1", "OWNER");
-    cashier = await activatedAccount(ctx, "cashier1", "CASHIER");
+    cashier = await activatedAccount(ctx, "cashier1", "EMPLOYEE");
   });
 
   afterEach(async () => {
@@ -107,7 +107,7 @@ describe("POS station day and refill sales", () => {
       expect(anonDay.status).toBe(401);
       expect(anonDay.body.error.code).toBe("UNAUTHENTICATED");
 
-      const { temporaryPassword } = await provision(ctx.db, "tempcashier", "CASHIER");
+      const { temporaryPassword } = await provision(ctx.db, "tempcashier", "EMPLOYEE");
       const unactivated = await signIn(ctx.app, "tempcashier", temporaryPassword);
       const blockedDay = await request(ctx.app).get("/api/pos/day").set("Cookie", unactivated.cookie);
       expect(blockedDay.status).toBe(403);
@@ -1272,7 +1272,7 @@ describe("POS station day and refill sales", () => {
       try {
         const first = await createTestContext({ dataDir: dir, clock });
         const o1 = await activatedAccount(first, "owner1", "OWNER");
-        const c1 = await activatedAccount(first, "cashier1", "CASHIER");
+        const c1 = await activatedAccount(first, "cashier1", "EMPLOYEE");
 
         await startDay(first, c1, { requestKey: "restart-day" });
         const prep = await prepareCheckout(first, c1, {
@@ -1321,7 +1321,7 @@ describe("POS station day and refill sales", () => {
       try {
         const first = await createTestContext({ dataDir: dir, clock });
         const o1 = await activatedAccount(first, "owner1", "OWNER");
-        const c1 = await activatedAccount(first, "cashier1", "CASHIER");
+        const c1 = await activatedAccount(first, "cashier1", "EMPLOYEE");
 
         await startDay(first, o1, { requestKey: "prot-day" });
 
@@ -2234,7 +2234,7 @@ describe("POS station day and refill sales", () => {
           close: () => upgradeDb.close(),
         };
         const upOwner = await activatedAccount(preUpgradeCtx, "upowner", "OWNER");
-        const upCashier = await activatedAccount(preUpgradeCtx, "upcashier", "CASHIER");
+        const upCashier = await activatedAccount(preUpgradeCtx, "upcashier", "EMPLOYEE");
 
         const { rows: uRows } = await upgradeDb.query<{ id: string; username: string }>(
           `SELECT id, username FROM app_users WHERE username IN ('upowner', 'upcashier')`,
@@ -3316,7 +3316,7 @@ describe("POS station day and refill sales", () => {
           close: () => upgradeDb.close(),
         };
         const upOwner = await activatedAccount(upCtx, "upowner", "OWNER");
-        const upCashier = await activatedAccount(upCtx, "upcashier", "CASHIER");
+        const upCashier = await activatedAccount(upCtx, "upcashier", "CASHIER" as unknown as Parameters<typeof activatedAccount>[2]);
 
         const { rows: userRows } = await upgradeDb.query<{ id: string; username: string }>(
           `SELECT id, username FROM app_users WHERE username IN ('upowner', 'upcashier')`,
@@ -3427,6 +3427,7 @@ describe("POS station day and refill sales", () => {
           "0014_pos_checkout_resolutions_and_holds.sql",
           "0015_pos_sale_actions.sql",
           "0016_pos_sale_action_stock_effects.sql",
+          "0017_employee_role_rename.sql",
         ]);
 
         const cashierAfter = await signIn(upgradeApp, "upcashier", upCashier.password);
@@ -3536,6 +3537,7 @@ describe("POS station day and refill sales", () => {
           "0014_pos_checkout_resolutions_and_holds.sql",
           "0015_pos_sale_actions.sql",
           "0016_pos_sale_action_stock_effects.sql",
+          "0017_employee_role_rename.sql",
         ]);
       } finally {
         await revisedDb.close();
@@ -3585,7 +3587,7 @@ describe("POS station day and refill sales", () => {
           close: () => upgradeDb.close(),
         };
         const upOwner = await activatedAccount(upCtx, "f6owner", "OWNER");
-        const upCashier = await activatedAccount(upCtx, "f6cashier", "CASHIER");
+        const upCashier = await activatedAccount(upCtx, "f6cashier", "CASHIER" as unknown as Parameters<typeof activatedAccount>[2]);
 
         const { rows: userRows } = await upgradeDb.query<{ id: string; username: string }>(
           `SELECT id, username FROM app_users WHERE username IN ('f6owner', 'f6cashier')`,
@@ -3665,6 +3667,7 @@ describe("POS station day and refill sales", () => {
           "0014_pos_checkout_resolutions_and_holds.sql",
           "0015_pos_sale_actions.sql",
           "0016_pos_sale_action_stock_effects.sql",
+          "0017_employee_role_rename.sql",
         ]);
 
         const cashier = await signIn(upgradeApp, "f6cashier", upCashier.password);
@@ -3803,7 +3806,7 @@ describe("POS station day and refill sales", () => {
           close: () => upgradeDb.close(),
         };
         const upOwner = await activatedAccount(upCtx, "f7owner", "OWNER");
-        const upCashier = await activatedAccount(upCtx, "f7cashier", "CASHIER");
+        const upCashier = await activatedAccount(upCtx, "f7cashier", "CASHIER" as unknown as Parameters<typeof activatedAccount>[2]);
 
         const { rows: userRows } = await upgradeDb.query<{ id: string; username: string }>(
           `SELECT id, username FROM app_users WHERE username IN ('f7owner', 'f7cashier')`,
@@ -3909,6 +3912,7 @@ describe("POS station day and refill sales", () => {
           "0014_pos_checkout_resolutions_and_holds.sql",
           "0015_pos_sale_actions.sql",
           "0016_pos_sale_action_stock_effects.sql",
+          "0017_employee_role_rename.sql",
         ]);
 
         const cashier = await signIn(upgradeApp, "f7cashier", upCashier.password);
@@ -4074,7 +4078,7 @@ describe("POS station day and refill sales", () => {
           close: () => upgradeDb.close(),
         };
         const upOwner = await activatedAccount(upCtx, "f7bowner", "OWNER");
-        const upCashier = await activatedAccount(upCtx, "f7bcashier", "CASHIER");
+        const upCashier = await activatedAccount(upCtx, "f7bcashier", "CASHIER" as unknown as Parameters<typeof activatedAccount>[2]);
 
         const { rows: userRows } = await upgradeDb.query<{ id: string; username: string }>(
           `SELECT id, username FROM app_users WHERE username IN ('f7bowner', 'f7bcashier')`,
@@ -4147,6 +4151,7 @@ describe("POS station day and refill sales", () => {
           "0014_pos_checkout_resolutions_and_holds.sql",
           "0015_pos_sale_actions.sql",
           "0016_pos_sale_action_stock_effects.sql",
+          "0017_employee_role_rename.sql",
         ]);
 
         // Cross Asia/Manila midnight with cash collection never started on draftRef

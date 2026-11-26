@@ -1048,7 +1048,7 @@ export function mergeRecoveryLookup(
 export function resolveRecoveryPresentation(
   record: PendingCheckoutRecovery,
   currentUsername: string,
-  currentUserRole: "OWNER" | "CASHIER" = "CASHIER",
+  currentUserRole: "OWNER" | "EMPLOYEE" = "EMPLOYEE",
   todayDate?: string,
 ): RecoveryPresentation {
   const lookup = record.lastLookup;
