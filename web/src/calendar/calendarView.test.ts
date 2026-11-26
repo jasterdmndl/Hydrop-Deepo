@@ -5,9 +5,12 @@ import {
   createRequestTracker,
   currentManilaDateAndTime,
   formatLongDate,
+  formatManilaTimestamp,
   formatMonthHeading,
   formatShortDateTime,
   formatTime12h,
+  MAX_SERIES_OCCURRENCES,
+  previewRepeatSchedule,
   resolveSelectedActivityForDate,
   scheduleDraftSignature,
   shiftMonth,
@@ -16,12 +19,24 @@ import {
 function makeActivity(reference: string, scheduledDate: string): ActivityView {
   return {
     reference,
+    version: 1,
     name: `Activity ${reference}`,
     scheduledAt: `${scheduledDate}T14:00:00.000Z`,
     scheduledDate,
     scheduledTime: "14:00",
     scheduleNotes: null,
+    originalName: `Activity ${reference}`,
+    originalScheduledAt: `${scheduledDate}T14:00:00.000Z`,
+    originalScheduledDate: scheduledDate,
+    originalScheduledTime: "14:00",
+    originalScheduleNotes: null,
     status: "SCHEDULED",
+    recurrence: "ONE_TIME",
+    seriesReference: null,
+    seriesIndex: null,
+    seriesEndDate: null,
+    cancellation: null,
+    scheduleHistory: [],
     createdBy: "owner.demo",
     createdAt: "2026-11-18T00:00:00.000Z",
     actualCompletedAt: null,
@@ -57,6 +72,7 @@ describe("calendar view helpers", () => {
     expect(formatLongDate("2026-11-12")).toBe("Thursday, November 12, 2026");
     expect(formatLongDate("2026-11-12", false)).toBe("November 12, 2026");
     expect(formatShortDateTime("2026-11-08", "16:00")).toBe("Nov 8 · 4:00 PM");
+    expect(formatManilaTimestamp("2026-10-31T16:30:00.000Z")).toBe("Nov 1, 2026 · 12:30 AM");
   });
 
   it("derives Asia/Manila date/time across UTC midnight", () => {
@@ -68,7 +84,45 @@ describe("calendar view helpers", () => {
     });
   });
 
-  it("keeps the same draft signature for retries and rotates when fields change", () => {
+  it("previews repeating schedules including monthly clamping and the 1,096-occurrence limit", () => {
+    expect(
+      previewRepeatSchedule({ scheduledDate: "2026-11-10", recurrence: "DAILY", endDate: "2026-11-12" }),
+    ).toEqual({ ok: true, dates: ["2026-11-10", "2026-11-11", "2026-11-12"] });
+
+    expect(
+      previewRepeatSchedule({ scheduledDate: "2026-11-09", recurrence: "WEEKLY", endDate: "2026-11-25" }),
+    ).toEqual({ ok: true, dates: ["2026-11-09", "2026-11-16", "2026-11-23"] });
+
+    expect(
+      previewRepeatSchedule({ scheduledDate: "2028-01-31", recurrence: "MONTHLY", endDate: "2028-03-31" }),
+    ).toEqual({ ok: true, dates: ["2028-01-31", "2028-02-29", "2028-03-31"] });
+
+    expect(
+      previewRepeatSchedule({ scheduledDate: "2027-01-31", recurrence: "MONTHLY", endDate: "2027-04-30" }),
+    ).toEqual({ ok: true, dates: ["2027-01-31", "2027-02-28", "2027-03-31", "2027-04-30"] });
+
+    const atLimit = previewRepeatSchedule({
+      scheduledDate: "2026-11-09",
+      recurrence: "DAILY",
+      endDate: "2029-11-08",
+    });
+    expect(atLimit.ok).toBe(true);
+    if (atLimit.ok) {
+      expect(atLimit.dates).toHaveLength(MAX_SERIES_OCCURRENCES);
+    }
+
+    const overLimit = previewRepeatSchedule({
+      scheduledDate: "2026-11-09",
+      recurrence: "DAILY",
+      endDate: "2029-11-09",
+    });
+    expect(overLimit).toEqual({
+      ok: false,
+      message: "Repeating schedules can include at most 1,096 occurrences at once. Choose an earlier end date.",
+    });
+  });
+
+  it("keeps the same draft signature for retries and rotates when fields or recurrence change", () => {
     const a = scheduleDraftSignature({
       name: "Filter replacement",
       scheduledDate: "2026-11-12",
@@ -80,6 +134,7 @@ describe("calendar view helpers", () => {
       scheduledDate: "2026-11-12",
       scheduledTime: "14:00",
       scheduleNotes: "Replace 1-micron cartridge.",
+      recurrence: "ONE_TIME",
     });
     const edited = scheduleDraftSignature({
       name: "Filter replacement",
@@ -87,8 +142,17 @@ describe("calendar view helpers", () => {
       scheduledTime: "14:30",
       scheduleNotes: "Replace 1-micron cartridge.",
     });
+    const repeating = scheduleDraftSignature({
+      name: "Filter replacement",
+      scheduledDate: "2026-11-12",
+      scheduledTime: "14:00",
+      scheduleNotes: "Replace 1-micron cartridge.",
+      recurrence: "WEEKLY",
+      endDate: "2026-12-03",
+    });
     expect(a).toBe(retry);
     expect(a).not.toBe(edited);
+    expect(a).not.toBe(repeating);
   });
 
   it("ignores stale out-of-order month navigation responses in favor of the latest selected month", async () => {
@@ -127,17 +191,9 @@ describe("calendar view helpers", () => {
     const nov21a = makeActivity("ACT-002", "2026-11-21");
     const nov21b = makeActivity("ACT-003", "2026-11-21");
 
-    // Empty date clears a previously selected activity from another date.
     expect(resolveSelectedActivityForDate(nov19, "2026-11-20", [])).toBeNull();
-
-    // Empty date also clears an activity previously from that date if it is no longer scheduled there.
     expect(resolveSelectedActivityForDate(nov19, "2026-11-19", [])).toBeNull();
-
-    // Single-activity date auto-selects its activity.
     expect(resolveSelectedActivityForDate(null, "2026-11-19", [nov19])).toEqual(nov19);
-
-    // Multi-activity date clears stale selection from another date,
-    // but preserves a selection that already belongs to that date.
     expect(resolveSelectedActivityForDate(nov19, "2026-11-21", [nov21a, nov21b])).toBeNull();
     expect(resolveSelectedActivityForDate(nov21b, "2026-11-21", [nov21a, nov21b])).toEqual(nov21b);
   });

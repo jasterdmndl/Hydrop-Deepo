@@ -1,7 +1,61 @@
-/** Pure Asia/Manila formatting, month-grid, and draft helpers for Activity Calendar. */
+/** Pure Asia/Manila formatting, month-grid, recurrence preview, and draft helpers for Activity Calendar. */
 
-export type ActivityStatus = "SCHEDULED" | "OVERDUE" | "COMPLETED";
+export type ActivityStatus = "SCHEDULED" | "OVERDUE" | "COMPLETED" | "CANCELLED";
 export type ReminderStatus = "UPCOMING" | "OVERDUE";
+export type RecurrenceRule = "ONE_TIME" | "DAILY" | "WEEKLY" | "MONTHLY";
+export type ActivityEditScope = "THIS_OCCURRENCE" | "THIS_AND_FUTURE";
+
+export const MAX_SERIES_OCCURRENCES = 1096;
+
+export interface ActivitySeriesSummary {
+  reference: string;
+  recurrence: Exclude<RecurrenceRule, "ONE_TIME">;
+  startDate: string;
+  endDate: string;
+  scheduledTime: string;
+  occurrenceCount: number;
+  occurrenceReferences: string[];
+}
+
+export interface ActivityCancellationView {
+  reason: string;
+  cancelledBy: string;
+  cancelledAt: string;
+}
+
+export interface ActivityChangeView {
+  id: string;
+  changeType: "EDIT" | "CANCEL";
+  scope: ActivityEditScope;
+  previousName: string;
+  newName: string;
+  previousScheduledAt: string;
+  previousScheduledDate: string;
+  previousScheduledTime: string;
+  newScheduledAt: string;
+  newScheduledDate: string;
+  newScheduledTime: string;
+  previousScheduleNotes: string | null;
+  newScheduleNotes: string | null;
+  reason: string | null;
+  changedBy: string;
+  changedAt: string;
+}
+
+export interface ActivityCompletionCorrectionView {
+  id: string;
+  previousActualCompletedAt: string;
+  previousCompletedDate: string;
+  previousCompletedTime: string;
+  previousCompletionNotes: string;
+  newActualCompletedAt: string;
+  newCompletedDate: string;
+  newCompletedTime: string;
+  newCompletionNotes: string;
+  reason: string;
+  correctedBy: string;
+  correctedAt: string;
+}
 
 export interface ActivityCompletionView {
   actualCompletedAt: string;
@@ -11,16 +65,33 @@ export interface ActivityCompletionView {
   completionNotes: string;
   recordedBy: string;
   recordedAt: string;
+  originalActualCompletedAt: string;
+  originalCompletedDate: string;
+  originalCompletedTime: string;
+  originalCompletionNotes: string;
+  corrections: ActivityCompletionCorrectionView[];
 }
 
 export interface ActivityView {
   reference: string;
+  version: number;
   name: string;
   scheduledAt: string;
   scheduledDate: string;
   scheduledTime: string;
   scheduleNotes: string | null;
+  originalName: string;
+  originalScheduledAt: string;
+  originalScheduledDate: string;
+  originalScheduledTime: string;
+  originalScheduleNotes: string | null;
   status: ActivityStatus;
+  recurrence: RecurrenceRule;
+  seriesReference: string | null;
+  seriesIndex: number | null;
+  seriesEndDate: string | null;
+  cancellation: ActivityCancellationView | null;
+  scheduleHistory: ActivityChangeView[];
   createdBy: string;
   createdAt: string;
   actualCompletedAt: string | null;
@@ -32,10 +103,38 @@ export interface ActivityView {
   completion: ActivityCompletionView | null;
 }
 
+export interface ScheduleSaveResponse extends ActivityView {
+  activity: ActivityView;
+  activities: ActivityView[];
+  series: ActivitySeriesSummary | null;
+  replayed: boolean;
+}
+
+export interface MutationSaveResponse extends ActivityView {
+  activity: ActivityView;
+  activities: ActivityView[];
+  affectedReferences: string[];
+  replayed: boolean;
+}
+
+export interface BulkPreviewResponse {
+  preview: true;
+  scope: ActivityEditScope;
+  targetReference: string;
+  affectedReferences: string[];
+  affectedVersions: Record<string, number>;
+  affectedActivities: ActivityView[];
+  protectedActivities: ActivityView[];
+  conflicts?: ActivityView[];
+  conflictReferences?: string[];
+  conflictDates?: string[];
+}
+
 export interface ActivitiesMonthResponse {
   month: string;
   scheduledActivities: ActivityView[];
   completedActivities: ActivityView[];
+  cancelledActivities: ActivityView[];
 }
 
 export interface ReminderItem {
@@ -76,6 +175,13 @@ export function createRequestTracker(): RequestTracker {
       return id === latest;
     },
   };
+}
+
+export function makeRequestKey(prefix = "cal"): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return `${prefix}-${crypto.randomUUID()}`;
+  }
+  return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
 const MANILA_OFFSET_MS = 8 * 60 * 60 * 1000;
@@ -130,10 +236,22 @@ function parseYyyyMm(month: string): { year: number; month: number } {
   return { year: Number(match[1]), month: Number(match[2]) };
 }
 
-function parseYyyyMmDd(dateStr: string): { year: number; month: number; day: number } | null {
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateStr);
+function parseYyyyMmDdStrict(dateStr: string): { year: number; month: number; day: number; isoDate: string } | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(dateStr.trim());
   if (!match) return null;
-  return { year: Number(match[1]), month: Number(match[2]), day: Number(match[3]) };
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const check = new Date(Date.UTC(year, month - 1, day));
+  if (
+    Number.isNaN(check.getTime()) ||
+    check.getUTCFullYear() !== year ||
+    check.getUTCMonth() !== month - 1 ||
+    check.getUTCDate() !== day
+  ) {
+    return null;
+  }
+  return { year, month, day, isoDate: `${year}-${pad2(month)}-${pad2(day)}` };
 }
 
 function formatUtcYyyyMmDd(date: Date): string {
@@ -201,7 +319,7 @@ export function formatTime12h(timeStr: string): string {
 }
 
 export function formatLongDate(dateStr: string, includeWeekday = true): string {
-  const parts = parseYyyyMmDd(dateStr);
+  const parts = parseYyyyMmDdStrict(dateStr);
   if (!parts) return dateStr;
   const utc = new Date(Date.UTC(parts.year, parts.month - 1, parts.day));
   const monthName = MONTH_NAMES[parts.month - 1];
@@ -211,9 +329,35 @@ export function formatLongDate(dateStr: string, includeWeekday = true): string {
 }
 
 export function formatShortDateTime(dateStr: string, timeStr: string): string {
-  const parts = parseYyyyMmDd(dateStr);
+  const parts = parseYyyyMmDdStrict(dateStr);
   if (!parts) return `${dateStr} · ${formatTime12h(timeStr)}`;
   return `${SHORT_MONTHS[parts.month - 1]} ${parts.day} · ${formatTime12h(timeStr)}`;
+}
+
+export function formatManilaTimestamp(iso: string): string {
+  const parsed = new Date(iso);
+  if (Number.isNaN(parsed.getTime())) return iso;
+  const manila = currentManilaDateAndTime(parsed);
+  const dateParts = parseYyyyMmDdStrict(manila.date);
+  if (!dateParts) return iso;
+  return `${SHORT_MONTHS[dateParts.month - 1]} ${dateParts.day}, ${dateParts.year} · ${formatTime12h(manila.time)}`;
+}
+
+export function formatRecurrenceLabel(recurrence: RecurrenceRule): string {
+  switch (recurrence) {
+    case "ONE_TIME":
+      return "One-time";
+    case "DAILY":
+      return "Daily";
+    case "WEEKLY":
+      return "Weekly";
+    case "MONTHLY":
+      return "Monthly";
+  }
+}
+
+export function formatScopeLabel(scope: ActivityEditScope): string {
+  return scope === "THIS_AND_FUTURE" ? "This and future occurrences" : "This occurrence only";
 }
 
 export function reminderBadgeLabel(scheduledDate: string, status: ReminderStatus, todayDate: string, justScheduled: boolean): string {
@@ -226,10 +370,82 @@ export function reminderBadgeLabel(scheduledDate: string, status: ReminderStatus
 }
 
 function previousDateStr(dateStr: string): string {
-  const parts = parseYyyyMmDd(dateStr);
+  const parts = parseYyyyMmDdStrict(dateStr);
   if (!parts) return "";
   const prev = new Date(Date.UTC(parts.year, parts.month - 1, parts.day - 1));
   return formatUtcYyyyMmDd(prev);
+}
+
+export type RepeatSchedulePreview =
+  | { ok: true; dates: string[] }
+  | { ok: false; message: string };
+
+/**
+ * Mirrors the server recurrence preview rules so the Owner sees exact occurrence
+ * dates and the 1,096-occurrence limit before saving.
+ */
+export function previewRepeatSchedule(input: {
+  scheduledDate: string;
+  recurrence: RecurrenceRule;
+  endDate: string;
+}): RepeatSchedulePreview {
+  const start = parseYyyyMmDdStrict(input.scheduledDate);
+  if (!start) {
+    return { ok: false, message: "Choose a valid scheduled date." };
+  }
+
+  if (input.recurrence === "ONE_TIME") {
+    return { ok: true, dates: [start.isoDate] };
+  }
+
+  if (!input.endDate.trim()) {
+    return { ok: false, message: "Enter an end date for repeating activities." };
+  }
+
+  const end = parseYyyyMmDdStrict(input.endDate);
+  if (!end) {
+    return { ok: false, message: "Enter a valid end date." };
+  }
+  if (end.isoDate < start.isoDate) {
+    return { ok: false, message: "End date must be on or after the start date." };
+  }
+
+  const dates: string[] = [];
+  if (input.recurrence === "DAILY" || input.recurrence === "WEEKLY") {
+    const step = input.recurrence === "DAILY" ? 1 : 7;
+    for (let i = 0; ; i += 1) {
+      const candidate = new Date(Date.UTC(start.year, start.month - 1, start.day + i * step));
+      const iso = formatUtcYyyyMmDd(candidate);
+      if (iso > end.isoDate) break;
+      if (dates.length >= MAX_SERIES_OCCURRENCES) {
+        return {
+          ok: false,
+          message: "Repeating schedules can include at most 1,096 occurrences at once. Choose an earlier end date.",
+        };
+      }
+      dates.push(iso);
+    }
+    return { ok: true, dates };
+  }
+
+  const preferredDay = start.day;
+  for (let monthOffset = 0; ; monthOffset += 1) {
+    const zeroBasedMonth = start.month - 1 + monthOffset;
+    const targetYear = start.year + Math.floor(zeroBasedMonth / 12);
+    const targetMonth = (zeroBasedMonth % 12) + 1;
+    const daysInMonth = new Date(Date.UTC(targetYear, targetMonth, 0)).getUTCDate();
+    const targetDay = Math.min(preferredDay, daysInMonth);
+    const iso = `${targetYear}-${pad2(targetMonth)}-${pad2(targetDay)}`;
+    if (iso > end.isoDate) break;
+    if (dates.length >= MAX_SERIES_OCCURRENCES) {
+      return {
+        ok: false,
+        message: "Repeating schedules can include at most 1,096 occurrences at once. Choose an earlier end date.",
+      };
+    }
+    dates.push(iso);
+  }
+  return { ok: true, dates };
 }
 
 /**
@@ -242,12 +458,74 @@ export function scheduleDraftSignature(draft: {
   scheduledDate: string;
   scheduledTime: string;
   scheduleNotes: string;
+  recurrence?: RecurrenceRule;
+  endDate?: string;
 }): string {
+  const recurrence = draft.recurrence ?? "ONE_TIME";
+  const endDate = recurrence === "ONE_TIME" ? "" : (draft.endDate ?? "").trim();
   return JSON.stringify([
     draft.name.trim(),
     draft.scheduledDate.trim(),
     draft.scheduledTime.trim(),
     draft.scheduleNotes.trim(),
+    recurrence,
+    endDate,
+  ]);
+}
+
+export function editDraftSignature(draft: {
+  reference: string;
+  expectedVersion: number;
+  scope: ActivityEditScope;
+  name: string;
+  scheduledDate: string;
+  scheduledTime: string;
+  scheduleNotes: string;
+  expectedAffectedReferences?: string[];
+}): string {
+  return JSON.stringify([
+    draft.reference,
+    draft.expectedVersion,
+    draft.scope,
+    draft.name.trim(),
+    draft.scheduledDate.trim(),
+    draft.scheduledTime.trim(),
+    draft.scheduleNotes.trim(),
+    draft.expectedAffectedReferences ?? [],
+  ]);
+}
+
+export function cancelDraftSignature(draft: {
+  reference: string;
+  expectedVersion: number;
+  scope: ActivityEditScope;
+  reason: string;
+  expectedAffectedReferences?: string[];
+}): string {
+  return JSON.stringify([
+    draft.reference,
+    draft.expectedVersion,
+    draft.scope,
+    draft.reason.trim(),
+    draft.expectedAffectedReferences ?? [],
+  ]);
+}
+
+export function correctionDraftSignature(draft: {
+  reference: string;
+  expectedVersion: number;
+  completedDate: string;
+  completedTime: string;
+  completionNotes: string;
+  reason: string;
+}): string {
+  return JSON.stringify([
+    draft.reference,
+    draft.expectedVersion,
+    draft.completedDate.trim(),
+    draft.completedTime.trim(),
+    draft.completionNotes.trim(),
+    draft.reason.trim(),
   ]);
 }
 
