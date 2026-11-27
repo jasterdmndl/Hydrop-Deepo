@@ -435,6 +435,7 @@ export type ReconcileStockResult =
 export type RecordStockMovementResult =
   | { kind: "created"; item: InventoryItemView; movement: StockMovementView }
   | { kind: "replayed"; item: InventoryItemView; movement: StockMovementView }
+  | { kind: "cancelled" }
   | { kind: "key-conflict" }
   | { kind: "late-date-not-enabled" }
   | { kind: "not-found" }
@@ -1433,6 +1434,16 @@ export const inventoryRepository = {
             movement: toStockMovementView(existing),
           };
         }
+
+        const { rows: cancelledRows } = await tx.query<{ requestKey: string }>(
+          `SELECT request_key AS "requestKey"
+             FROM inventory_cancelled_movement_requests
+            WHERE request_key = $1`,
+          [input.requestKey],
+        );
+        if (cancelledRows.length > 0) {
+          return { kind: "cancelled" as const };
+        }
       }
 
       if (input.effectiveDate < input.todayManila) {
@@ -1607,6 +1618,16 @@ export const inventoryRepository = {
             movement: toStockMovementView(existing),
           };
         }
+
+        const { rows: cancelledRows } = await tx.query<{ requestKey: string }>(
+          `SELECT request_key AS "requestKey"
+             FROM inventory_cancelled_movement_requests
+            WHERE request_key = $1`,
+          [input.requestKey],
+        );
+        if (cancelledRows.length > 0) {
+          return { kind: "cancelled" as const };
+        }
       }
 
       if (input.effectiveDate < input.todayManila) {
@@ -1701,8 +1722,9 @@ export const inventoryRepository = {
       actorUserId: string;
     },
   ): Promise<
-    | { found: false }
-    | { found: true; item: InventoryItemView; movement: StockMovementView }
+    | { status: "NOT_FOUND" }
+    | { status: "CANCELLED" }
+    | { status: "SAVED"; item: InventoryItemView; movement: StockMovementView }
   > {
     const { rows } = await db.query<StockMovementDbRow>(
       `${STOCK_MOVEMENT_SELECT}
@@ -1712,18 +1734,121 @@ export const inventoryRepository = {
       [input.requestKey, input.actorUserId],
     );
     const row = rows[0];
-    if (!row) {
-      return { found: false };
+    if (row) {
+      const item = await findItemById(db, row.itemId);
+      if (!item) {
+        return { status: "NOT_FOUND" };
+      }
+      return {
+        status: "SAVED",
+        item,
+        movement: toStockMovementView(row),
+      };
     }
-    const item = await findItemById(db, row.itemId);
-    if (!item) {
-      return { found: false };
+
+    const { rows: cancelledRows } = await db.query<{ requestKey: string }>(
+      `SELECT request_key AS "requestKey"
+         FROM inventory_cancelled_movement_requests
+        WHERE request_key = $1
+          AND actor_user_id = $2`,
+      [input.requestKey, input.actorUserId],
+    );
+    if (cancelledRows.length > 0) {
+      return { status: "CANCELLED" };
     }
-    return {
-      found: true,
-      item,
-      movement: toStockMovementView(row),
-    };
+
+    return { status: "NOT_FOUND" };
+  },
+
+  async cancelPendingMovementRequest(
+    db: Database,
+    input: {
+      target: OpeningStockTarget;
+      movementType: "STOCK_RECEIVED" | "STOCK_USED";
+      requestKey: string;
+      actorUserId: string;
+      cancelledAt: Date;
+    },
+  ): Promise<
+    | { kind: "not-found" }
+    | { kind: "key-conflict" }
+    | { kind: "already-saved"; item: InventoryItemView; movement: StockMovementView }
+    | { kind: "cancelled" }
+  > {
+    return db.transaction(async (tx) => {
+      const whereSql =
+        input.target.kind === "shape"
+          ? `category = 'CONTAINER' AND container_shape = $1`
+          : `id = $1`;
+      const whereParam = input.target.kind === "shape" ? input.target.shape : input.target.id;
+
+      const { rows: lockedRows } = await tx.query<{ id: string }>(
+        `SELECT id
+           FROM inventory_items
+          WHERE ${whereSql}
+          FOR UPDATE`,
+        [whereParam],
+      );
+      const locked = lockedRows[0];
+      if (!locked) {
+        return { kind: "not-found" as const };
+      }
+
+      const { rows: existingRows } = await tx.query<StockMovementDbRow>(
+        `${STOCK_MOVEMENT_SELECT} WHERE m.request_key = $1`,
+        [input.requestKey],
+      );
+      const existing = existingRows[0];
+      if (existing) {
+        if (
+          existing.itemId !== locked.id ||
+          existing.actorUserId !== input.actorUserId ||
+          existing.movementType !== input.movementType
+        ) {
+          return { kind: "key-conflict" as const };
+        }
+        const currentItem = await findItemById(tx, locked.id);
+        return {
+          kind: "already-saved" as const,
+          item: currentItem!,
+          movement: toStockMovementView(existing),
+        };
+      }
+
+      const { rows: tombstoneRows } = await tx.query<{
+        itemId: string;
+        movementType: string;
+        actorUserId: string;
+      }>(
+        `SELECT item_id AS "itemId",
+                movement_type AS "movementType",
+                actor_user_id AS "actorUserId"
+           FROM inventory_cancelled_movement_requests
+          WHERE request_key = $1`,
+        [input.requestKey],
+      );
+      const tombstone = tombstoneRows[0];
+      if (tombstone) {
+        if (
+          tombstone.itemId !== locked.id ||
+          tombstone.movementType !== input.movementType ||
+          tombstone.actorUserId !== input.actorUserId
+        ) {
+          return { kind: "key-conflict" as const };
+        }
+        return { kind: "cancelled" as const };
+      }
+
+      await tx.query(
+        `INSERT INTO inventory_cancelled_movement_requests (
+           request_key, item_id, movement_type, actor_user_id, cancelled_at
+         )
+         VALUES ($1, $2, $3, $4, $5)`,
+        [input.requestKey, locked.id, input.movementType, input.actorUserId, input.cancelledAt],
+      );
+
+      return { kind: "cancelled" as const };
+    });
   },
 
   async listReconciliations(

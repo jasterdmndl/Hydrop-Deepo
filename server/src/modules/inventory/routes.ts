@@ -79,6 +79,7 @@ const USAGE_KEYS = new Set([
   "expectedCurrentQuantity",
   "requestKey",
 ]);
+const CANCEL_MOVEMENT_KEYS = new Set(["itemKey", "movementType"]);
 
 function resolveItemTarget(rawKey: string): OpeningStockTarget | null {
   const shape = parseContainerShape(rawKey);
@@ -131,8 +132,12 @@ export function inventoryRoutes(db: Database): Router {
       requestKey: parsedKey.value,
       actorUserId: req.auth!.user.id,
     });
-    if (!found.found) {
+    if (found.status === "NOT_FOUND") {
       res.json({ status: "NOT_FOUND" });
+      return;
+    }
+    if (found.status === "CANCELLED") {
+      res.json({ status: "CANCELLED" });
       return;
     }
 
@@ -141,6 +146,75 @@ export function inventoryRoutes(db: Database): Router {
       item: found.item,
       movement: found.movement,
     });
+  });
+
+  router.post("/movements/by-request-key/:requestKey/cancel", async (req, res) => {
+    const rawKey = typeof req.params.requestKey === "string" ? req.params.requestKey : "";
+    const parsedKey = parseRequestKey(rawKey);
+    if (!parsedKey.ok || !parsedKey.value) {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid movement request key.");
+      return;
+    }
+
+    const body = req.body as Record<string, unknown> | null | undefined;
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      sendError(res, 400, "VALIDATION_FAILED", "Enter valid movement cancellation details.");
+      return;
+    }
+
+    const extraKeys = Object.keys(body).filter((key) => !CANCEL_MOVEMENT_KEYS.has(key));
+    if (extraKeys.length > 0) {
+      sendError(res, 400, "VALIDATION_FAILED", "Unexpected movement cancellation fields provided.");
+      return;
+    }
+
+    if (body.movementType !== "STOCK_RECEIVED" && body.movementType !== "STOCK_USED") {
+      sendError(res, 400, "VALIDATION_FAILED", "Choose a valid movement type to cancel.");
+      return;
+    }
+    if (body.movementType === "STOCK_RECEIVED" && req.auth!.user.role !== "OWNER") {
+      sendError(res, 403, "FORBIDDEN", "Only the Owner can cancel a Stock Received submission.");
+      return;
+    }
+
+    const rawItemKey = typeof body.itemKey === "string" ? body.itemKey.trim() : "";
+    const target = resolveItemTarget(rawItemKey);
+    if (!target) {
+      sendError(res, 400, "VALIDATION_FAILED", "Choose a valid Inventory item.");
+      return;
+    }
+
+    const outcome = await repo.cancelPendingMovementRequest(db, {
+      target,
+      movementType: body.movementType,
+      requestKey: parsedKey.value,
+      actorUserId: req.auth!.user.id,
+      cancelledAt: req.now,
+    });
+
+    if (outcome.kind === "not-found") {
+      sendError(res, 404, "NOT_FOUND", "Inventory item not found.");
+      return;
+    }
+    if (outcome.kind === "key-conflict") {
+      sendError(
+        res,
+        409,
+        "REQUEST_KEY_CONFLICT",
+        "This movement request key was already used for a different entry or account.",
+      );
+      return;
+    }
+    if (outcome.kind === "already-saved") {
+      res.json({
+        status: "SAVED",
+        item: outcome.item,
+        movement: outcome.movement,
+      });
+      return;
+    }
+
+    res.json({ status: "CANCELLED" });
   });
 
   router.post("/pos-sections", requireRole("OWNER"), async (req, res) => {
@@ -1068,6 +1142,15 @@ export function inventoryRoutes(db: Database): Router {
       sendError(res, 400, "VALIDATION_FAILED", "Invalid Stock Received item category.");
       return;
     }
+    if (outcome.kind === "cancelled") {
+      sendError(
+        res,
+        409,
+        "REQUEST_KEY_CANCELLED",
+        "This Stock Received submission was cancelled before saving. Review the current stock balance before submitting a new entry.",
+      );
+      return;
+    }
     if (outcome.kind === "key-conflict") {
       sendError(
         res,
@@ -1239,6 +1322,15 @@ export function inventoryRoutes(db: Database): Router {
         409,
         "OPENING_STOCK_NOT_SET",
         "Record an opening stock count before recording Stock Used.",
+      );
+      return;
+    }
+    if (outcome.kind === "cancelled") {
+      sendError(
+        res,
+        409,
+        "REQUEST_KEY_CANCELLED",
+        "This Stock Used submission was cancelled before saving. Review the current stock balance before submitting a new entry.",
       );
       return;
     }

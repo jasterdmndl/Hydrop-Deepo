@@ -4,7 +4,7 @@ import path from "node:path";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "../src/app.js";
-import { createPgliteDatabase } from "../src/db/database.js";
+import { createPgliteDatabase, type Database, type Queryable } from "../src/db/database.js";
 import { MIGRATIONS_DIR, runMigrations } from "../src/db/migrate.js";
 import { ManualClock } from "../src/shared/clock.js";
 import {
@@ -1257,7 +1257,7 @@ describe("Final Inventory Task 1 — operating supplies, receiving, usage, and D
     const db = await createPgliteDatabase();
     try {
       const files = (await readdir(MIGRATIONS_DIR))
-        .filter((f) => /^\d{4}_.+\.sql$/.test(f) && !f.startsWith("0021_"))
+        .filter((f) => /^\d{4}_.+\.sql$/.test(f) && Number(f.slice(0, 4)) < 21)
         .sort();
       for (const file of files) {
         await copyFile(path.join(MIGRATIONS_DIR, file), path.join(preDir, file));
@@ -1359,9 +1359,12 @@ describe("Final Inventory Task 1 — operating supplies, receiving, usage, and D
         [roundId, merchId, saleId, empId],
       );
 
-      // Apply migration 0021 onto the populated database.
+      // Apply migrations 0021 and 0022 onto the populated database.
       const newlyApplied = await runMigrations(db, MIGRATIONS_DIR);
-      expect(newlyApplied).toEqual(["0021_inventory_supplies_and_movements.sql"]);
+      expect(newlyApplied).toEqual([
+        "0021_inventory_supplies_and_movements.sql",
+        "0022_inventory_movement_request_tombstones.sql",
+      ]);
 
       const afterItems = await request(app).get("/api/inventory/items").set("Cookie", empAcct.cookie);
       expect(afterItems.status).toBe(200);
@@ -2251,5 +2254,315 @@ describe("Final Inventory Task 1 — operating supplies, receiving, usage, and D
         })
       ).status,
     ).toBe(400);
+  });
+
+  it("Finding 1 race: preserves requestKey across in-flight status checks and blocks late commits after explicit cancel for both receiving and usage", async () => {
+    const supplyRes = await postProduct(ctx, owner, {
+      category: "OPERATING_SUPPLY",
+      name: "Sanitizing Tabs",
+      unit: "tabs",
+      allowDecimalQuantity: false,
+      unitConfirmed: true,
+    });
+    expect(supplyRes.status).toBe(201);
+    const supplyId = supplyRes.body.item.id as string;
+
+    const openRes = await postOpeningStock(ctx, owner, supplyId, { quantity: 10 });
+    expect(openRes.status).toBe(201);
+    let currentRev = openRes.body.item.stockRevision as number;
+
+    let gate: {
+      armed: boolean;
+      resolveReached: () => void;
+      waitToProceed: Promise<void>;
+    } | null = null;
+
+    const gatedDb: Database = {
+      query: ctx.db.query.bind(ctx.db),
+      exec: ctx.db.exec.bind(ctx.db),
+      close: ctx.db.close.bind(ctx.db),
+      async transaction<T>(fn: (tx: Queryable) => Promise<T>): Promise<T> {
+        if (gate && gate.armed) {
+          const active = gate;
+          active.armed = false;
+          active.resolveReached();
+          await active.waitToProceed;
+        }
+        return ctx.db.transaction(fn);
+      },
+    };
+    const raceApp = createApp({ db: gatedDb, clock: ctx.clock, secureCookies: false });
+    const armNextTx = () => {
+      let resolveReached!: () => void;
+      let release!: () => void;
+      const reached = new Promise<void>((res) => {
+        resolveReached = res;
+      });
+      const waitToProceed = new Promise<void>((res) => {
+        release = res;
+      });
+      gate = { armed: true, resolveReached, waitToProceed };
+      return { reached, release };
+    };
+
+    // 1a. STOCK_USED: pause in-flight POST before tx begins -> status check sees NOT_FOUND without blocking late commit.
+    const usePause = armNextTx();
+    const pendingUseReq = request(raceApp)
+      .post(`/api/inventory/items/${encodeURIComponent(supplyId)}/usage`)
+      .set("Cookie", employee.cookie)
+      .set("X-CSRF-Token", employee.csrfToken)
+      .send({
+        quantity: 1,
+        purpose: "Container rinse",
+        expectedRevision: currentRev,
+        expectedCurrentQuantity: 10,
+        requestKey: "race-use-status-1",
+      })
+      .then((res) => res);
+    await usePause.reached;
+
+    const inflightUseStatus = await request(raceApp)
+      .get("/api/inventory/movements/by-request-key/race-use-status-1")
+      .set("Cookie", employee.cookie);
+    expect(inflightUseStatus.status).toBe(200);
+    expect(inflightUseStatus.body).toEqual({ status: "NOT_FOUND" });
+
+    usePause.release();
+    const committedUse = await pendingUseReq;
+    expect(committedUse.status).toBe(201);
+    expect(committedUse.body.item.currentQuantity).toBe(9);
+    currentRev = committedUse.body.item.stockRevision as number;
+
+    const savedUseStatus = await request(raceApp)
+      .get("/api/inventory/movements/by-request-key/race-use-status-1")
+      .set("Cookie", employee.cookie);
+    expect(savedUseStatus.status).toBe(200);
+    expect(savedUseStatus.body).toMatchObject({
+      status: "SAVED",
+      item: { currentQuantity: 9 },
+      movement: { movementType: "STOCK_USED", quantity: 1 },
+    });
+
+    const replayUse = await request(raceApp)
+      .post(`/api/inventory/items/${encodeURIComponent(supplyId)}/usage`)
+      .set("Cookie", employee.cookie)
+      .set("X-CSRF-Token", employee.csrfToken)
+      .send({
+        quantity: 1,
+        purpose: "Container rinse",
+        expectedRevision: openRes.body.item.stockRevision,
+        expectedCurrentQuantity: 10,
+        requestKey: "race-use-status-1",
+      });
+    expect(replayUse.status).toBe(200);
+    expect(replayUse.body.replayed).toBe(true);
+    expect(replayUse.body.item.currentQuantity).toBe(9);
+
+    // 1b. STOCK_RECEIVED: pause in-flight POST before tx begins -> status check sees NOT_FOUND, original commits once, retry replays.
+    const recvPause = armNextTx();
+    const pendingRecvReq = request(raceApp)
+      .post(`/api/inventory/items/${encodeURIComponent(supplyId)}/receiving`)
+      .set("Cookie", owner.cookie)
+      .set("X-CSRF-Token", owner.csrfToken)
+      .send({
+        quantity: 2,
+        note: "Supplier box",
+        expectedRevision: currentRev,
+        expectedCurrentQuantity: 9,
+        requestKey: "race-recv-status-1",
+      })
+      .then((res) => res);
+    await recvPause.reached;
+
+    const inflightRecvStatus = await request(raceApp)
+      .get("/api/inventory/movements/by-request-key/race-recv-status-1")
+      .set("Cookie", owner.cookie);
+    expect(inflightRecvStatus.status).toBe(200);
+    expect(inflightRecvStatus.body).toEqual({ status: "NOT_FOUND" });
+
+    recvPause.release();
+    const committedRecv = await pendingRecvReq;
+    expect(committedRecv.status).toBe(201);
+    expect(committedRecv.body.item.currentQuantity).toBe(11);
+    currentRev = committedRecv.body.item.stockRevision as number;
+
+    const replayRecv = await request(raceApp)
+      .post(`/api/inventory/items/${encodeURIComponent(supplyId)}/receiving`)
+      .set("Cookie", owner.cookie)
+      .set("X-CSRF-Token", owner.csrfToken)
+      .send({
+        quantity: 2,
+        note: "Supplier box",
+        expectedRevision: committedUse.body.item.stockRevision,
+        expectedCurrentQuantity: 9,
+        requestKey: "race-recv-status-1",
+      });
+    expect(replayRecv.status).toBe(200);
+    expect(replayRecv.body.replayed).toBe(true);
+    expect(replayRecv.body.item.currentQuantity).toBe(11);
+
+    // 2a. STOCK_USED cancel race: cancel while original POST is paused before tx -> paused POST returns 409 REQUEST_KEY_CANCELLED; fresh key applies once.
+    const useCancelPause = armNextTx();
+    const stalledUseReq = request(raceApp)
+      .post(`/api/inventory/items/${encodeURIComponent(supplyId)}/usage`)
+      .set("Cookie", employee.cookie)
+      .set("X-CSRF-Token", employee.csrfToken)
+      .send({
+        quantity: 1,
+        purpose: "Afternoon sanitize",
+        expectedRevision: currentRev,
+        expectedCurrentQuantity: 11,
+        requestKey: "race-use-cancel-1",
+      })
+      .then((res) => res);
+    await useCancelPause.reached;
+
+    const cancelUseRes = await request(raceApp)
+      .post("/api/inventory/movements/by-request-key/race-use-cancel-1/cancel")
+      .set("Cookie", employee.cookie)
+      .set("X-CSRF-Token", employee.csrfToken)
+      .send({ itemKey: supplyId, movementType: "STOCK_USED" });
+    expect(cancelUseRes.status).toBe(200);
+    expect(cancelUseRes.body).toEqual({ status: "CANCELLED" });
+
+    const cancelledUseLookup = await request(raceApp)
+      .get("/api/inventory/movements/by-request-key/race-use-cancel-1")
+      .set("Cookie", employee.cookie);
+    expect(cancelledUseLookup.status).toBe(200);
+    expect(cancelledUseLookup.body).toEqual({ status: "CANCELLED" });
+
+    useCancelPause.release();
+    const delayedUseOutcome = await stalledUseReq;
+    expect(delayedUseOutcome.status).toBe(409);
+    expect(delayedUseOutcome.body.error.code).toBe("REQUEST_KEY_CANCELLED");
+
+    const afterCancelledUseItems = await request(raceApp)
+      .get("/api/inventory/items")
+      .set("Cookie", employee.cookie);
+    expect(
+      afterCancelledUseItems.body.items.find((i: any) => i.id === supplyId).currentQuantity,
+    ).toBe(11);
+
+    const freshUseRes = await request(raceApp)
+      .post(`/api/inventory/items/${encodeURIComponent(supplyId)}/usage`)
+      .set("Cookie", employee.cookie)
+      .set("X-CSRF-Token", employee.csrfToken)
+      .send({
+        quantity: 1,
+        purpose: "Afternoon sanitize",
+        expectedRevision: currentRev,
+        expectedCurrentQuantity: 11,
+        requestKey: "race-use-fresh-1",
+      });
+    expect(freshUseRes.status).toBe(201);
+    expect(freshUseRes.body.item.currentQuantity).toBe(10);
+    currentRev = freshUseRes.body.item.stockRevision as number;
+
+    // 2b. STOCK_RECEIVED cancel race: cancel while original POST is paused before tx -> paused POST returns 409 REQUEST_KEY_CANCELLED; fresh key applies once.
+    const recvCancelPause = armNextTx();
+    const stalledRecvReq = request(raceApp)
+      .post(`/api/inventory/items/${encodeURIComponent(supplyId)}/receiving`)
+      .set("Cookie", owner.cookie)
+      .set("X-CSRF-Token", owner.csrfToken)
+      .send({
+        quantity: 3,
+        note: "Evening restock",
+        expectedRevision: currentRev,
+        expectedCurrentQuantity: 10,
+        requestKey: "race-recv-cancel-1",
+      })
+      .then((res) => res);
+    await recvCancelPause.reached;
+
+    const cancelRecvRes = await request(raceApp)
+      .post("/api/inventory/movements/by-request-key/race-recv-cancel-1/cancel")
+      .set("Cookie", owner.cookie)
+      .set("X-CSRF-Token", owner.csrfToken)
+      .send({ itemKey: supplyId, movementType: "STOCK_RECEIVED" });
+    expect(cancelRecvRes.status).toBe(200);
+    expect(cancelRecvRes.body).toEqual({ status: "CANCELLED" });
+
+    recvCancelPause.release();
+    const delayedRecvOutcome = await stalledRecvReq;
+    expect(delayedRecvOutcome.status).toBe(409);
+    expect(delayedRecvOutcome.body.error.code).toBe("REQUEST_KEY_CANCELLED");
+
+    const afterCancelledRecvItems = await request(raceApp)
+      .get("/api/inventory/items")
+      .set("Cookie", owner.cookie);
+    expect(
+      afterCancelledRecvItems.body.items.find((i: any) => i.id === supplyId).currentQuantity,
+    ).toBe(10);
+
+    const freshRecvRes = await request(raceApp)
+      .post(`/api/inventory/items/${encodeURIComponent(supplyId)}/receiving`)
+      .set("Cookie", owner.cookie)
+      .set("X-CSRF-Token", owner.csrfToken)
+      .send({
+        quantity: 3,
+        note: "Evening restock",
+        expectedRevision: currentRev,
+        expectedCurrentQuantity: 10,
+        requestKey: "race-recv-fresh-1",
+      });
+    expect(freshRecvRes.status).toBe(201);
+    expect(freshRecvRes.body.item.currentQuantity).toBe(13);
+
+    // 3. Cancel after commit recovers the SAVED movement without tombstoning it.
+    const cancelAfterSavedUse = await request(raceApp)
+      .post("/api/inventory/movements/by-request-key/race-use-fresh-1/cancel")
+      .set("Cookie", employee.cookie)
+      .set("X-CSRF-Token", employee.csrfToken)
+      .send({ itemKey: supplyId, movementType: "STOCK_USED" });
+    expect(cancelAfterSavedUse.status).toBe(200);
+    expect(cancelAfterSavedUse.body).toMatchObject({
+      status: "SAVED",
+      item: { currentQuantity: 13 },
+      movement: { movementType: "STOCK_USED", quantity: 1 },
+    });
+
+    const cancelAfterSavedRecv = await request(raceApp)
+      .post("/api/inventory/movements/by-request-key/race-recv-fresh-1/cancel")
+      .set("Cookie", owner.cookie)
+      .set("X-CSRF-Token", owner.csrfToken)
+      .send({ itemKey: supplyId, movementType: "STOCK_RECEIVED" });
+    expect(cancelAfterSavedRecv.status).toBe(200);
+    expect(cancelAfterSavedRecv.body).toMatchObject({
+      status: "SAVED",
+      item: { currentQuantity: 13 },
+      movement: { movementType: "STOCK_RECEIVED", quantity: 3 },
+    });
+
+    // 4. RBAC & key conflicts on cancel endpoint.
+    const empCancelRecvForbidden = await request(raceApp)
+      .post("/api/inventory/movements/by-request-key/emp-cancel-recv/cancel")
+      .set("Cookie", employee.cookie)
+      .set("X-CSRF-Token", employee.csrfToken)
+      .send({ itemKey: supplyId, movementType: "STOCK_RECEIVED" });
+    expect(empCancelRecvForbidden.status).toBe(403);
+    expect(empCancelRecvForbidden.body.error.code).toBe("FORBIDDEN");
+
+    const crossActorCancelConflict = await request(raceApp)
+      .post("/api/inventory/movements/by-request-key/race-use-cancel-1/cancel")
+      .set("Cookie", owner.cookie)
+      .set("X-CSRF-Token", owner.csrfToken)
+      .send({ itemKey: supplyId, movementType: "STOCK_USED" });
+    expect(crossActorCancelConflict.status).toBe(409);
+    expect(crossActorCancelConflict.body.error.code).toBe("REQUEST_KEY_CONFLICT");
+
+    const wrongTypeCancelConflict = await request(raceApp)
+      .post("/api/inventory/movements/by-request-key/race-use-fresh-1/cancel")
+      .set("Cookie", employee.cookie)
+      .set("X-CSRF-Token", employee.csrfToken)
+      .send({ itemKey: supplyId, movementType: "STOCK_RECEIVED" });
+    expect(wrongTypeCancelConflict.status).toBe(403);
+
+    const wrongTypeOwnerConflict = await request(raceApp)
+      .post("/api/inventory/movements/by-request-key/race-recv-fresh-1/cancel")
+      .set("Cookie", owner.cookie)
+      .set("X-CSRF-Token", owner.csrfToken)
+      .send({ itemKey: supplyId, movementType: "STOCK_USED" });
+    expect(wrongTypeOwnerConflict.status).toBe(409);
+    expect(wrongTypeOwnerConflict.body.error.code).toBe("REQUEST_KEY_CONFLICT");
   });
 });

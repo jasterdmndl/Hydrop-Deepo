@@ -329,6 +329,10 @@ export function InventoryPage() {
     loadPendingMovementAttempts(signedInUser.username),
   );
   const [checkingPendingKey, setCheckingPendingKey] = useState<string | null>(null);
+  const [pendingBannerFeedback, setPendingBannerFeedback] = useState<{
+    tone: "warning" | "error";
+    message: string;
+  } | null>(null);
 
   useEffect(() => {
     setPendingAttempts(loadPendingMovementAttempts(signedInUser.username));
@@ -385,8 +389,10 @@ export function InventoryPage() {
     );
   }, []);
 
-  const loadItems = useCallback(async (options: { preserveNotice?: boolean; force?: boolean } = {}) => {
-    if (!options.force && submittingRef.current) return;
+  const loadItems = useCallback(async (
+    options: { preserveNotice?: boolean; force?: boolean } = {},
+  ): Promise<InventoryItemView[] | null> => {
+    if (!options.force && submittingRef.current) return null;
     const requestId = loadTrackerRef.current.next();
     loadingRef.current = true;
     setLoading(true);
@@ -397,16 +403,18 @@ export function InventoryPage() {
     }
     try {
       const response = await api<InventoryItemsResponse>("/api/inventory/items");
-      if (!loadTrackerRef.current.isCurrent(requestId)) return;
+      if (!loadTrackerRef.current.isCurrent(requestId)) return null;
       setItems((prev) => mergeRefreshedInventoryItems(prev, response.items));
       if (Array.isArray(response.posSections) && response.posSections.length > 0) {
         setPosSections(response.posSections);
       }
       setPermissions(response.permissions);
       setHasLoaded(true);
+      return response.items;
     } catch (err) {
-      if (!loadTrackerRef.current.isCurrent(requestId)) return;
+      if (!loadTrackerRef.current.isCurrent(requestId)) return null;
       setLoadError(err instanceof ApiError ? err.message : "Could not load inventory stock.");
+      return null;
     } finally {
       if (loadTrackerRef.current.isCurrent(requestId)) {
         loadingRef.current = false;
@@ -438,8 +446,8 @@ export function InventoryPage() {
       if (editContainerAlertItem && !savingContainerAlert) setEditContainerAlertItem(null);
       if (archiveItem && !archiving) setArchiveItem(null);
       if (reconcileItem && !reconciling) setReconcileItem(null);
-      if (receiveItem && !receiving) setReceiveItem(null);
-      if (useItem && !recordingUse) setUseItem(null);
+      if (receiveItem && !receiving && checkingPendingKey === null) setReceiveItem(null);
+      if (useItem && !recordingUse && checkingPendingKey === null) setUseItem(null);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -458,6 +466,7 @@ export function InventoryPage() {
     receiving,
     useItem,
     recordingUse,
+    checkingPendingKey,
   ]);
 
   function openAddProductModal() {
@@ -1040,73 +1049,172 @@ export function InventoryPage() {
     }
   }
 
+  function recoverSavedPendingMovement(
+    attempt: PendingStockMovementAttempt,
+    response: { item: InventoryItemView; movement: StockMovementView },
+  ) {
+    loadTrackerRef.current.next();
+    updatePendingAttempts((prev) =>
+      removePendingMovementAttempt(prev, attempt.movementType, attempt.itemKey),
+    );
+    setPendingBannerFeedback(null);
+    setItems((prev) =>
+      prev.map((entry) =>
+        getItemKey(entry) === getItemKey(response.item) ? response.item : entry,
+      ),
+    );
+    if (
+      attempt.movementType === "STOCK_RECEIVED" &&
+      receiveItem &&
+      getItemKey(receiveItem) === attempt.itemKey
+    ) {
+      setReceiveItem(null);
+    }
+    if (
+      attempt.movementType === "STOCK_USED" &&
+      useItem &&
+      getItemKey(useItem) === attempt.itemKey
+    ) {
+      setUseItem(null);
+    }
+    setSaveNotice({
+      id: nextNoticeId(),
+      duration: "detailed",
+      title:
+        attempt.movementType === "STOCK_RECEIVED"
+          ? "Saved Stock Received recovered"
+          : "Saved Stock Used recovered",
+      body: `${attempt.itemName} (${formatQuantityLabel(response.movement.quantity, response.movement.unit)} on ${response.movement.effectiveDate ?? attempt.effectiveDate}) was already saved. Current balance: ${formatQuantityLabel(response.item.currentQuantity, response.item.unit)}.`,
+    });
+  }
+
+  async function finalizeCancelledPendingMovement(attempt: PendingStockMovementAttempt) {
+    updatePendingAttempts((prev) =>
+      removePendingMovementAttempt(prev, attempt.movementType, attempt.itemKey),
+    );
+    setPendingBannerFeedback(null);
+    const refreshedItems = await loadItems({ preserveNotice: true, force: true });
+    const updatedTarget = refreshedItems?.find(
+      (entry) => getItemKey(entry) === attempt.itemKey,
+    );
+    const modalNotice = `Earlier ${attempt.movementType === "STOCK_RECEIVED" ? "Stock Received" : "Stock Used"} submission was cancelled on the server. Review the refreshed stock balance before submitting a new entry.`;
+    if (attempt.movementType === "STOCK_RECEIVED") {
+      if (updatedTarget) {
+        setReceiveItem((prev) =>
+          prev && getItemKey(prev) === attempt.itemKey ? updatedTarget : prev,
+        );
+      }
+      setReceiveRequestKey(generateClientKey());
+      setReceiveStaleNotice(modalNotice);
+    } else {
+      if (updatedTarget) {
+        setUseItem((prev) =>
+          prev && getItemKey(prev) === attempt.itemKey ? updatedTarget : prev,
+        );
+      }
+      setUseRequestKey(generateClientKey());
+      setUseStaleNotice(modalNotice);
+    }
+    setSaveNotice({
+      id: nextNoticeId(),
+      duration: "detailed",
+      title: "Earlier submission cancelled",
+      body: `Cancelled the unresolved ${attempt.movementType === "STOCK_RECEIVED" ? "Stock Received" : "Stock Used"} reference for ${attempt.itemName} so it cannot save late. You can now enter a fresh submission.`,
+    });
+  }
+
   async function handleCheckPendingAttemptStatus(attempt: PendingStockMovementAttempt) {
-    if (checkingPendingKey !== null) return;
+    if (checkingPendingKey !== null || receiving || recordingUse) return;
     setCheckingPendingKey(attempt.requestKey);
     setReceiveError(null);
     setUseError(null);
     setSaveNotice(null);
+    setPendingBannerFeedback(null);
     loadTrackerRef.current.next();
 
     try {
       const response = await api<
         | { status: "NOT_FOUND" }
+        | { status: "CANCELLED" }
         | { status: "SAVED"; item: InventoryItemView; movement: StockMovementView }
       >(`/api/inventory/movements/by-request-key/${encodeURIComponent(attempt.requestKey)}`);
 
       if (response.status === "SAVED") {
-        loadTrackerRef.current.next();
-        updatePendingAttempts((prev) =>
-          removePendingMovementAttempt(prev, attempt.movementType, attempt.itemKey),
-        );
-        setItems((prev) =>
-          prev.map((entry) =>
-            getItemKey(entry) === getItemKey(response.item) ? response.item : entry,
-          ),
-        );
-        if (attempt.movementType === "STOCK_RECEIVED" && receiveItem && getItemKey(receiveItem) === attempt.itemKey) {
-          setReceiveItem(null);
-        }
-        if (attempt.movementType === "STOCK_USED" && useItem && getItemKey(useItem) === attempt.itemKey) {
-          setUseItem(null);
-        }
-        setSaveNotice({
-          id: nextNoticeId(),
-          duration: "detailed",
-          title:
-            attempt.movementType === "STOCK_RECEIVED"
-              ? "Saved Stock Received recovered"
-              : "Saved Stock Used recovered",
-          body: `${attempt.itemName} (${formatQuantityLabel(response.movement.quantity, response.movement.unit)} on ${response.movement.effectiveDate ?? attempt.effectiveDate}) was already saved. Current balance: ${formatQuantityLabel(response.item.currentQuantity, response.item.unit)}.`,
-        });
+        recoverSavedPendingMovement(attempt, response);
+      } else if (response.status === "CANCELLED") {
+        await finalizeCancelledPendingMovement(attempt);
       } else {
-        updatePendingAttempts((prev) =>
-          removePendingMovementAttempt(prev, attempt.movementType, attempt.itemKey),
-        );
-        await loadItems({ preserveNotice: true, force: true });
-        if (attempt.movementType === "STOCK_RECEIVED") {
-          setReceiveRequestKey(generateClientKey());
-          setReceiveStaleNotice(
-            "Previous Stock Received submission did not save on the server. Review the refreshed stock balance before submitting again.",
-          );
-        } else {
-          setUseRequestKey(generateClientKey());
-          setUseStaleNotice(
-            "Previous Stock Used submission did not save on the server. Review the refreshed stock balance before submitting again.",
-          );
+        const inconclusiveMsg = `Earlier ${attempt.movementType === "STOCK_RECEIVED" ? "Stock Received" : "Stock Used"} submission for ${attempt.itemName} is not recorded on the server yet and may still be in flight. Keep this reference to Retry Same Submission, or Cancel earlier attempt before starting a new entry.`;
+        setPendingBannerFeedback({ tone: "warning", message: inconclusiveMsg });
+        if (
+          attempt.movementType === "STOCK_RECEIVED" &&
+          receiveItem &&
+          getItemKey(receiveItem) === attempt.itemKey
+        ) {
+          setReceiveError(inconclusiveMsg);
+        } else if (
+          attempt.movementType === "STOCK_USED" &&
+          useItem &&
+          getItemKey(useItem) === attempt.itemKey
+        ) {
+          setUseError(inconclusiveMsg);
         }
-        setSaveNotice({
-          id: nextNoticeId(),
-          duration: "detailed",
-          title: "Unresolved submission did not save",
-          body: `Confirmed that the earlier ${attempt.movementType === "STOCK_RECEIVED" ? "Stock Received" : "Stock Used"} entry for ${attempt.itemName} was not recorded on the server.`,
-        });
       }
     } catch (err) {
       const msg =
         err instanceof ApiError
           ? err.message
           : "Could not verify submission status. Check connection and try again.";
+      setPendingBannerFeedback({ tone: "error", message: msg });
+      if (attempt.movementType === "STOCK_RECEIVED") {
+        setReceiveError(msg);
+      } else {
+        setUseError(msg);
+      }
+    } finally {
+      setCheckingPendingKey(null);
+    }
+  }
+
+  async function handleCancelPendingAttempt(attempt: PendingStockMovementAttempt) {
+    if (checkingPendingKey !== null || receiving || recordingUse) return;
+    const targetItem = items.find((entry) => getItemKey(entry) === attempt.itemKey);
+    const endpointItemKey = targetItem
+      ? (targetItem.shape ?? targetItem.id ?? targetItem.code)
+      : attempt.itemKey;
+    setCheckingPendingKey(attempt.requestKey);
+    setReceiveError(null);
+    setUseError(null);
+    setSaveNotice(null);
+    setPendingBannerFeedback(null);
+    loadTrackerRef.current.next();
+
+    try {
+      const response = await api<
+        | { status: "CANCELLED" }
+        | { status: "SAVED"; item: InventoryItemView; movement: StockMovementView }
+      >(
+        `/api/inventory/movements/by-request-key/${encodeURIComponent(attempt.requestKey)}/cancel`,
+        {
+          method: "POST",
+          body: {
+            itemKey: endpointItemKey,
+            movementType: attempt.movementType,
+          },
+        },
+      );
+
+      if (response.status === "SAVED") {
+        recoverSavedPendingMovement(attempt, response);
+      } else {
+        await finalizeCancelledPendingMovement(attempt);
+      }
+    } catch (err) {
+      const msg =
+        err instanceof ApiError
+          ? err.message
+          : "Could not cancel the earlier submission. Check connection and try again.";
+      setPendingBannerFeedback({ tone: "error", message: msg });
       if (attempt.movementType === "STOCK_RECEIVED") {
         setReceiveError(msg);
       } else {
@@ -1230,6 +1338,18 @@ export function InventoryPage() {
         }
         setReceiveRequestKey(generateClientKey());
         setReceiveStaleNotice(err.message);
+      } else if (err instanceof ApiError && err.code === "REQUEST_KEY_CANCELLED") {
+        updatePendingAttempts((prev) =>
+          removePendingMovementAttempt(prev, "STOCK_RECEIVED", itemKey),
+        );
+        setPendingBannerFeedback(null);
+        const refreshed = await loadItems({ preserveNotice: true, force: true });
+        const updatedTarget = refreshed?.find((entry) => getItemKey(entry) === itemKey);
+        if (updatedTarget) {
+          setReceiveItem(updatedTarget);
+        }
+        setReceiveRequestKey(generateClientKey());
+        setReceiveError(err.message);
       } else if (
         (err instanceof ApiError && err.status === 401) ||
         isUncertainSubmissionError(err)
@@ -1362,6 +1482,16 @@ export function InventoryPage() {
         }
         setUseRequestKey(generateClientKey());
         setUseStaleNotice(err.message);
+      } else if (err instanceof ApiError && err.code === "REQUEST_KEY_CANCELLED") {
+        updatePendingAttempts((prev) => removePendingMovementAttempt(prev, "STOCK_USED", itemKey));
+        setPendingBannerFeedback(null);
+        const refreshed = await loadItems({ preserveNotice: true, force: true });
+        const updatedTarget = refreshed?.find((entry) => getItemKey(entry) === itemKey);
+        if (updatedTarget) {
+          setUseItem(updatedTarget);
+        }
+        setUseRequestKey(generateClientKey());
+        setUseError(err.message);
       } else if (
         (err instanceof ApiError && err.status === 401) ||
         isUncertainSubmissionError(err)
@@ -1656,6 +1786,18 @@ export function InventoryPage() {
           <p className="callout__body">
             Check the server status before recording another entry so a saved submission is not repeated.
           </p>
+          {pendingBannerFeedback && (
+            <div
+              className={
+                pendingBannerFeedback.tone === "error"
+                  ? "alert alert--error"
+                  : "callout callout--warning"
+              }
+              role={pendingBannerFeedback.tone === "error" ? "alert" : "status"}
+            >
+              {pendingBannerFeedback.message}
+            </div>
+          )}
           <ul className="conflict-list">
             {pendingAttempts.map((attempt) => {
               const targetItem = items.find((entry) => getItemKey(entry) === attempt.itemKey);
@@ -1688,6 +1830,14 @@ export function InventoryPage() {
                       onClick={() => void handleCheckPendingAttemptStatus(attempt)}
                     >
                       {isChecking ? "Checking…" : "Check status"}
+                    </button>
+                    <button
+                      type="button"
+                      className="button button--ghost button--sm"
+                      disabled={checkingPendingKey !== null}
+                      onClick={() => void handleCancelPendingAttempt(attempt)}
+                    >
+                      Cancel earlier attempt
                     </button>
                   </div>
                 </li>
@@ -3109,14 +3259,24 @@ export function InventoryPage() {
                   Cancel
                 </button>
                 {lockedByPending && pendingReceive && (
-                  <button
-                    type="button"
-                    className="button button--ghost"
-                    disabled={receiving || checkingPendingKey !== null}
-                    onClick={() => void handleCheckPendingAttemptStatus(pendingReceive)}
-                  >
-                    {isCheckingReceive ? "Checking status…" : "Check status"}
-                  </button>
+                  <>
+                    <button
+                      type="button"
+                      className="button button--ghost"
+                      disabled={receiving || checkingPendingKey !== null}
+                      onClick={() => void handleCheckPendingAttemptStatus(pendingReceive)}
+                    >
+                      {isCheckingReceive ? "Checking status…" : "Check status"}
+                    </button>
+                    <button
+                      type="button"
+                      className="button button--ghost"
+                      disabled={receiving || checkingPendingKey !== null}
+                      onClick={() => void handleCancelPendingAttempt(pendingReceive)}
+                    >
+                      Cancel earlier attempt
+                    </button>
+                  </>
                 )}
                 <button
                   type="submit"
@@ -3282,14 +3442,24 @@ export function InventoryPage() {
                   Cancel
                 </button>
                 {lockedByPending && pendingUse && (
-                  <button
-                    type="button"
-                    className="button button--ghost"
-                    disabled={recordingUse || checkingPendingKey !== null}
-                    onClick={() => void handleCheckPendingAttemptStatus(pendingUse)}
-                  >
-                    {isCheckingUse ? "Checking status…" : "Check status"}
-                  </button>
+                  <>
+                    <button
+                      type="button"
+                      className="button button--ghost"
+                      disabled={recordingUse || checkingPendingKey !== null}
+                      onClick={() => void handleCheckPendingAttemptStatus(pendingUse)}
+                    >
+                      {isCheckingUse ? "Checking status…" : "Check status"}
+                    </button>
+                    <button
+                      type="button"
+                      className="button button--ghost"
+                      disabled={recordingUse || checkingPendingKey !== null}
+                      onClick={() => void handleCancelPendingAttempt(pendingUse)}
+                    >
+                      Cancel earlier attempt
+                    </button>
+                  </>
                 )}
                 <button
                   type="submit"
