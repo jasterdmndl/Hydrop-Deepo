@@ -11,6 +11,7 @@ import {
 } from "../notifications/noticeTiming";
 import { TemporaryNotice } from "../notifications/TemporaryNotice";
 import {
+  computeLateCoveragePreview,
   computeReconciliationPreview,
   type ContainerShape,
   DEFAULT_POS_SECTIONS,
@@ -36,6 +37,7 @@ import {
   getTodayManilaDateString,
   groupInventoryItems,
   type InventoryCategoryFilter,
+  type InventoryItemHistoryView,
   type InventoryItemsResponse,
   type InventoryItemView,
   type InventoryPermissions,
@@ -46,11 +48,13 @@ import {
   loadPendingMovementAttempts,
   matchesPendingMovementAttempt,
   mergeRefreshedInventoryItems,
+  type MovementCoverageMode,
   parseLowStockLevelInput,
   parseMovementQuantityInput,
   parseOpeningQuantityInput,
   parsePesoPriceToCentavos,
   parsePhysicalCountInput,
+  type PendingMovementReviewView,
   type PendingStockMovementAttempt,
   type PosSectionView,
   QUANTITY_SCALE,
@@ -62,6 +66,373 @@ import {
   type StockReconciliationView,
   upsertPendingMovementAttempt,
 } from "./inventoryView";
+
+interface CoverageFormState {
+  mode: MovementCoverageMode;
+  coveredQtyInput: string;
+  countSource: string;
+  reviewNote: string;
+}
+
+interface ApplicableCountsState {
+  loading: boolean;
+  error: string | null;
+  reconciliations: StockReconciliationView[];
+  openingCountCoversDate: boolean;
+}
+
+const EMPTY_APPLICABLE_COUNTS: ApplicableCountsState = {
+  loading: false,
+  error: null,
+  reconciliations: [],
+  openingCountCoversDate: false,
+};
+
+function defaultCoverageState(): CoverageFormState {
+  return {
+    mode: "NONE",
+    coveredQtyInput: "",
+    countSource: "",
+    reviewNote: "",
+  };
+}
+
+function validateCoverageSelection(
+  state: CoverageFormState,
+  counts: ApplicableCountsState,
+  enteredQty: number,
+  unit: string,
+  allowDecimal: boolean,
+): string | null {
+  const hasCounts = counts.reconciliations.length > 0 || counts.openingCountCoversDate;
+  if ((state.mode === "FULL" || state.mode === "PARTIAL") && (!hasCounts || !state.countSource)) {
+    return "Select the supporting physical count or opening count that covered this entry.";
+  }
+  if (state.mode === "PARTIAL") {
+    const parsedCovered = parseMovementQuantityInput(state.coveredQtyInput, unit, allowDecimal);
+    if (!parsedCovered.ok) {
+      return parsedCovered.message;
+    }
+    if (
+      Math.round(parsedCovered.quantity * QUANTITY_SCALE) >=
+      Math.round(enteredQty * QUANTITY_SCALE)
+    ) {
+      return "Covered quantity must be strictly less than the full quantity. Choose Full Coverage instead.";
+    }
+  }
+  return null;
+}
+
+function buildCoverageRequestPayload(
+  state: CoverageFormState,
+  counts: ApplicableCountsState,
+): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    coverageMode: state.mode,
+    expectedLatestReconciliationId: counts.reconciliations[0]?.id ?? null,
+    expectedOpeningCountCoversDate: counts.openingCountCoversDate,
+  };
+  if (state.mode === "FULL" || state.mode === "PARTIAL") {
+    if (state.countSource === "OPENING") {
+      payload.coveredByOpeningCount = true;
+    } else if (state.countSource) {
+      payload.supportingReconciliationId = state.countSource;
+    }
+  }
+  if (state.mode === "PARTIAL") {
+    payload.coveredQuantity = Number(state.coveredQtyInput.trim());
+  }
+  const trimmedReviewNote = state.reviewNote.trim().replace(/\s+/g, " ");
+  if (trimmedReviewNote) {
+    payload.reviewNote = trimmedReviewNote;
+  }
+  return payload;
+}
+
+function LateCoverageControls({
+  movementType,
+  item,
+  enteredQuantity,
+  counts,
+  value,
+  allowUnclear,
+  disabled,
+  onChange,
+  onReconcileFirst,
+}: {
+  movementType: "STOCK_RECEIVED" | "STOCK_USED";
+  item: InventoryItemView;
+  enteredQuantity: number | null;
+  counts: ApplicableCountsState;
+  value: CoverageFormState;
+  allowUnclear: boolean;
+  disabled: boolean;
+  onChange: (next: CoverageFormState) => void;
+  onReconcileFirst?: () => void;
+}) {
+  const hasApplicableCounts = counts.reconciliations.length > 0 || counts.openingCountCoversDate;
+  const parsedCovered =
+    value.mode === "PARTIAL"
+      ? parseMovementQuantityInput(
+          value.coveredQtyInput,
+          item.unit,
+          Boolean(item.allowDecimalQuantity),
+        )
+      : null;
+
+  const preview =
+    enteredQuantity !== null
+      ? computeLateCoveragePreview({
+          movementType,
+          currentQuantity: item.currentQuantity,
+          enteredQuantity,
+          coverageMode: value.mode,
+          coveredQuantity: parsedCovered?.ok ? parsedCovered.quantity : null,
+        })
+      : null;
+
+  return (
+    <fieldset className="scope-fieldset">
+      <legend>Physical-count coverage confirmation (Owner)</legend>
+
+      {counts.loading ? (
+        <p className="muted-sm">Loading applicable physical counts…</p>
+      ) : counts.error ? (
+        <div className="alert alert--error" role="alert">
+          {counts.error}
+        </div>
+      ) : hasApplicableCounts ? (
+        <div className="callout callout--warning" role="status">
+          <p className="callout__title">Applicable counts recorded on or after this date</p>
+          <ul className="conflict-list">
+            {counts.reconciliations.map((rec) => (
+              <li key={rec.id}>
+                <strong>{formatQuantityLabel(rec.physicalCount, rec.unit)}</strong> (
+                {formatSignedDelta(rec.quantityDelta, rec.unit)}) on{" "}
+                {formatRecordedAtManila(rec.recordedAt)} by {rec.recordedBy} — {rec.reason}
+              </li>
+            ))}
+            {counts.openingCountCoversDate && item.openingStock && (
+              <li>
+                <strong>
+                  Opening count: {formatQuantityLabel(item.openingStock.quantity, item.openingStock.unit)}
+                </strong>{" "}
+                on {formatRecordedAtManila(item.openingStock.recordedAt)} by{" "}
+                {item.openingStock.recordedBy}
+              </li>
+            )}
+          </ul>
+          {onReconcileFirst && (
+            <div className="inventory-card-reconcile-row">
+              <button
+                type="button"
+                className="button button--ghost button--sm"
+                disabled={disabled}
+                onClick={onReconcileFirst}
+              >
+                Recount / Reconcile item first (INV-009)
+              </button>
+            </div>
+          )}
+        </div>
+      ) : (
+        <p className="muted-sm">
+          No physical count or opening count was recorded on or after this date.
+          {onReconcileFirst && (
+            <>
+              {" "}
+              <button
+                type="button"
+                className="button button--ghost button--sm"
+                disabled={disabled}
+                onClick={onReconcileFirst}
+              >
+                Recount / Reconcile item first
+              </button>
+            </>
+          )}
+        </p>
+      )}
+
+      <div className="scope-options">
+        <label className="scope-option">
+          <input
+            type="radio"
+            name={`cov-mode-${movementType}`}
+            checked={value.mode === "NONE"}
+            disabled={disabled}
+            onChange={() => onChange({ ...value, mode: "NONE", countSource: "", coveredQtyInput: "" })}
+          />
+          <span>
+            <strong>No intervening count covered it</strong>
+            <small>Apply the full quantity to current stock.</small>
+          </span>
+        </label>
+
+        {hasApplicableCounts && (
+          <>
+            <label className="scope-option">
+              <input
+                type="radio"
+                name={`cov-mode-${movementType}`}
+                checked={value.mode === "FULL"}
+                disabled={disabled}
+                onChange={() =>
+                  onChange({
+                    ...value,
+                    mode: "FULL",
+                    countSource:
+                      value.countSource ||
+                      counts.reconciliations[0]?.id ||
+                      (counts.openingCountCoversDate ? "OPENING" : ""),
+                    coveredQtyInput: "",
+                  })
+                }
+              />
+              <span>
+                <strong>Full coverage — already counted</strong>
+                <small>Save full history with zero stock change.</small>
+              </span>
+            </label>
+
+            <label className="scope-option">
+              <input
+                type="radio"
+                name={`cov-mode-${movementType}`}
+                checked={value.mode === "PARTIAL"}
+                disabled={disabled}
+                onChange={() =>
+                  onChange({
+                    ...value,
+                    mode: "PARTIAL",
+                    countSource:
+                      value.countSource ||
+                      counts.reconciliations[0]?.id ||
+                      (counts.openingCountCoversDate ? "OPENING" : ""),
+                  })
+                }
+              />
+              <span>
+                <strong>Partial coverage — apply remaining uncovered amount</strong>
+                <small>Keep full entered quantity in history and apply only the missed part.</small>
+              </span>
+            </label>
+          </>
+        )}
+
+        {allowUnclear && (
+          <label className="scope-option">
+            <input
+              type="radio"
+              name={`cov-mode-${movementType}`}
+              checked={value.mode === "UNCLEAR"}
+              disabled={disabled}
+              onChange={() => onChange({ ...value, mode: "UNCLEAR", countSource: "", coveredQtyInput: "" })}
+            />
+            <span>
+              <strong>Coverage unclear — save as Pending Owner Review</strong>
+              <small>Save the entry now with zero stock change until reviewed later.</small>
+            </span>
+          </label>
+        )}
+      </div>
+
+      {(value.mode === "FULL" || value.mode === "PARTIAL") && hasApplicableCounts && (
+        <label className="field">
+          <span>Supporting physical count *</span>
+          <select
+            disabled={disabled}
+            value={value.countSource}
+            onChange={(e) => onChange({ ...value, countSource: e.target.value })}
+          >
+            <option value="">Select physical count…</option>
+            {counts.reconciliations.map((rec) => (
+              <option key={rec.id} value={rec.id}>
+                {formatRecordedAtManila(rec.recordedAt)} · Count{" "}
+                {formatQuantityLabel(rec.physicalCount, rec.unit)} ({rec.reason})
+              </option>
+            ))}
+            {counts.openingCountCoversDate && item.openingStock && (
+              <option value="OPENING">
+                Opening count · {formatQuantityLabel(item.openingStock.quantity, item.openingStock.unit)}{" "}
+                ({formatRecordedAtManila(item.openingStock.recordedAt)})
+              </option>
+            )}
+          </select>
+        </label>
+      )}
+
+      {value.mode === "PARTIAL" && (
+        <label className="field">
+          <span>Quantity already covered ({item.unit}) *</span>
+          <input
+            type="text"
+            inputMode={item.allowDecimalQuantity ? "decimal" : "numeric"}
+            placeholder="e.g. 2"
+            disabled={disabled}
+            value={value.coveredQtyInput}
+            onChange={(e) => onChange({ ...value, coveredQtyInput: e.target.value })}
+          />
+          <small>
+            Must be positive and strictly less than{" "}
+            {enteredQuantity !== null ? formatQuantityLabel(enteredQuantity, item.unit) : "the full quantity"}.
+          </small>
+        </label>
+      )}
+
+      {(hasApplicableCounts || value.mode !== "NONE") && value.mode !== "UNCLEAR" && (
+        <label className="field">
+          <span>Coverage confirmation note (optional)</span>
+          <input
+            type="text"
+            maxLength={240}
+            placeholder="e.g. Included in Tuesday shelf recount"
+            disabled={disabled}
+            value={value.reviewNote}
+            onChange={(e) => onChange({ ...value, reviewNote: e.target.value })}
+          />
+        </label>
+      )}
+
+      {preview && (
+        <div className="inventory-reconcile-preview" role="status">
+          <dl className="detail-list inventory-detail-list">
+            <div className="detail-list__row">
+              <dt>Entered quantity</dt>
+              <dd>{formatQuantityLabel(preview.enteredQuantity, item.unit)}</dd>
+            </div>
+            {preview.coveredQuantity > 0 && (
+              <div className="detail-list__row">
+                <dt>Already covered by count</dt>
+                <dd>{formatQuantityLabel(preview.coveredQuantity, item.unit)}</dd>
+              </div>
+            )}
+            <div className="detail-list__row">
+              <dt>Stock effect</dt>
+              <dd>
+                <strong>
+                  {preview.pendingReview
+                    ? "Pending Owner review (0 stock change)"
+                    : preview.signedDelta === 0
+                      ? `0 ${item.unit} (history only)`
+                      : formatSignedDelta(preview.signedDelta, item.unit)}
+                </strong>
+              </dd>
+            </div>
+            {preview.projectedBalance !== null && (
+              <div className="detail-list__row">
+                <dt>Resulting balance</dt>
+                <dd>
+                  <strong>{formatQuantityLabel(preview.projectedBalance, item.unit)}</strong>
+                </dd>
+              </div>
+            )}
+          </dl>
+        </div>
+      )}
+    </fieldset>
+  );
+}
 
 function isInventoryItemView(value: unknown): value is InventoryItemView {
   return isValidInventoryItemPayload(value);
@@ -322,6 +693,8 @@ export function InventoryPage() {
   const [receiving, setReceiving] = useState(false);
   const [receiveError, setReceiveError] = useState<string | null>(null);
   const [receiveStaleNotice, setReceiveStaleNotice] = useState<string | null>(null);
+  const [receiveCoverage, setReceiveCoverage] = useState<CoverageFormState>(defaultCoverageState);
+  const [receiveCounts, setReceiveCounts] = useState<ApplicableCountsState>(EMPTY_APPLICABLE_COUNTS);
 
   const [useItem, setUseItem] = useState<InventoryItemView | null>(null);
   const [useQtyInput, setUseQtyInput] = useState("");
@@ -331,6 +704,21 @@ export function InventoryPage() {
   const [recordingUse, setRecordingUse] = useState(false);
   const [useError, setUseError] = useState<string | null>(null);
   const [useStaleNotice, setUseStaleNotice] = useState<string | null>(null);
+  const [useCoverage, setUseCoverage] = useState<CoverageFormState>(defaultCoverageState);
+  const [useCounts, setUseCounts] = useState<ApplicableCountsState>(EMPTY_APPLICABLE_COUNTS);
+
+  const [pendingMovementReviews, setPendingMovementReviews] = useState<PendingMovementReviewView[]>([]);
+  const [reviewTarget, setReviewTarget] = useState<PendingMovementReviewView | null>(null);
+  const [reviewCoverage, setReviewCoverage] = useState<CoverageFormState>(defaultCoverageState);
+  const [reviewRequestKey, setReviewRequestKey] = useState("");
+  const [resolvingReview, setResolvingReview] = useState(false);
+  const [reviewError, setReviewError] = useState<string | null>(null);
+  const [reviewStaleNotice, setReviewStaleNotice] = useState<string | null>(null);
+
+  const [historyItem, setHistoryItem] = useState<InventoryItemView | null>(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyError, setHistoryError] = useState<string | null>(null);
+  const [historyData, setHistoryData] = useState<InventoryItemHistoryView | null>(null);
 
   const [pendingAttempts, setPendingAttempts] = useState<PendingStockMovementAttempt[]>(() =>
     loadPendingMovementAttempts(signedInUser.username),
@@ -417,6 +805,17 @@ export function InventoryPage() {
       }
       setPermissions(response.permissions);
       setHasLoaded(true);
+      if (response.permissions.canReviewPendingEntries) {
+        void api<{ reviews: PendingMovementReviewView[] }>("/api/inventory/pending-reviews")
+          .then((revRes) => {
+            if (loadTrackerRef.current.isCurrent(requestId)) {
+              setPendingMovementReviews(revRes.reviews);
+            }
+          })
+          .catch(() => undefined);
+      } else {
+        setPendingMovementReviews([]);
+      }
       return response.items;
     } catch (err) {
       if (!loadTrackerRef.current.isCurrent(requestId)) return null;
@@ -535,6 +934,121 @@ export function InventoryPage() {
     setTimeout(() => reconcileCountInputRef.current?.focus(), 0);
   }
 
+  const refreshPendingMovementReviews = useCallback(async () => {
+    if (!permissions?.canReviewPendingEntries) {
+      setPendingMovementReviews([]);
+      return;
+    }
+    try {
+      const res = await api<{ reviews: PendingMovementReviewView[] }>("/api/inventory/pending-reviews");
+      setPendingMovementReviews(res.reviews);
+    } catch {
+      // Preserve last loaded review queue on background refresh error.
+    }
+  }, [permissions?.canReviewPendingEntries]);
+
+  useEffect(() => {
+    const todayManila = getTodayManilaDateString();
+    if (
+      !receiveItem ||
+      !receiveEffectiveDate ||
+      receiveEffectiveDate >= todayManila ||
+      !permissions?.canReviewPendingEntries
+    ) {
+      setReceiveCounts(EMPTY_APPLICABLE_COUNTS);
+      setReceiveCoverage(defaultCoverageState());
+      return;
+    }
+    let cancelled = false;
+    const endpointKey = receiveItem.shape ?? receiveItem.id ?? receiveItem.code;
+    setReceiveCounts((prev) => ({ ...prev, loading: true, error: null }));
+    void api<{
+      reconciliations: StockReconciliationView[];
+      openingCountCoversDate?: boolean;
+    }>(
+      `/api/inventory/items/${encodeURIComponent(endpointKey)}/reconciliations?sinceDate=${encodeURIComponent(receiveEffectiveDate)}`,
+    )
+      .then((res) => {
+        if (cancelled) return;
+        const recs = res.reconciliations ?? [];
+        const openingCovers = Boolean(res.openingCountCoversDate);
+        setReceiveCounts({
+          loading: false,
+          error: null,
+          reconciliations: recs,
+          openingCountCoversDate: openingCovers,
+        });
+        setReceiveCoverage((prev) => ({
+          ...defaultCoverageState(),
+          mode: recs.length > 0 || openingCovers ? "UNCLEAR" : "NONE",
+          reviewNote: prev.reviewNote,
+        }));
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setReceiveCounts({
+          loading: false,
+          error: err instanceof ApiError ? err.message : "Could not load applicable physical counts.",
+          reconciliations: [],
+          openingCountCoversDate: false,
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [receiveItem, receiveEffectiveDate, permissions?.canReviewPendingEntries]);
+
+  useEffect(() => {
+    const todayManila = getTodayManilaDateString();
+    if (
+      !useItem ||
+      !useEffectiveDate ||
+      useEffectiveDate >= todayManila ||
+      !permissions?.canReviewPendingEntries
+    ) {
+      setUseCounts(EMPTY_APPLICABLE_COUNTS);
+      setUseCoverage(defaultCoverageState());
+      return;
+    }
+    let cancelled = false;
+    const endpointKey = useItem.shape ?? useItem.id ?? useItem.code;
+    setUseCounts((prev) => ({ ...prev, loading: true, error: null }));
+    void api<{
+      reconciliations: StockReconciliationView[];
+      openingCountCoversDate?: boolean;
+    }>(
+      `/api/inventory/items/${encodeURIComponent(endpointKey)}/reconciliations?sinceDate=${encodeURIComponent(useEffectiveDate)}`,
+    )
+      .then((res) => {
+        if (cancelled) return;
+        const recs = res.reconciliations ?? [];
+        const openingCovers = Boolean(res.openingCountCoversDate);
+        setUseCounts({
+          loading: false,
+          error: null,
+          reconciliations: recs,
+          openingCountCoversDate: openingCovers,
+        });
+        setUseCoverage((prev) => ({
+          ...defaultCoverageState(),
+          mode: recs.length > 0 || openingCovers ? "UNCLEAR" : "NONE",
+          reviewNote: prev.reviewNote,
+        }));
+      })
+      .catch((err) => {
+        if (cancelled) return;
+        setUseCounts({
+          loading: false,
+          error: err instanceof ApiError ? err.message : "Could not load applicable physical counts.",
+          reconciliations: [],
+          openingCountCoversDate: false,
+        });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [useItem, useEffectiveDate, permissions?.canReviewPendingEntries]);
+
   function openReceiveModal(item: InventoryItemView) {
     if (item.status !== "INITIALIZED" || item.currentQuantity === null) return;
     const itemKey = getItemKey(item);
@@ -544,6 +1058,7 @@ export function InventoryPage() {
     setReceiveNoteInput(pending ? pending.noteOrPurposeInput : "");
     setReceiveEffectiveDate(pending ? pending.effectiveDate : getTodayManilaDateString());
     setReceiveRequestKey(pending ? pending.requestKey : generateClientKey());
+    setReceiveCoverage(defaultCoverageState());
     setReceiveError(null);
     setReceiveStaleNotice(null);
     setTimeout(() => receiveQtyInputRef.current?.focus(), 0);
@@ -560,9 +1075,47 @@ export function InventoryPage() {
     setUsePurposeInput(pending ? pending.noteOrPurposeInput : "");
     setUseEffectiveDate(pending ? pending.effectiveDate : getTodayManilaDateString());
     setUseRequestKey(pending ? pending.requestKey : generateClientKey());
+    setUseCoverage(defaultCoverageState());
     setUseError(null);
     setUseStaleNotice(null);
     setTimeout(() => useQtyInputRef.current?.focus(), 0);
+  }
+
+  function openReviewModal(review: PendingMovementReviewView) {
+    setReviewTarget(review);
+    const hasCounts =
+      review.applicableReconciliations.length > 0 || review.openingCountCoversDate;
+    setReviewCoverage({
+      mode: hasCounts ? "FULL" : "NONE",
+      coveredQtyInput: "",
+      countSource:
+        review.applicableReconciliations[0]?.id ??
+        (review.openingCountCoversDate ? "OPENING" : ""),
+      reviewNote: "",
+    });
+    setReviewRequestKey(generateClientKey());
+    setReviewError(null);
+    setReviewStaleNotice(null);
+  }
+
+  async function openHistoryModal(item: InventoryItemView) {
+    const endpointKey = item.shape ?? item.id ?? item.code;
+    setHistoryItem(item);
+    setHistoryData(null);
+    setHistoryError(null);
+    setHistoryLoading(true);
+    try {
+      const response = await api<InventoryItemHistoryView>(
+        `/api/inventory/items/${encodeURIComponent(endpointKey)}/history`,
+      );
+      setHistoryData(response);
+    } catch (err) {
+      setHistoryError(
+        err instanceof ApiError ? err.message : "Could not load stock history for this item.",
+      );
+    } finally {
+      setHistoryLoading(false);
+    }
   }
 
   async function handleCreateProduct(event: FormEvent) {
@@ -1300,6 +1853,26 @@ export function InventoryPage() {
       return;
     }
 
+    const todayManila = getTodayManilaDateString();
+    const isLateEntry = submittedEffectiveDate < todayManila;
+    if (isLateEntry && !pendingAttempt) {
+      if (receiveCounts.loading) {
+        setReceiveError("Wait for applicable physical counts to finish loading.");
+        return;
+      }
+      const covError = validateCoverageSelection(
+        receiveCoverage,
+        receiveCounts,
+        parsedQty.quantity,
+        receiveItem.unit,
+        Boolean(receiveItem.allowDecimalQuantity),
+      );
+      if (covError) {
+        setReceiveError(covError);
+        return;
+      }
+    }
+
     const attemptRecord: PendingStockMovementAttempt = {
       movementType: "STOCK_RECEIVED",
       itemKey,
@@ -1323,20 +1896,22 @@ export function InventoryPage() {
     loadTrackerRef.current.next();
 
     try {
+      const postBody: Record<string, unknown> = {
+        quantity: parsedQty.quantity,
+        effectiveDate: submittedEffectiveDate,
+        note: trimmedNote || null,
+        expectedRevision: submittedRevision,
+        expectedCurrentQuantity: submittedCurrentQuantity,
+        requestKey: submittedRequestKey,
+        ...(isLateEntry ? buildCoverageRequestPayload(receiveCoverage, receiveCounts) : {}),
+      };
       const response = await api<{
         item: InventoryItemView;
         movement: StockMovementView;
         replayed?: boolean;
       }>(`/api/inventory/items/${encodeURIComponent(endpointKey)}/receiving`, {
         method: "POST",
-        body: {
-          quantity: parsedQty.quantity,
-          effectiveDate: submittedEffectiveDate,
-          note: trimmedNote || null,
-          expectedRevision: submittedRevision,
-          expectedCurrentQuantity: submittedCurrentQuantity,
-          requestKey: submittedRequestKey,
-        },
+        body: postBody,
       });
       if (
         !isValidSavedMovementItemPayload(response?.item) ||
@@ -1355,14 +1930,50 @@ export function InventoryPage() {
         ),
       );
       setReceiveItem(null);
+      void refreshPendingMovementReviews();
+      const mov = response.movement;
+      const noticeTitle = response.replayed
+        ? "Stock received already saved"
+        : mov.entryStatus === "PENDING_REVIEW"
+          ? "Late Stock Received saved for review"
+          : mov.quantityDelta === 0
+            ? "Late Stock Received saved (zero stock change)"
+            : "Stock received recorded";
+      const noticeBody =
+        mov.entryStatus === "PENDING_REVIEW"
+          ? `${response.replayed ? "Recovered earlier submission: " : ""}Saved ${formatQuantityLabel(mov.quantity, mov.unit)} for ${response.item.name} (${mov.effectiveDate}) as Pending Owner Review with 0 stock change.`
+          : mov.quantityDelta === 0
+            ? `${response.replayed ? "Recovered earlier submission: " : ""}Saved ${formatQuantityLabel(mov.quantity, mov.unit)} for ${response.item.name} (${mov.effectiveDate}) in history with 0 stock change (covered by physical count). Current balance remains ${formatQuantityLabel(response.item.currentQuantity, response.item.unit)}.`
+            : `${response.replayed ? "Recovered earlier submission: " : ""}Added ${formatSignedDelta(mov.quantityDelta, mov.unit)} to ${response.item.name}${mov.coveredQuantity ? ` (${formatQuantityLabel(mov.coveredQuantity, mov.unit)} covered by count)` : ""}. Current balance: ${formatQuantityLabel(response.item.currentQuantity, response.item.unit)}.`;
       setSaveNotice({
         id: nextNoticeId(),
         duration: "detailed",
-        title: response.replayed ? "Stock received already saved" : "Stock received recorded",
-        body: `${response.replayed ? "Recovered earlier submission: " : ""}Added ${formatQuantityLabel(response.movement.quantity, response.movement.unit)} to ${response.item.name}. Current balance: ${formatQuantityLabel(response.item.currentQuantity, response.item.unit)}.`,
+        title: noticeTitle,
+        body: noticeBody,
       });
     } catch (err) {
-      if (err instanceof ApiError && err.code === "STALE_STOCK_BALANCE") {
+      if (err instanceof ApiError && err.code === "STALE_REVIEW_CONTEXT") {
+        updatePendingAttempts((prev) =>
+          removePendingMovementAttempt(prev, "STOCK_RECEIVED", itemKey),
+        );
+        const latestItem = isInventoryItemView(err.details?.item) ? err.details.item : null;
+        if (latestItem) {
+          setItems((prev) =>
+            prev.map((entry) => (getItemKey(entry) === getItemKey(latestItem) ? latestItem : entry)),
+          );
+          setReceiveItem(latestItem);
+        }
+        setReceiveCounts({
+          loading: false,
+          error: null,
+          reconciliations: Array.isArray(err.details?.applicableReconciliations)
+            ? (err.details.applicableReconciliations as StockReconciliationView[])
+            : [],
+          openingCountCoversDate: Boolean(err.details?.openingCountCoversDate),
+        });
+        setReceiveRequestKey(generateClientKey());
+        setReceiveStaleNotice(err.message);
+      } else if (err instanceof ApiError && err.code === "STALE_STOCK_BALANCE") {
         updatePendingAttempts((prev) =>
           removePendingMovementAttempt(prev, "STOCK_RECEIVED", itemKey),
         );
@@ -1448,6 +2059,27 @@ export function InventoryPage() {
       return;
     }
 
+    const todayManila = getTodayManilaDateString();
+    const isLateEntry = submittedEffectiveDate < todayManila;
+    const isOwnerReviewCapable = Boolean(permissions?.canReviewPendingEntries);
+    if (isLateEntry && isOwnerReviewCapable && !pendingAttempt) {
+      if (useCounts.loading) {
+        setUseError("Wait for applicable physical counts to finish loading.");
+        return;
+      }
+      const covError = validateCoverageSelection(
+        useCoverage,
+        useCounts,
+        parsedQty.quantity,
+        useItem.unit,
+        Boolean(useItem.allowDecimalQuantity),
+      );
+      if (covError) {
+        setUseError(covError);
+        return;
+      }
+    }
+
     const attemptRecord: PendingStockMovementAttempt = {
       movementType: "STOCK_USED",
       itemKey,
@@ -1471,20 +2103,22 @@ export function InventoryPage() {
     loadTrackerRef.current.next();
 
     try {
+      const postBody: Record<string, unknown> = {
+        quantity: parsedQty.quantity,
+        effectiveDate: submittedEffectiveDate,
+        purpose: trimmedPurpose,
+        expectedRevision: submittedRevision,
+        expectedCurrentQuantity: submittedCurrentQuantity,
+        requestKey: submittedRequestKey,
+        ...(isLateEntry && isOwnerReviewCapable ? buildCoverageRequestPayload(useCoverage, useCounts) : {}),
+      };
       const response = await api<{
         item: InventoryItemView;
         movement: StockMovementView;
         replayed?: boolean;
       }>(`/api/inventory/items/${encodeURIComponent(endpointKey)}/usage`, {
         method: "POST",
-        body: {
-          quantity: parsedQty.quantity,
-          effectiveDate: submittedEffectiveDate,
-          purpose: trimmedPurpose,
-          expectedRevision: submittedRevision,
-          expectedCurrentQuantity: submittedCurrentQuantity,
-          requestKey: submittedRequestKey,
-        },
+        body: postBody,
       });
       if (
         !isValidSavedMovementItemPayload(response?.item) ||
@@ -1501,21 +2135,53 @@ export function InventoryPage() {
         ),
       );
       setUseItem(null);
+      void refreshPendingMovementReviews();
+      const mov = response.movement;
       const flagged = Boolean(response.item.needsReconciliation);
+      const noticeTitle = response.replayed
+        ? "Stock used already saved"
+        : mov.entryStatus === "PENDING_REVIEW"
+          ? "Late Stock Used saved for Owner review"
+          : mov.quantityDelta === 0
+            ? "Late Stock Used saved (zero stock change)"
+            : flagged
+              ? "Stock used recorded · Reconciliation needed"
+              : "Stock used recorded";
+      const noticeBody =
+        mov.entryStatus === "PENDING_REVIEW"
+          ? `${response.replayed ? "Recovered earlier submission: " : ""}Recorded ${formatQuantityLabel(mov.quantity, mov.unit)} used for ${response.item.name} (${mov.effectiveDate}) as Pending Owner Review with 0 stock change.`
+          : mov.quantityDelta === 0
+            ? `${response.replayed ? "Recovered earlier submission: " : ""}Recorded ${formatQuantityLabel(mov.quantity, mov.unit)} used for ${response.item.name} (${mov.effectiveDate}) in history with 0 stock change (covered by physical count). Balance stays ${formatQuantityLabel(response.item.currentQuantity, response.item.unit)}.`
+            : flagged
+              ? `${response.replayed ? "Recovered earlier submission: " : ""}Recorded ${formatQuantityLabel(mov.appliedQuantity ?? Math.abs(mov.quantityDelta), mov.unit)} used for ${response.item.name}${mov.coveredQuantity ? ` (${formatQuantityLabel(mov.coveredQuantity, mov.unit)} covered by count)` : ""}. Balance is now ${formatQuantityLabel(response.item.currentQuantity, response.item.unit)} and flagged for Owner physical-count reconciliation.`
+              : `${response.replayed ? "Recovered earlier submission: " : ""}Deducted ${formatQuantityLabel(mov.appliedQuantity ?? Math.abs(mov.quantityDelta), mov.unit)} from ${response.item.name}${mov.coveredQuantity ? ` (${formatQuantityLabel(mov.coveredQuantity, mov.unit)} covered by count)` : ""}. Current balance: ${formatQuantityLabel(response.item.currentQuantity, response.item.unit)}.`;
       setSaveNotice({
         id: nextNoticeId(),
         duration: "detailed",
-        title: response.replayed
-          ? "Stock used already saved"
-          : flagged
-            ? "Stock used recorded · Reconciliation needed"
-            : "Stock used recorded",
-        body: flagged
-          ? `${response.replayed ? "Recovered earlier submission: " : ""}Recorded ${formatQuantityLabel(response.movement.quantity, response.movement.unit)} used for ${response.item.name}. Balance is now ${formatQuantityLabel(response.item.currentQuantity, response.item.unit)} and flagged for Owner physical-count reconciliation.`
-          : `${response.replayed ? "Recovered earlier submission: " : ""}Deducted ${formatQuantityLabel(response.movement.quantity, response.movement.unit)} from ${response.item.name}. Current balance: ${formatQuantityLabel(response.item.currentQuantity, response.item.unit)}.`,
+        title: noticeTitle,
+        body: noticeBody,
       });
     } catch (err) {
-      if (err instanceof ApiError && err.code === "STALE_STOCK_BALANCE") {
+      if (err instanceof ApiError && err.code === "STALE_REVIEW_CONTEXT") {
+        updatePendingAttempts((prev) => removePendingMovementAttempt(prev, "STOCK_USED", itemKey));
+        const latestItem = isInventoryItemView(err.details?.item) ? err.details.item : null;
+        if (latestItem) {
+          setItems((prev) =>
+            prev.map((entry) => (getItemKey(entry) === getItemKey(latestItem) ? latestItem : entry)),
+          );
+          setUseItem(latestItem);
+        }
+        setUseCounts({
+          loading: false,
+          error: null,
+          reconciliations: Array.isArray(err.details?.applicableReconciliations)
+            ? (err.details.applicableReconciliations as StockReconciliationView[])
+            : [],
+          openingCountCoversDate: Boolean(err.details?.openingCountCoversDate),
+        });
+        setUseRequestKey(generateClientKey());
+        setUseStaleNotice(err.message);
+      } else if (err instanceof ApiError && err.code === "STALE_STOCK_BALANCE") {
         updatePendingAttempts((prev) => removePendingMovementAttempt(prev, "STOCK_USED", itemKey));
         const latestItem = isInventoryItemView(err.details?.item) ? err.details.item : null;
         if (latestItem) {
@@ -1552,6 +2218,122 @@ export function InventoryPage() {
       }
     } finally {
       setRecordingUse(false);
+    }
+  }
+
+  async function handleResolvePendingReview(event: FormEvent) {
+    event.preventDefault();
+    if (!reviewTarget || resolvingReview || !permissions?.canReviewPendingEntries) {
+      return;
+    }
+
+    const enteredQty = reviewTarget.entry.enteredQuantity ?? reviewTarget.entry.quantity;
+    const covError = validateCoverageSelection(
+      reviewCoverage,
+      {
+        loading: false,
+        error: null,
+        reconciliations: reviewTarget.applicableReconciliations,
+        openingCountCoversDate: reviewTarget.openingCountCoversDate,
+      },
+      enteredQty,
+      reviewTarget.item.unit,
+      Boolean(reviewTarget.item.allowDecimalQuantity),
+    );
+    if (covError) {
+      setReviewError(covError);
+      return;
+    }
+
+    setResolvingReview(true);
+    setReviewError(null);
+    setReviewStaleNotice(null);
+    setSaveNotice(null);
+    loadTrackerRef.current.next();
+
+    try {
+      const countsState: ApplicableCountsState = {
+        loading: false,
+        error: null,
+        reconciliations: reviewTarget.applicableReconciliations,
+        openingCountCoversDate: reviewTarget.openingCountCoversDate,
+      };
+      const response = await api<{
+        item: InventoryItemView;
+        movement: StockMovementView;
+        replayed?: boolean;
+      }>(`/api/inventory/pending-reviews/${encodeURIComponent(reviewTarget.entry.id)}/resolve`, {
+        method: "POST",
+        body: {
+          ...buildCoverageRequestPayload(reviewCoverage, countsState),
+          expectedRevision: reviewTarget.item.stockRevision ?? 0,
+          expectedCurrentQuantity: reviewTarget.item.currentQuantity ?? 0,
+          requestKey: reviewRequestKey,
+        },
+      });
+      loadTrackerRef.current.next();
+      setItems((prev) =>
+        prev.map((entry) =>
+          getItemKey(entry) === getItemKey(response.item) ? response.item : entry,
+        ),
+      );
+      setPendingMovementReviews((prev) =>
+        prev.filter((r) => r.entry.id !== response.movement.id),
+      );
+      if (historyItem && getItemKey(historyItem) === getItemKey(response.item)) {
+        void openHistoryModal(response.item);
+      }
+      setReviewTarget(null);
+      setSaveNotice({
+        id: nextNoticeId(),
+        duration: "detailed",
+        title: response.replayed ? "Pending review already resolved" : "Pending entry resolved",
+        body:
+          response.movement.quantityDelta === 0
+            ? `Confirmed ${response.item.name} (${formatQuantityLabel(response.movement.quantity, response.movement.unit)} on ${response.movement.effectiveDate}) with 0 stock change.`
+            : `Resolved ${response.item.name} (${formatSignedDelta(response.movement.quantityDelta, response.movement.unit)} applied; ${formatQuantityLabel(response.movement.coveredQuantity ?? 0, response.movement.unit)} covered). Current balance: ${formatQuantityLabel(response.item.currentQuantity, response.item.unit)}.`,
+      });
+    } catch (err) {
+      if (
+        err instanceof ApiError &&
+        (err.code === "STALE_REVIEW_CONTEXT" || err.code === "STALE_STOCK_BALANCE")
+      ) {
+        const latestItem = isInventoryItemView(err.details?.item) ? err.details.item : null;
+        if (latestItem) {
+          setItems((prev) =>
+            prev.map((entry) => (getItemKey(entry) === getItemKey(latestItem) ? latestItem : entry)),
+          );
+        }
+        setReviewTarget((prev) =>
+          prev
+            ? {
+                ...prev,
+                item: latestItem ?? prev.item,
+                entry:
+                  err.details?.entry && typeof err.details.entry === "object"
+                    ? (err.details.entry as StockMovementView)
+                    : prev.entry,
+                applicableReconciliations: Array.isArray(err.details?.applicableReconciliations)
+                  ? (err.details.applicableReconciliations as StockReconciliationView[])
+                  : prev.applicableReconciliations,
+                openingCountCoversDate:
+                  typeof err.details?.openingCountCoversDate === "boolean"
+                    ? err.details.openingCountCoversDate
+                    : prev.openingCountCoversDate,
+              }
+            : null,
+        );
+        setReviewRequestKey(generateClientKey());
+        setReviewStaleNotice(err.message);
+      } else {
+        setReviewError(
+          err instanceof ApiError
+            ? err.message
+            : "Could not resolve pending inventory entry. Please try again.",
+        );
+      }
+    } finally {
+      setResolvingReview(false);
     }
   }
 
@@ -1646,6 +2428,9 @@ export function InventoryPage() {
   const canCreateProduct = permissions?.canCreateProduct ?? false;
   const canRecordReceiving = permissions?.canRecordReceiving ?? canInitialize;
   const canRecordUsage = permissions?.canRecordUsage ?? true;
+  const canViewFullHistory = permissions?.canViewFullHistory ?? canInitialize;
+  const canReviewPendingEntries = permissions?.canReviewPendingEntries ?? canInitialize;
+  const todayManila = getTodayManilaDateString();
   const hasUninitialized = items.some((item) => item.status === "NOT_SET");
   const hasOtherItems = items.some((item) => getInventoryItemGroup(item, posSections) === "OTHER");
   const hasOperatingSupplies = items.some((item) => item.category === "OPERATING_SUPPLY");
@@ -1890,6 +2675,48 @@ export function InventoryPage() {
             })}
           </ul>
         </div>
+      )}
+
+      {canReviewPendingEntries && pendingMovementReviews.length > 0 && (
+        <section className="callout callout--warning" aria-label="Pending late-entry reviews">
+          <p className="callout__title">
+            Pending late-entry reviews ({pendingMovementReviews.length})
+          </p>
+          <p className="callout__body">
+            Review whether an intervening physical count covered these backdated entries before any
+            stock change is applied. Pending entries leave stock and Dashboard Trend unchanged.
+          </p>
+          <ul className="conflict-list">
+            {pendingMovementReviews.map((review) => (
+              <li key={review.entry.id}>
+                <strong>
+                  {review.entry.movementType === "STOCK_RECEIVED" ? "Stock Received" : "Stock Used"}
+                </strong>{" "}
+                · {review.item.name} ({formatQuantityLabel(review.entry.quantity, review.entry.unit)}
+                {review.entry.effectiveDate ? ` for ${review.entry.effectiveDate}` : ""}) · Recorded{" "}
+                {formatRecordedAtManila(review.entry.recordedAt)} by {review.entry.recordedBy}
+                {review.entry.note ? ` — "${review.entry.note}"` : ""}
+                <div className="inventory-card-reconcile-row">
+                  <button
+                    type="button"
+                    className="button button--primary button--sm"
+                    disabled={resolvingReview || loading}
+                    onClick={() => openReviewModal(review)}
+                  >
+                    Review &amp; Resolve
+                  </button>
+                  <button
+                    type="button"
+                    className="button button--ghost button--sm"
+                    onClick={() => void openHistoryModal(review.item)}
+                  >
+                    Item history
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        </section>
       )}
 
       {items.some((item) => (item.pendingStockReviews?.length ?? 0) > 0) && (
@@ -2330,7 +3157,7 @@ export function InventoryPage() {
                                   ? "Explicit zero confirmed · Opening count is preserved."
                                   : "Opening count is preserved and cannot be overwritten."}
                               </p>
-                              {(canRecordReceiving || (isSupply && canRecordUsage) || canInitialize) && (
+                              {(canRecordReceiving || (isSupply && canRecordUsage) || canInitialize || canViewFullHistory || isSupply) && (
                                 <div className="inventory-card-reconcile-row">
                                   {canRecordReceiving && (
                                     <button
@@ -2360,6 +3187,16 @@ export function InventoryPage() {
                                       onClick={() => openReconcileModal(item)}
                                     >
                                       Correct stock
+                                    </button>
+                                  )}
+                                  {(canViewFullHistory || isSupply) && (
+                                    <button
+                                      type="button"
+                                      className="button button--ghost button--sm"
+                                      disabled={loading}
+                                      onClick={() => void openHistoryModal(item)}
+                                    >
+                                      {canViewFullHistory ? "History" : "My Usage"}
                                     </button>
                                   )}
                                 </div>
@@ -3175,6 +4012,8 @@ export function InventoryPage() {
         const isCheckingReceive = Boolean(
           pendingReceive && checkingPendingKey === pendingReceive.requestKey,
         );
+        const isLateReceive =
+          Boolean(receiveEffectiveDate) && receiveEffectiveDate < todayManila;
         return (
         <div className="modal-backdrop" role="presentation">
           <div
@@ -3187,8 +4026,9 @@ export function InventoryPage() {
               <div>
                 <h2 id="receive-stock-title">Stock Received · {receiveItem.name}</h2>
                 <p className="muted-sm">
-                  Add delivered stock in {receiveItem.unit}. Delivery date is locked to this session&apos;s
-                  Asia/Manila date; late-date coverage review is added in Task 2.
+                  Add delivered stock in {receiveItem.unit}. Choose the actual delivery date
+                  (Asia/Manila); late deliveries after an intervening physical count require count-coverage
+                  confirmation before adding stock.
                 </p>
               </div>
             </div>
@@ -3201,14 +4041,14 @@ export function InventoryPage() {
                 </dd>
               </div>
               <div className="detail-list__row">
-                <dt>Delivery date (Asia/Manila)</dt>
-                <dd>{receiveEffectiveDate || getTodayManilaDateString()}</dd>
+                <dt>Recording time (Asia/Manila)</dt>
+                <dd>Recorded automatically on save</dd>
               </div>
             </dl>
 
             {receiveStaleNotice && (
               <div className="callout callout--warning" role="alert">
-                <p className="callout__title">Stock balance changed before saving</p>
+                <p className="callout__title">Review counts or balance updated before saving</p>
                 <p className="callout__body">{receiveStaleNotice}</p>
               </div>
             )}
@@ -3224,6 +4064,23 @@ export function InventoryPage() {
             )}
 
             <form className="subview" onSubmit={(event) => void handleConfirmReceiving(event)} noValidate>
+              <label className="field">
+                <span>Actual delivery date (Asia/Manila) *</span>
+                <input
+                  type="date"
+                  max={todayManila}
+                  disabled={receiving || lockedByPending}
+                  value={receiveEffectiveDate}
+                  onChange={(e) => {
+                    setReceiveEffectiveDate(e.target.value);
+                    setReceiveError(null);
+                    setReceiveStaleNotice(null);
+                    setReceiveRequestKey(generateClientKey());
+                  }}
+                />
+                <small>Defaults to today ({todayManila}); past dates show count-coverage confirmation.</small>
+              </label>
+
               <label className="field">
                 <span>Quantity received ({receiveItem.unit}) *</span>
                 <input
@@ -3265,27 +4122,44 @@ export function InventoryPage() {
                 />
               </label>
 
-              {receivePreviewAfter !== null && receiveParsedQty?.ok && (
-                <div className="inventory-reconcile-preview" role="status">
-                  <dl className="detail-list inventory-detail-list">
-                    <div className="detail-list__row">
-                      <dt>Current balance</dt>
-                      <dd>{formatQuantityLabel(receiveItem.currentQuantity, receiveItem.unit)}</dd>
-                    </div>
-                    <div className="detail-list__row">
-                      <dt>Adding</dt>
-                      <dd>
-                        <strong>{formatSignedDelta(receiveParsedQty.quantity, receiveItem.unit)}</strong>
-                      </dd>
-                    </div>
-                    <div className="detail-list__row">
-                      <dt>New balance</dt>
-                      <dd>
-                        <strong>{formatQuantityLabel(receivePreviewAfter, receiveItem.unit)}</strong>
-                      </dd>
-                    </div>
-                  </dl>
-                </div>
+              {isLateReceive && canReviewPendingEntries ? (
+                <LateCoverageControls
+                  movementType="STOCK_RECEIVED"
+                  item={receiveItem}
+                  enteredQuantity={receiveParsedQty?.ok ? receiveParsedQty.quantity : null}
+                  counts={receiveCounts}
+                  value={receiveCoverage}
+                  allowUnclear={true}
+                  disabled={receiving || lockedByPending}
+                  onChange={(next) => {
+                    setReceiveCoverage(next);
+                    setReceiveError(null);
+                    setReceiveRequestKey(generateClientKey());
+                  }}
+                />
+              ) : (
+                receivePreviewAfter !== null && receiveParsedQty?.ok && (
+                  <div className="inventory-reconcile-preview" role="status">
+                    <dl className="detail-list inventory-detail-list">
+                      <div className="detail-list__row">
+                        <dt>Current balance</dt>
+                        <dd>{formatQuantityLabel(receiveItem.currentQuantity, receiveItem.unit)}</dd>
+                      </div>
+                      <div className="detail-list__row">
+                        <dt>Adding</dt>
+                        <dd>
+                          <strong>{formatSignedDelta(receiveParsedQty.quantity, receiveItem.unit)}</strong>
+                        </dd>
+                      </div>
+                      <div className="detail-list__row">
+                        <dt>New balance</dt>
+                        <dd>
+                          <strong>{formatQuantityLabel(receivePreviewAfter, receiveItem.unit)}</strong>
+                        </dd>
+                      </div>
+                    </dl>
+                  </div>
+                )
               )}
 
               {receiveError && (
@@ -3326,13 +4200,15 @@ export function InventoryPage() {
                 <button
                   type="submit"
                   className="button button--primary"
-                  disabled={receiving || isCheckingReceive}
+                  disabled={receiving || isCheckingReceive || (isLateReceive && receiveCounts.loading)}
                 >
                   {receiving
                     ? "Saving…"
                     : lockedByPending
                       ? "Retry Same Submission"
-                      : "Confirm Stock Received"}
+                      : isLateReceive && receiveCoverage.mode === "UNCLEAR"
+                        ? "Save as Pending Review"
+                        : "Confirm Stock Received"}
                 </button>
               </div>
             </form>
@@ -3348,6 +4224,30 @@ export function InventoryPage() {
         const isCheckingUse = Boolean(
           pendingUse && checkingPendingKey === pendingUse.requestKey,
         );
+        const isLateUse = Boolean(useEffectiveDate) && useEffectiveDate < todayManila;
+        const ownerLateUsePreview =
+          isLateUse && canReviewPendingEntries && useParsedQty?.ok
+            ? computeLateCoveragePreview({
+                movementType: "STOCK_USED",
+                currentQuantity: useItem.currentQuantity,
+                enteredQuantity: useParsedQty.quantity,
+                coverageMode: useCoverage.mode,
+                coveredQuantity:
+                  useCoverage.mode === "PARTIAL"
+                    ? (() => {
+                        const p = parseMovementQuantityInput(
+                          useCoverage.coveredQtyInput,
+                          useItem.unit,
+                          Boolean(useItem.allowDecimalQuantity),
+                        );
+                        return p.ok ? p.quantity : null;
+                      })()
+                    : null,
+              })
+            : null;
+        const projectedAfterUse = isLateUse && canReviewPendingEntries
+          ? (ownerLateUsePreview?.projectedBalance ?? null)
+          : usePreviewAfter;
         return (
         <div className="modal-backdrop" role="presentation">
           <div
@@ -3360,8 +4260,8 @@ export function InventoryPage() {
               <div>
                 <h2 id="use-stock-title">Stock Used · {useItem.name}</h2>
                 <p className="muted-sm">
-                  Record operating supply used today (Asia/Manila). Completing a Calendar activity does not
-                  deduct stock automatically.
+                  Record actual operating supply used (Asia/Manila). Completing a Calendar activity
+                  does not deduct stock automatically.
                 </p>
               </div>
             </div>
@@ -3374,14 +4274,14 @@ export function InventoryPage() {
                 </dd>
               </div>
               <div className="detail-list__row">
-                <dt>Use date (Asia/Manila)</dt>
-                <dd>{useEffectiveDate || getTodayManilaDateString()}</dd>
+                <dt>Recording time (Asia/Manila)</dt>
+                <dd>Recorded automatically on save</dd>
               </div>
             </dl>
 
             {useStaleNotice && (
               <div className="callout callout--warning" role="alert">
-                <p className="callout__title">Stock balance changed before saving</p>
+                <p className="callout__title">Review counts or balance updated before saving</p>
                 <p className="callout__body">{useStaleNotice}</p>
               </div>
             )}
@@ -3397,6 +4297,23 @@ export function InventoryPage() {
             )}
 
             <form className="subview" onSubmit={(event) => void handleConfirmUsage(event)} noValidate>
+              <label className="field">
+                <span>Actual use date (Asia/Manila) *</span>
+                <input
+                  type="date"
+                  max={todayManila}
+                  disabled={recordingUse || lockedByPending}
+                  value={useEffectiveDate}
+                  onChange={(e) => {
+                    setUseEffectiveDate(e.target.value);
+                    setUseError(null);
+                    setUseStaleNotice(null);
+                    setUseRequestKey(generateClientKey());
+                  }}
+                />
+                <small>Defaults to today ({todayManila}). Past dates check for intervening counts.</small>
+              </label>
+
               <label className="field">
                 <span>Quantity used ({useItem.unit}) *</span>
                 <input
@@ -3438,30 +4355,57 @@ export function InventoryPage() {
                 />
               </label>
 
-              {usePreviewAfter !== null && useParsedQty?.ok && (
-                <div className="inventory-reconcile-preview" role="status">
-                  <dl className="detail-list inventory-detail-list">
-                    <div className="detail-list__row">
-                      <dt>Current balance</dt>
-                      <dd>{formatQuantityLabel(useItem.currentQuantity, useItem.unit)}</dd>
-                    </div>
-                    <div className="detail-list__row">
-                      <dt>Deducting</dt>
-                      <dd>
-                        <strong>{formatSignedDelta(-useParsedQty.quantity, useItem.unit)}</strong>
-                      </dd>
-                    </div>
-                    <div className="detail-list__row">
-                      <dt>New balance</dt>
-                      <dd>
-                        <strong>{formatQuantityLabel(usePreviewAfter, useItem.unit)}</strong>
-                      </dd>
-                    </div>
-                  </dl>
+              {isLateUse && !canReviewPendingEntries && (
+                <div className="callout callout--warning" role="status">
+                  <p className="callout__title">Late usage check</p>
+                  <p className="callout__body">
+                    If the Owner recorded a physical count on or after {useEffectiveDate}, this late
+                    entry will be saved as Pending Owner Review with zero stock change until confirmed.
+                  </p>
                 </div>
               )}
 
-              {usePreviewAfter !== null && usePreviewAfter < 0 && (
+              {isLateUse && canReviewPendingEntries ? (
+                <LateCoverageControls
+                  movementType="STOCK_USED"
+                  item={useItem}
+                  enteredQuantity={useParsedQty?.ok ? useParsedQty.quantity : null}
+                  counts={useCounts}
+                  value={useCoverage}
+                  allowUnclear={true}
+                  disabled={recordingUse || lockedByPending}
+                  onChange={(next) => {
+                    setUseCoverage(next);
+                    setUseError(null);
+                    setUseRequestKey(generateClientKey());
+                  }}
+                />
+              ) : (
+                usePreviewAfter !== null && useParsedQty?.ok && !isLateUse && (
+                  <div className="inventory-reconcile-preview" role="status">
+                    <dl className="detail-list inventory-detail-list">
+                      <div className="detail-list__row">
+                        <dt>Current balance</dt>
+                        <dd>{formatQuantityLabel(useItem.currentQuantity, useItem.unit)}</dd>
+                      </div>
+                      <div className="detail-list__row">
+                        <dt>Deducting</dt>
+                        <dd>
+                          <strong>{formatSignedDelta(-useParsedQty.quantity, useItem.unit)}</strong>
+                        </dd>
+                      </div>
+                      <div className="detail-list__row">
+                        <dt>New balance</dt>
+                        <dd>
+                          <strong>{formatQuantityLabel(usePreviewAfter, useItem.unit)}</strong>
+                        </dd>
+                      </div>
+                    </dl>
+                  </div>
+                )
+              )}
+
+              {projectedAfterUse !== null && projectedAfterUse < 0 && (
                 <div className="callout callout--warning" role="status">
                   <p className="callout__title">Balance will go below zero</p>
                   <p className="callout__body">
@@ -3509,13 +4453,19 @@ export function InventoryPage() {
                 <button
                   type="submit"
                   className="button button--primary"
-                  disabled={recordingUse || isCheckingUse}
+                  disabled={
+                    recordingUse ||
+                    isCheckingUse ||
+                    (isLateUse && canReviewPendingEntries && useCounts.loading)
+                  }
                 >
                   {recordingUse
                     ? "Saving…"
                     : lockedByPending
                       ? "Retry Same Submission"
-                      : "Confirm Stock Used"}
+                      : isLateUse && canReviewPendingEntries && useCoverage.mode === "UNCLEAR"
+                        ? "Save as Pending Review"
+                        : "Confirm Stock Used"}
                 </button>
               </div>
             </form>
@@ -3523,6 +4473,312 @@ export function InventoryPage() {
         </div>
         );
       })()}
+
+      {reviewTarget && canReviewPendingEntries && (
+        <div className="modal-backdrop" role="presentation">
+          <div
+            className="modal modal--wide"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="review-pending-title"
+          >
+            <div className="detail-card__header">
+              <div>
+                <h2 id="review-pending-title">
+                  Review Pending {reviewTarget.entry.movementType === "STOCK_RECEIVED" ? "Stock Received" : "Stock Used"} ·{" "}
+                  {reviewTarget.item.name}
+                </h2>
+                <p className="muted-sm">
+                  Confirm how much of this late entry was already covered by an intervening physical count
+                  before updating the balance.
+                </p>
+              </div>
+            </div>
+
+            <dl className="detail-list">
+              <div className="detail-list__row">
+                <dt>Current balance</dt>
+                <dd>
+                  <strong>
+                    {formatQuantityLabel(reviewTarget.item.currentQuantity, reviewTarget.item.unit)}
+                  </strong>
+                </dd>
+              </div>
+              <div className="detail-list__row">
+                <dt>Entered quantity</dt>
+                <dd>
+                  <strong>
+                    {formatQuantityLabel(
+                      reviewTarget.entry.enteredQuantity ?? reviewTarget.entry.quantity,
+                      reviewTarget.entry.unit,
+                    )}
+                  </strong>
+                </dd>
+              </div>
+              <div className="detail-list__row">
+                <dt>Actual date (Asia/Manila)</dt>
+                <dd>{reviewTarget.entry.effectiveDate ?? "—"}</dd>
+              </div>
+              <div className="detail-list__row">
+                <dt>Recorded by &amp; time</dt>
+                <dd>
+                  {reviewTarget.entry.recordedBy} · {formatRecordedAtManila(reviewTarget.entry.recordedAt)}
+                </dd>
+              </div>
+              {reviewTarget.entry.note && (
+                <div className="detail-list__row">
+                  <dt>{reviewTarget.entry.movementType === "STOCK_RECEIVED" ? "Note" : "Purpose"}</dt>
+                  <dd>{reviewTarget.entry.note}</dd>
+                </div>
+              )}
+            </dl>
+
+            {reviewStaleNotice && (
+              <div className="callout callout--warning" role="alert">
+                <p className="callout__title">Counts or balance changed before confirming</p>
+                <p className="callout__body">{reviewStaleNotice}</p>
+              </div>
+            )}
+
+            <form className="subview" onSubmit={(event) => void handleResolvePendingReview(event)} noValidate>
+              <LateCoverageControls
+                movementType={
+                  reviewTarget.entry.movementType === "STOCK_RECEIVED"
+                    ? "STOCK_RECEIVED"
+                    : "STOCK_USED"
+                }
+                item={reviewTarget.item}
+                enteredQuantity={reviewTarget.entry.enteredQuantity ?? reviewTarget.entry.quantity}
+                counts={{
+                  loading: false,
+                  error: null,
+                  reconciliations: reviewTarget.applicableReconciliations,
+                  openingCountCoversDate: reviewTarget.openingCountCoversDate,
+                }}
+                value={reviewCoverage}
+                allowUnclear={false}
+                disabled={resolvingReview}
+                onChange={(next) => {
+                  setReviewCoverage(next);
+                  setReviewError(null);
+                  setReviewRequestKey(generateClientKey());
+                }}
+                onReconcileFirst={() => {
+                  const targetItem = reviewTarget.item;
+                  setReviewTarget(null);
+                  openReconcileModal(targetItem);
+                }}
+              />
+
+              {reviewError && (
+                <div className="alert alert--error" role="alert">
+                  {reviewError}
+                </div>
+              )}
+
+              <div className="modal__actions">
+                <button
+                  type="button"
+                  className="button button--ghost"
+                  disabled={resolvingReview}
+                  onClick={() => setReviewTarget(null)}
+                >
+                  Close
+                </button>
+                <button
+                  type="submit"
+                  className="button button--primary"
+                  disabled={resolvingReview}
+                >
+                  {resolvingReview ? "Saving…" : "Confirm Review Decision"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {historyItem && (
+        <div className="modal-backdrop" role="presentation">
+          <div
+            className="modal modal--wide"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="item-history-title"
+          >
+            <div className="detail-card__header">
+              <div>
+                <h2 id="item-history-title">
+                  {canViewFullHistory ? "Stock History" : "My Usage"} · {historyItem.name}
+                </h2>
+                <p className="muted-sm">
+                  {canViewFullHistory
+                    ? "Opening count, physical-count reconciliations, pending reviews, and all stock movements."
+                    : "Your own Stock Used submissions and their confirmation status for this item."}
+                </p>
+              </div>
+            </div>
+
+            {historyLoading ? (
+              <p className="muted-sm">Loading history…</p>
+            ) : historyError ? (
+              <div className="alert alert--error" role="alert">
+                {historyError}
+              </div>
+            ) : historyData ? (
+              <div className="subview">
+                <dl className="detail-list">
+                  <div className="detail-list__row">
+                    <dt>Current balance</dt>
+                    <dd>
+                      <strong>
+                        {formatQuantityLabel(historyData.item.currentQuantity, historyData.item.unit)}
+                      </strong>
+                    </dd>
+                  </div>
+                  {historyData.scope === "FULL" && historyData.openingStock && (
+                    <div className="detail-list__row">
+                      <dt>Opening physical count</dt>
+                      <dd>
+                        {formatQuantityLabel(
+                          historyData.openingStock.quantity,
+                          historyData.openingStock.unit,
+                        )}{" "}
+                        · {historyData.openingStock.recordedBy} (
+                        {formatRecordedAtManila(historyData.openingStock.recordedAt)})
+                      </dd>
+                    </div>
+                  )}
+                </dl>
+
+                {historyData.scope === "FULL" && historyData.reconciliations.length > 0 && (
+                  <div className="preview-protected">
+                    <h3>Physical-count reconciliations ({historyData.reconciliations.length})</h3>
+                    <ul className="history-timeline">
+                      {historyData.reconciliations.map((rec) => (
+                        <li key={rec.id} className="history-timeline__item">
+                          <div className="history-timeline__head">
+                            <strong>
+                              Counted {formatQuantityLabel(rec.physicalCount, rec.unit)} (
+                              {formatSignedDelta(rec.quantityDelta, rec.unit)})
+                            </strong>
+                            <span>{formatRecordedAtManila(rec.recordedAt)}</span>
+                          </div>
+                          <p className="muted-sm">
+                            By {rec.recordedBy} · {rec.reason} (
+                            {formatQuantityLabel(rec.balanceBefore, rec.unit)} →{" "}
+                            {formatQuantityLabel(rec.balanceAfter, rec.unit)})
+                          </p>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                <div className="preview-protected">
+                  <h3>
+                    {historyData.scope === "FULL" ? "Stock movements" : "My Stock Used entries"} (
+                    {historyData.movements.length})
+                  </h3>
+                  {historyData.movements.length === 0 ? (
+                    <p className="muted-sm">
+                      {historyData.scope === "FULL"
+                        ? "No stock movements recorded for this item yet."
+                        : "You have not recorded any Stock Used entries for this item yet."}
+                    </p>
+                  ) : (
+                    <ul className="history-timeline">
+                      {historyData.movements.map((mov) => {
+                        const isPending = mov.entryStatus === "PENDING_REVIEW";
+                        const matchingReview = isPending
+                          ? pendingMovementReviews.find((r) => r.entry.id === mov.id)
+                          : undefined;
+                        return (
+                          <li key={mov.id} className="history-timeline__item">
+                            <div className="history-timeline__head">
+                              <strong>
+                                {mov.movementType} · {formatQuantityLabel(mov.quantity, mov.unit)}{" "}
+                                ({mov.quantityDelta === 0 ? "0 stock change" : formatSignedDelta(mov.quantityDelta, mov.unit)})
+                              </strong>
+                              <span>{formatRecordedAtManila(mov.recordedAt)}</span>
+                            </div>
+                            <p className="muted-sm">
+                              {isPending
+                                ? "Status: Pending Owner Review"
+                                : mov.coverageMode === "FULL"
+                                  ? "Status: Covered by physical count (zero stock change)"
+                                  : mov.coverageMode === "PARTIAL"
+                                    ? `Status: Partial count coverage (${formatQuantityLabel(mov.coveredQuantity ?? 0, mov.unit)} covered)`
+                                    : "Status: Applied"}
+                              {mov.effectiveDate ? ` · Actual date: ${mov.effectiveDate}` : ""}
+                              {` · Recorded by ${mov.recordedBy}`}
+                              {mov.note ? ` · ${mov.note}` : ""}
+                            </p>
+                            {historyData.scope === "FULL" && (
+                              <p className="muted-sm">
+                                Balance: {formatQuantityLabel(mov.balanceBefore, mov.unit)} →{" "}
+                                {formatQuantityLabel(mov.balanceAfter, mov.unit)}
+                                {mov.supportingReconciliation
+                                  ? ` · Supporting count: ${formatQuantityLabel(
+                                      mov.supportingReconciliation.physicalCount,
+                                      mov.supportingReconciliation.unit,
+                                    )} (${formatRecordedAtManila(mov.supportingReconciliation.recordedAt)})`
+                                  : mov.coveredByOpeningCount
+                                    ? " · Supporting count: Opening physical count"
+                                    : ""}
+                                {mov.reviewedBy && mov.reviewedAt
+                                  ? ` · Confirmed by ${mov.reviewedBy} (${formatRecordedAtManila(mov.reviewedAt)})`
+                                  : ""}
+                                {mov.reviewNote ? ` · Review note: ${mov.reviewNote}` : ""}
+                              </p>
+                            )}
+                            {historyData.scope === "FULL" && isPending && canReviewPendingEntries && (
+                              <div className="inventory-card-reconcile-row">
+                                <button
+                                  type="button"
+                                  className="button button--primary button--sm"
+                                  onClick={() => {
+                                    setHistoryItem(null);
+                                    if (matchingReview) {
+                                      openReviewModal(matchingReview);
+                                    } else {
+                                      void api<{ reviews: PendingMovementReviewView[] }>(
+                                        "/api/inventory/pending-reviews",
+                                      ).then((res) => {
+                                        setPendingMovementReviews(res.reviews);
+                                        const found = res.reviews.find(
+                                          (r) => r.entry.id === mov.id,
+                                        );
+                                        if (found) openReviewModal(found);
+                                      });
+                                    }
+                                  }}
+                                >
+                                  Review &amp; Resolve
+                                </button>
+                              </div>
+                            )}
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  )}
+                </div>
+              </div>
+            ) : null}
+
+            <div className="modal__actions">
+              <button
+                type="button"
+                className="button button--ghost"
+                onClick={() => setHistoryItem(null)}
+              >
+                Close
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </AppShell>
   );
 }

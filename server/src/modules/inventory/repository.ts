@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { Role } from "../auth/policy.js";
 import type { Database, Queryable } from "../../db/database.js";
 import {
   addQuantities,
@@ -8,19 +9,25 @@ import {
   formatManilaDate,
   formatManilaIso,
   type InventoryCategory,
+  type InventoryItemHistoryView,
   type InventoryItemView,
   type InventoryStockHoldView,
+  type MovementCoverageMode,
+  type MovementEntryStatus,
   parseOpeningQuantity,
   parsePhysicalCount,
   parseQuantity,
   parseStoredBalanceBaseline,
+  type PendingMovementReviewView,
   type PendingSaleActionStockReviewView,
   type PosSection,
   type PosSectionView,
   quantitiesEqual,
+  type StockMovementType,
   type StockMovementView,
   type StockReconciliationView,
   subtractQuantities,
+  type SupportingReconciliationSummary,
 } from "./inventory.js";
 
 export interface InventoryItemDbRow {
@@ -88,17 +95,34 @@ interface ReconciliationDbRow {
 interface StockMovementDbRow {
   id: string;
   itemId: string;
-  movementType: "STOCK_RECEIVED" | "STOCK_USED";
+  movementType: StockMovementType;
+  entryStatus: MovementEntryStatus;
+  enteredQuantity: number | string | null;
   quantityDelta: number | string;
   balanceBefore: number | string;
   balanceAfter: number | string;
   unit: string;
   effectiveDate: Date | string | null;
   note: string | null;
+  coverageMode: MovementCoverageMode | null;
+  coveredQuantity: number | string;
+  supportingReconciliationId: string | null;
+  coveredByOpeningCount: boolean;
+  posReference: string | null;
   requestKey: string | null;
+  reviewRequestKey: string | null;
   actorUserId: string;
   actorUsername: string;
   recordedAt: Date | string;
+  reviewedByUsername: string | null;
+  reviewedAt: Date | string | null;
+  reviewNote: string | null;
+  supportingRecPhysicalCount: number | string | null;
+  supportingRecQuantityDelta: number | string | null;
+  supportingRecUnit: string | null;
+  supportingRecReason: string | null;
+  supportingRecRecordedBy: string | null;
+  supportingRecRecordedAt: Date | string | null;
 }
 
 interface LockedItemRow {
@@ -162,19 +186,74 @@ function toReconciliationView(row: ReconciliationDbRow): StockReconciliationView
 
 function toStockMovementView(row: StockMovementDbRow): StockMovementView {
   const delta = Number(row.quantityDelta);
+  const appliedQuantity = Math.abs(delta);
+  const enteredQuantity =
+    row.enteredQuantity !== null && row.enteredQuantity !== undefined
+      ? Number(row.enteredQuantity)
+      : row.movementType === "STOCK_RECEIVED" || row.movementType === "STOCK_USED"
+        ? appliedQuantity
+        : null;
+  const supportingReconciliation: SupportingReconciliationSummary | null =
+    row.supportingReconciliationId &&
+    row.supportingRecPhysicalCount !== null &&
+    row.supportingRecQuantityDelta !== null &&
+    row.supportingRecUnit !== null &&
+    row.supportingRecReason !== null &&
+    row.supportingRecRecordedBy !== null &&
+    row.supportingRecRecordedAt !== null
+      ? {
+          id: row.supportingReconciliationId,
+          physicalCount: Number(row.supportingRecPhysicalCount),
+          quantityDelta: Number(row.supportingRecQuantityDelta),
+          unit: row.supportingRecUnit,
+          reason: row.supportingRecReason,
+          recordedBy: row.supportingRecRecordedBy,
+          recordedAt: formatManilaIso(toDate(row.supportingRecRecordedAt)),
+        }
+      : null;
+
   return {
     id: row.id,
     itemId: row.itemId,
     movementType: row.movementType,
-    quantity: Math.abs(delta),
+    entryStatus: row.entryStatus,
+    quantity: enteredQuantity ?? appliedQuantity,
+    enteredQuantity,
+    appliedQuantity,
     quantityDelta: delta,
     balanceBefore: Number(row.balanceBefore),
     balanceAfter: Number(row.balanceAfter),
     unit: row.unit,
     effectiveDate: toOptionalDateString(row.effectiveDate),
     note: row.note ?? null,
+    coverageMode: row.coverageMode ?? null,
+    coveredQuantity: Number(row.coveredQuantity ?? 0),
+    supportingReconciliationId: row.supportingReconciliationId ?? null,
+    supportingReconciliation,
+    coveredByOpeningCount: Boolean(row.coveredByOpeningCount),
+    posReference: row.posReference ?? null,
     recordedBy: row.actorUsername,
     recordedAt: formatManilaIso(toDate(row.recordedAt)),
+    reviewedBy: row.reviewedByUsername ?? null,
+    reviewedAt: row.reviewedAt ? formatManilaIso(toDate(row.reviewedAt)) : null,
+    reviewNote: row.reviewNote ?? null,
+  };
+}
+
+export function redactItemForEmployee(item: InventoryItemView): InventoryItemView {
+  return {
+    ...item,
+    latestReconciliation: null,
+    pendingStockReviews: [],
+  };
+}
+
+export function redactMovementForEmployee(movement: StockMovementView): StockMovementView {
+  return {
+    ...movement,
+    supportingReconciliationId: null,
+    supportingReconciliation: null,
+    reviewNote: null,
   };
 }
 
@@ -362,18 +441,38 @@ const STOCK_MOVEMENT_SELECT = `
   SELECT m.id,
          m.item_id AS "itemId",
          m.movement_type AS "movementType",
+         m.entry_status AS "entryStatus",
+         m.entered_quantity AS "enteredQuantity",
          m.quantity_delta AS "quantityDelta",
          m.balance_before AS "balanceBefore",
          m.balance_after AS "balanceAfter",
          m.unit,
          to_char(m.effective_date, 'YYYY-MM-DD') AS "effectiveDate",
          m.note,
+         m.coverage_mode AS "coverageMode",
+         m.covered_quantity AS "coveredQuantity",
+         m.supporting_reconciliation_id AS "supportingReconciliationId",
+         m.covered_by_opening_count AS "coveredByOpeningCount",
+         m.pos_reference AS "posReference",
          m.request_key AS "requestKey",
+         m.review_request_key AS "reviewRequestKey",
          m.actor_user_id AS "actorUserId",
          u.username AS "actorUsername",
-         m.recorded_at AS "recordedAt"
+         m.recorded_at AS "recordedAt",
+         ru.username AS "reviewedByUsername",
+         m.reviewed_at AS "reviewedAt",
+         m.review_note AS "reviewNote",
+         sr.physical_count AS "supportingRecPhysicalCount",
+         sr.quantity_delta AS "supportingRecQuantityDelta",
+         sr.unit AS "supportingRecUnit",
+         sr.reason AS "supportingRecReason",
+         sru.username AS "supportingRecRecordedBy",
+         sr.recorded_at AS "supportingRecRecordedAt"
     FROM inventory_stock_movements m
-    JOIN app_users u ON u.id = m.actor_user_id`;
+    JOIN app_users u ON u.id = m.actor_user_id
+    LEFT JOIN app_users ru ON ru.id = m.reviewed_by_user_id
+    LEFT JOIN inventory_reconciliations sr ON sr.id = m.supporting_reconciliation_id
+    LEFT JOIN app_users sru ON sru.id = sr.actor_user_id`;
 
 export type OpeningStockTarget =
   | { kind: "shape"; shape: ContainerShape }
@@ -432,12 +531,28 @@ export type ReconcileStockResult =
       item: InventoryItemView;
     };
 
+export interface LateCoverageSelectionInput {
+  coverageMode?: MovementCoverageMode | null;
+  coveredQuantity?: number | null;
+  supportingReconciliationId?: string | null;
+  coveredByOpeningCount?: boolean;
+  reviewNote?: string | null;
+  expectedLatestReconciliationId?: string | null;
+  expectedOpeningCountCoversDate?: boolean;
+}
+
 export type RecordStockMovementResult =
   | { kind: "created"; item: InventoryItemView; movement: StockMovementView }
   | { kind: "replayed"; item: InventoryItemView; movement: StockMovementView }
   | { kind: "cancelled" }
   | { kind: "key-conflict" }
-  | { kind: "late-date-not-enabled" }
+  | { kind: "invalid-coverage"; message: string }
+  | {
+      kind: "stale-review";
+      item: InventoryItemView;
+      applicableReconciliations: StockReconciliationView[];
+      openingCountCoversDate: boolean;
+    }
   | { kind: "not-found" }
   | { kind: "archived" }
   | { kind: "not-set" }
@@ -445,6 +560,29 @@ export type RecordStockMovementResult =
   | { kind: "invalid-quantity"; allowDecimalQuantity: boolean; unit: string }
   | { kind: "invalid-baseline"; allowDecimalQuantity: boolean; unit: string }
   | { kind: "stale"; item: InventoryItemView };
+
+export type ResolvePendingReviewResult =
+  | { kind: "resolved"; item: InventoryItemView; movement: StockMovementView }
+  | { kind: "replayed"; item: InventoryItemView; movement: StockMovementView }
+  | { kind: "not-found" }
+  | { kind: "already-resolved"; item: InventoryItemView; movement: StockMovementView }
+  | { kind: "key-conflict" }
+  | { kind: "invalid-coverage"; message: string }
+  | { kind: "invalid-baseline"; allowDecimalQuantity: boolean; unit: string }
+  | {
+      kind: "stale-review";
+      item: InventoryItemView;
+      entry: StockMovementView;
+      applicableReconciliations: StockReconciliationView[];
+      openingCountCoversDate: boolean;
+    }
+  | {
+      kind: "stale";
+      item: InventoryItemView;
+      entry: StockMovementView;
+      applicableReconciliations: StockReconciliationView[];
+      openingCountCoversDate: boolean;
+    };
 
 async function loadActiveHoldsByItemIds(
   db: Queryable,
@@ -612,6 +750,255 @@ async function findItemByTarget(db: Queryable, target: OpeningStockTarget): Prom
     );
   }
   return findItemById(db, target.id);
+}
+
+async function loadApplicableCountsForDate(
+  tx: Queryable,
+  itemId: string,
+  sinceDate: string,
+): Promise<{
+  applicableReconciliations: StockReconciliationView[];
+  openingCountCoversDate: boolean;
+}> {
+  const [{ rows: recRows }, { rows: openRows }] = await Promise.all([
+    tx.query<ReconciliationDbRow>(
+      `${RECONCILIATION_SELECT}
+        WHERE r.item_id = $1
+          AND ((r.recorded_at AT TIME ZONE 'Asia/Manila')::date) >= $2::date
+        ORDER BY r.recorded_at DESC, r.id DESC`,
+      [itemId, sinceDate],
+    ),
+    tx.query<{ recordedAt: Date | string }>(
+      `SELECT recorded_at AS "recordedAt" FROM inventory_opening_counts WHERE item_id = $1`,
+      [itemId],
+    ),
+  ]);
+  const applicableReconciliations = recRows.map(toReconciliationView);
+  const openingCountCoversDate = Boolean(
+    openRows[0] && formatManilaDate(toDate(openRows[0].recordedAt)) >= sinceDate,
+  );
+  return { applicableReconciliations, openingCountCoversDate };
+}
+
+type CoverageResolutionOutcome =
+  | {
+      ok: true;
+      entryStatus: MovementEntryStatus;
+      coverageMode: MovementCoverageMode;
+      coveredQuantity: number;
+      supportingReconciliationId: string | null;
+      coveredByOpeningCount: boolean;
+      deltaMagnitude: number;
+      reviewed: boolean;
+    }
+  | { ok: false; kind: "invalid-coverage"; message: string }
+  | { ok: false; kind: "stale-review" };
+
+function evaluateOwnerCoverageSelection(params: {
+  enteredQuantity: number;
+  allowDecimal: boolean;
+  applicableReconciliations: StockReconciliationView[];
+  openingCountCoversDate: boolean;
+  selection: LateCoverageSelectionInput;
+  requireExplicitWhenCountsExist: boolean;
+}): CoverageResolutionOutcome {
+  const latestRecId = params.applicableReconciliations[0]?.id ?? null;
+  if (
+    params.selection.expectedLatestReconciliationId !== undefined &&
+    params.selection.expectedLatestReconciliationId !== latestRecId
+  ) {
+    return { ok: false, kind: "stale-review" };
+  }
+  if (
+    params.selection.expectedOpeningCountCoversDate !== undefined &&
+    params.selection.expectedOpeningCountCoversDate !== params.openingCountCoversDate
+  ) {
+    return { ok: false, kind: "stale-review" };
+  }
+
+  const hasApplicableCounts =
+    params.applicableReconciliations.length > 0 || params.openingCountCoversDate;
+  const mode =
+    params.selection.coverageMode ??
+    (params.requireExplicitWhenCountsExist && hasApplicableCounts ? null : "NONE");
+  if (!mode) {
+    return {
+      ok: false,
+      kind: "invalid-coverage",
+      message:
+        "Choose whether an intervening physical count covered this late entry, or mark coverage unclear.",
+    };
+  }
+
+  const recId = params.selection.supportingReconciliationId ?? null;
+  const byOpening = Boolean(params.selection.coveredByOpeningCount);
+  if (recId && byOpening) {
+    return {
+      ok: false,
+      kind: "invalid-coverage",
+      message: "Choose either a supporting physical count or the opening count, not both.",
+    };
+  }
+
+  if (mode === "UNCLEAR") {
+    if (
+      recId ||
+      byOpening ||
+      (params.selection.coveredQuantity !== undefined && params.selection.coveredQuantity !== null)
+    ) {
+      return {
+        ok: false,
+        kind: "invalid-coverage",
+        message: "Unclear coverage cannot set a covered quantity or supporting count.",
+      };
+    }
+    return {
+      ok: true,
+      entryStatus: "PENDING_REVIEW",
+      coverageMode: "UNCLEAR",
+      coveredQuantity: 0,
+      supportingReconciliationId: null,
+      coveredByOpeningCount: false,
+      deltaMagnitude: 0,
+      reviewed: false,
+    };
+  }
+
+  if (mode === "NONE") {
+    if (
+      recId ||
+      byOpening ||
+      (params.selection.coveredQuantity !== undefined && params.selection.coveredQuantity !== null)
+    ) {
+      return {
+        ok: false,
+        kind: "invalid-coverage",
+        message: "No-coverage confirmation cannot set a covered quantity or supporting count.",
+      };
+    }
+    return {
+      ok: true,
+      entryStatus: "APPLIED",
+      coverageMode: "NONE",
+      coveredQuantity: 0,
+      supportingReconciliationId: null,
+      coveredByOpeningCount: false,
+      deltaMagnitude: params.enteredQuantity,
+      reviewed: true,
+    };
+  }
+
+  if (recId) {
+    if (!params.applicableReconciliations.some((r) => r.id === recId)) {
+      return {
+        ok: false,
+        kind: "invalid-coverage",
+        message: "Selected supporting physical count does not apply to this entry date.",
+      };
+    }
+  } else if (byOpening) {
+    if (!params.openingCountCoversDate) {
+      return {
+        ok: false,
+        kind: "invalid-coverage",
+        message: "The opening stock count was recorded before this entry date and cannot cover it.",
+      };
+    }
+  } else {
+    return {
+      ok: false,
+      kind: "invalid-coverage",
+      message: "Select the supporting physical count or opening count that covered this entry.",
+    };
+  }
+
+  if (mode === "FULL") {
+    if (
+      params.selection.coveredQuantity !== undefined &&
+      params.selection.coveredQuantity !== null &&
+      !quantitiesEqual(Number(params.selection.coveredQuantity), params.enteredQuantity)
+    ) {
+      return {
+        ok: false,
+        kind: "invalid-coverage",
+        message: "Full coverage covers the entire entered quantity.",
+      };
+    }
+    return {
+      ok: true,
+      entryStatus: "APPLIED",
+      coverageMode: "FULL",
+      coveredQuantity: params.enteredQuantity,
+      supportingReconciliationId: recId,
+      coveredByOpeningCount: byOpening,
+      deltaMagnitude: 0,
+      reviewed: true,
+    };
+  }
+
+  const parsedCovered = parseQuantity(params.selection.coveredQuantity, {
+    allowDecimal: params.allowDecimal,
+    allowZero: false,
+  });
+  if (parsedCovered === null) {
+    return {
+      ok: false,
+      kind: "invalid-coverage",
+      message: "Enter a positive covered quantity in the item's unit.",
+    };
+  }
+  const remaining = subtractQuantities(params.enteredQuantity, parsedCovered);
+  if (remaining <= 0) {
+    return {
+      ok: false,
+      kind: "invalid-coverage",
+      message:
+        "Covered quantity must be strictly less than the full entry quantity. Choose Full Coverage when the entire entry was covered.",
+    };
+  }
+
+  return {
+    ok: true,
+    entryStatus: "APPLIED",
+    coverageMode: "PARTIAL",
+    coveredQuantity: parsedCovered,
+    supportingReconciliationId: recId,
+    coveredByOpeningCount: byOpening,
+    deltaMagnitude: remaining,
+    reviewed: true,
+  };
+}
+
+function sameOptionalReplayCoverage(
+  existing: StockMovementDbRow,
+  selection: LateCoverageSelectionInput | undefined,
+): boolean {
+  if (!selection || existing.reviewRequestKey !== null) {
+    return true;
+  }
+  if (selection.coverageMode && existing.coverageMode !== selection.coverageMode) {
+    return false;
+  }
+  if (
+    selection.coveredQuantity !== undefined &&
+    selection.coveredQuantity !== null &&
+    !quantitiesEqual(Number(existing.coveredQuantity ?? 0), Number(selection.coveredQuantity))
+  ) {
+    return false;
+  }
+  if (
+    selection.supportingReconciliationId !== undefined &&
+    (existing.supportingReconciliationId ?? null) !== (selection.supportingReconciliationId ?? null)
+  ) {
+    return false;
+  }
+  if (
+    selection.coveredByOpeningCount !== undefined &&
+    Boolean(existing.coveredByOpeningCount) !== Boolean(selection.coveredByOpeningCount)
+  ) {
+    return false;
+  }
+  return true;
 }
 
 /** PostgreSQL persistence adapter for Inventory containers, merchandise, sections, archiving, and INV-009 reconciliations. */
@@ -1365,6 +1752,7 @@ export const inventoryRepository = {
       requestKey: string | null;
       actorUserId: string;
       recordedAt: Date;
+      coverage?: LateCoverageSelectionInput;
     },
   ): Promise<RecordStockMovementResult> {
     return db.transaction(async (tx) => {
@@ -1417,13 +1805,18 @@ export const inventoryRepository = {
         );
         const existing = existingRows[0];
         if (existing) {
+          const existingEntered =
+            existing.enteredQuantity !== null && existing.enteredQuantity !== undefined
+              ? Number(existing.enteredQuantity)
+              : Math.abs(Number(existing.quantityDelta));
           if (
             existing.itemId !== locked.id ||
             existing.actorUserId !== input.actorUserId ||
             existing.movementType !== "STOCK_RECEIVED" ||
-            !quantitiesEqual(Number(existing.quantityDelta), validatedQuantity) ||
+            !quantitiesEqual(existingEntered, validatedQuantity) ||
             toOptionalDateString(existing.effectiveDate) !== input.effectiveDate ||
-            (existing.note ?? null) !== input.note
+            (existing.note ?? null) !== input.note ||
+            !sameOptionalReplayCoverage(existing, input.coverage)
           ) {
             return { kind: "key-conflict" as const };
           }
@@ -1446,10 +1839,6 @@ export const inventoryRepository = {
         }
       }
 
-      if (input.effectiveDate < input.todayManila) {
-        return { kind: "late-date-not-enabled" as const };
-      }
-
       if (locked.archivedAt !== null) {
         return { kind: "archived" as const };
       }
@@ -1462,60 +1851,140 @@ export const inventoryRepository = {
         return { kind: "not-set" as const };
       }
 
-      const validatedBaseline = parseStoredBalanceBaseline(input.expectedCurrentQuantity, {
-        allowDecimal,
-        allowNegative: locked.category === "OPERATING_SUPPLY",
-      });
-      if (validatedBaseline === null) {
-        return {
-          kind: "invalid-baseline" as const,
-          allowDecimalQuantity: allowDecimal,
-          unit: locked.unit,
-        };
+      const isLateEntry = input.effectiveDate < input.todayManila;
+      let entryStatus: MovementEntryStatus = "APPLIED";
+      let coverageMode: MovementCoverageMode = "NONE";
+      let coveredQuantity = 0;
+      let supportingReconciliationId: string | null = null;
+      let coveredByOpeningCount = false;
+      let deltaMagnitude = validatedQuantity;
+      let reviewed = false;
+
+      if (!isLateEntry) {
+        const cov = input.coverage;
+        if (
+          (cov?.coverageMode !== undefined && cov.coverageMode !== null && cov.coverageMode !== "NONE") ||
+          (cov?.coveredQuantity !== undefined && cov.coveredQuantity !== null) ||
+          cov?.supportingReconciliationId ||
+          cov?.coveredByOpeningCount ||
+          cov?.reviewNote
+        ) {
+          return {
+            kind: "invalid-coverage" as const,
+            message: "Count-coverage options apply only to late deliveries dated before today.",
+          };
+        }
+      } else {
+        const counts = await loadApplicableCountsForDate(tx, locked.id, input.effectiveDate);
+        const coverageOutcome = evaluateOwnerCoverageSelection({
+          enteredQuantity: validatedQuantity,
+          allowDecimal,
+          applicableReconciliations: counts.applicableReconciliations,
+          openingCountCoversDate: counts.openingCountCoversDate,
+          selection: input.coverage ?? {},
+          requireExplicitWhenCountsExist: true,
+        });
+        if (!coverageOutcome.ok) {
+          if (coverageOutcome.kind === "stale-review") {
+            const latestItem = await findItemById(tx, locked.id);
+            return {
+              kind: "stale-review" as const,
+              item: latestItem!,
+              applicableReconciliations: counts.applicableReconciliations,
+              openingCountCoversDate: counts.openingCountCoversDate,
+            };
+          }
+          return {
+            kind: "invalid-coverage" as const,
+            message: coverageOutcome.message,
+          };
+        }
+        entryStatus = coverageOutcome.entryStatus;
+        coverageMode = coverageOutcome.coverageMode;
+        coveredQuantity = coverageOutcome.coveredQuantity;
+        supportingReconciliationId = coverageOutcome.supportingReconciliationId;
+        coveredByOpeningCount = coverageOutcome.coveredByOpeningCount;
+        deltaMagnitude = coverageOutcome.deltaMagnitude;
+        reviewed = coverageOutcome.reviewed;
       }
 
       const currentQuantity = Number(locked.currentQuantity);
       const stockRevision = Number(locked.stockRevision);
-      if (
-        stockRevision !== input.expectedRevision ||
-        !quantitiesEqual(currentQuantity, validatedBaseline)
-      ) {
-        const latestItem = await findItemById(tx, locked.id);
-        return { kind: "stale" as const, item: latestItem! };
+      if (deltaMagnitude > 0) {
+        const validatedBaseline = parseStoredBalanceBaseline(input.expectedCurrentQuantity, {
+          allowDecimal,
+          allowNegative: locked.category === "OPERATING_SUPPLY",
+        });
+        if (validatedBaseline === null) {
+          return {
+            kind: "invalid-baseline" as const,
+            allowDecimalQuantity: allowDecimal,
+            unit: locked.unit,
+          };
+        }
+        if (
+          stockRevision !== input.expectedRevision ||
+          !quantitiesEqual(currentQuantity, validatedBaseline)
+        ) {
+          const latestItem = await findItemById(tx, locked.id);
+          return { kind: "stale" as const, item: latestItem! };
+        }
       }
 
-      const balanceAfter = addQuantities(currentQuantity, validatedQuantity);
+      const balanceAfter =
+        deltaMagnitude > 0 ? addQuantities(currentQuantity, deltaMagnitude) : currentQuantity;
 
       const { rows: insertedRows } = await tx.query<{ id: string }>(
         `INSERT INTO inventory_stock_movements (
-           item_id, movement_type, quantity_delta, balance_before, balance_after,
-           unit, effective_date, note, request_key, actor_user_id, recorded_at
+           item_id, movement_type, entry_status, entered_quantity, quantity_delta,
+           balance_before, balance_after, unit, effective_date, note,
+           coverage_mode, covered_quantity, supporting_reconciliation_id, covered_by_opening_count,
+           reviewed_by_user_id, reviewed_at, review_note, request_key, actor_user_id, recorded_at,
+           balance_applied_at
          )
-         VALUES ($1, 'STOCK_RECEIVED', $2, $3, $4, $5, $6::date, $7, $8, $9, $10)
+         VALUES (
+           $1, 'STOCK_RECEIVED', $2, $3, $4,
+           $5, $6, $7, $8::date, $9,
+           $10, $11, $12, $13,
+           $14, $15, $16, $17, $18, $19,
+           $20
+         )
          RETURNING id`,
         [
           locked.id,
+          entryStatus,
           validatedQuantity,
+          deltaMagnitude,
           currentQuantity,
           balanceAfter,
           locked.unit,
           input.effectiveDate,
           input.note,
+          coverageMode,
+          coveredQuantity,
+          supportingReconciliationId,
+          coveredByOpeningCount,
+          reviewed ? input.actorUserId : null,
+          reviewed ? input.recordedAt : null,
+          reviewed ? (input.coverage?.reviewNote ?? null) : null,
           input.requestKey,
           input.actorUserId,
           input.recordedAt,
+          deltaMagnitude > 0 ? input.recordedAt : null,
         ],
       );
       const movementId = insertedRows[0]!.id;
 
       // INV-009: Receiving alone does NOT clear an existing reconciliation flag.
-      await tx.query(
-        `UPDATE inventory_items
-            SET current_quantity = $2,
-                stock_revision = stock_revision + 1
-          WHERE id = $1`,
-        [locked.id, balanceAfter],
-      );
+      if (deltaMagnitude > 0) {
+        await tx.query(
+          `UPDATE inventory_items
+              SET current_quantity = $2,
+                  stock_revision = stock_revision + 1
+            WHERE id = $1`,
+          [locked.id, balanceAfter],
+        );
+      }
 
       const [{ rows: movRows }, updatedItem] = await Promise.all([
         tx.query<StockMovementDbRow>(`${STOCK_MOVEMENT_SELECT} WHERE m.id = $1`, [movementId]),
@@ -1542,7 +2011,9 @@ export const inventoryRepository = {
       expectedCurrentQuantity: number;
       requestKey: string | null;
       actorUserId: string;
+      actorRole: Role;
       recordedAt: Date;
+      coverage?: LateCoverageSelectionInput;
     },
   ): Promise<RecordStockMovementResult> {
     return db.transaction(async (tx) => {
@@ -1591,8 +2062,6 @@ export const inventoryRepository = {
         };
       }
 
-      const quantityDelta = subtractQuantities(0, validatedQuantity);
-
       // Resolve saved same-reference replays for the original actor before late-date or stale-revision checks.
       if (input.requestKey) {
         const { rows: existingRows } = await tx.query<StockMovementDbRow>(
@@ -1601,21 +2070,32 @@ export const inventoryRepository = {
         );
         const existing = existingRows[0];
         if (existing) {
+          const existingEntered =
+            existing.enteredQuantity !== null && existing.enteredQuantity !== undefined
+              ? Number(existing.enteredQuantity)
+              : Math.abs(Number(existing.quantityDelta));
           if (
             existing.itemId !== locked.id ||
             existing.actorUserId !== input.actorUserId ||
             existing.movementType !== "STOCK_USED" ||
-            !quantitiesEqual(Number(existing.quantityDelta), quantityDelta) ||
+            !quantitiesEqual(existingEntered, validatedQuantity) ||
             toOptionalDateString(existing.effectiveDate) !== input.effectiveDate ||
-            (existing.note ?? null) !== input.purpose
+            (existing.note ?? null) !== input.purpose ||
+            !sameOptionalReplayCoverage(existing, input.coverage)
           ) {
             return { kind: "key-conflict" as const };
           }
           const currentItem = await findItemById(tx, locked.id);
+          const itemView =
+            input.actorRole === "OWNER" ? currentItem! : redactItemForEmployee(currentItem!);
+          const movementView =
+            input.actorRole === "OWNER"
+              ? toStockMovementView(existing)
+              : redactMovementForEmployee(toStockMovementView(existing));
           return {
             kind: "replayed" as const,
-            item: currentItem!,
-            movement: toStockMovementView(existing),
+            item: itemView,
+            movement: movementView,
           };
         }
 
@@ -1630,10 +2110,6 @@ export const inventoryRepository = {
         }
       }
 
-      if (input.effectiveDate < input.todayManila) {
-        return { kind: "late-date-not-enabled" as const };
-      }
-
       if (locked.archivedAt !== null) {
         return { kind: "archived" as const };
       }
@@ -1646,71 +2122,172 @@ export const inventoryRepository = {
         return { kind: "not-set" as const };
       }
 
-      const validatedBaseline = parseStoredBalanceBaseline(input.expectedCurrentQuantity, {
-        allowDecimal,
-        allowNegative: true,
-      });
-      if (validatedBaseline === null) {
-        return {
-          kind: "invalid-baseline" as const,
-          allowDecimalQuantity: allowDecimal,
-          unit: locked.unit,
-        };
+      const isLateEntry = input.effectiveDate < input.todayManila;
+      let entryStatus: MovementEntryStatus = "APPLIED";
+      let coverageMode: MovementCoverageMode = "NONE";
+      let coveredQuantity = 0;
+      let supportingReconciliationId: string | null = null;
+      let coveredByOpeningCount = false;
+      let deltaMagnitude = validatedQuantity;
+      let reviewed = false;
+
+      if (!isLateEntry) {
+        const cov = input.coverage;
+        if (
+          (cov?.coverageMode !== undefined && cov.coverageMode !== null && cov.coverageMode !== "NONE") ||
+          (cov?.coveredQuantity !== undefined && cov.coveredQuantity !== null) ||
+          cov?.supportingReconciliationId ||
+          cov?.coveredByOpeningCount ||
+          cov?.reviewNote
+        ) {
+          return {
+            kind: "invalid-coverage" as const,
+            message: "Count-coverage options apply only to late usage dated before today.",
+          };
+        }
+      } else {
+        const counts = await loadApplicableCountsForDate(tx, locked.id, input.effectiveDate);
+        if (input.actorRole === "EMPLOYEE") {
+          const hasCounts =
+            counts.applicableReconciliations.length > 0 || counts.openingCountCoversDate;
+          if (hasCounts) {
+            entryStatus = "PENDING_REVIEW";
+            coverageMode = "UNCLEAR";
+            deltaMagnitude = 0;
+          } else {
+            entryStatus = "APPLIED";
+            coverageMode = "NONE";
+            deltaMagnitude = validatedQuantity;
+          }
+        } else {
+          const coverageOutcome = evaluateOwnerCoverageSelection({
+            enteredQuantity: validatedQuantity,
+            allowDecimal,
+            applicableReconciliations: counts.applicableReconciliations,
+            openingCountCoversDate: counts.openingCountCoversDate,
+            selection: input.coverage ?? {},
+            requireExplicitWhenCountsExist: true,
+          });
+          if (!coverageOutcome.ok) {
+            if (coverageOutcome.kind === "stale-review") {
+              const latestItem = await findItemById(tx, locked.id);
+              return {
+                kind: "stale-review" as const,
+                item: latestItem!,
+                applicableReconciliations: counts.applicableReconciliations,
+                openingCountCoversDate: counts.openingCountCoversDate,
+              };
+            }
+            return {
+              kind: "invalid-coverage" as const,
+              message: coverageOutcome.message,
+            };
+          }
+          entryStatus = coverageOutcome.entryStatus;
+          coverageMode = coverageOutcome.coverageMode;
+          coveredQuantity = coverageOutcome.coveredQuantity;
+          supportingReconciliationId = coverageOutcome.supportingReconciliationId;
+          coveredByOpeningCount = coverageOutcome.coveredByOpeningCount;
+          deltaMagnitude = coverageOutcome.deltaMagnitude;
+          reviewed = coverageOutcome.reviewed;
+        }
       }
 
       const currentQuantity = Number(locked.currentQuantity);
       const stockRevision = Number(locked.stockRevision);
-      if (
-        stockRevision !== input.expectedRevision ||
-        !quantitiesEqual(currentQuantity, validatedBaseline)
-      ) {
-        const latestItem = await findItemById(tx, locked.id);
-        return { kind: "stale" as const, item: latestItem! };
+      if (deltaMagnitude > 0) {
+        const validatedBaseline = parseStoredBalanceBaseline(input.expectedCurrentQuantity, {
+          allowDecimal,
+          allowNegative: true,
+        });
+        if (validatedBaseline === null) {
+          return {
+            kind: "invalid-baseline" as const,
+            allowDecimalQuantity: allowDecimal,
+            unit: locked.unit,
+          };
+        }
+        if (
+          stockRevision !== input.expectedRevision ||
+          !quantitiesEqual(currentQuantity, validatedBaseline)
+        ) {
+          const latestItem = await findItemById(tx, locked.id);
+          return {
+            kind: "stale" as const,
+            item:
+              input.actorRole === "OWNER" ? latestItem! : redactItemForEmployee(latestItem!),
+          };
+        }
       }
 
-      const balanceAfter = subtractQuantities(currentQuantity, validatedQuantity);
-      const nextNeedsReconciliation = Boolean(locked.needsReconciliation) || balanceAfter < 0;
+      const quantityDelta = deltaMagnitude > 0 ? subtractQuantities(0, deltaMagnitude) : 0;
+      const balanceAfter =
+        deltaMagnitude > 0 ? subtractQuantities(currentQuantity, deltaMagnitude) : currentQuantity;
+      const nextNeedsReconciliation =
+        deltaMagnitude > 0 ? Boolean(locked.needsReconciliation) || balanceAfter < 0 : Boolean(locked.needsReconciliation);
 
       const { rows: insertedRows } = await tx.query<{ id: string }>(
         `INSERT INTO inventory_stock_movements (
-           item_id, movement_type, quantity_delta, balance_before, balance_after,
-           unit, effective_date, note, request_key, actor_user_id, recorded_at
+           item_id, movement_type, entry_status, entered_quantity, quantity_delta,
+           balance_before, balance_after, unit, effective_date, note,
+           coverage_mode, covered_quantity, supporting_reconciliation_id, covered_by_opening_count,
+           reviewed_by_user_id, reviewed_at, review_note, request_key, actor_user_id, recorded_at,
+           balance_applied_at
          )
-         VALUES ($1, 'STOCK_USED', $2, $3, $4, $5, $6::date, $7, $8, $9, $10)
+         VALUES (
+           $1, 'STOCK_USED', $2, $3, $4,
+           $5, $6, $7, $8::date, $9,
+           $10, $11, $12, $13,
+           $14, $15, $16, $17, $18, $19,
+           $20
+         )
          RETURNING id`,
         [
           locked.id,
+          entryStatus,
+          validatedQuantity,
           quantityDelta,
           currentQuantity,
           balanceAfter,
           locked.unit,
           input.effectiveDate,
           input.purpose,
+          coverageMode,
+          coveredQuantity,
+          supportingReconciliationId,
+          coveredByOpeningCount,
+          reviewed ? input.actorUserId : null,
+          reviewed ? input.recordedAt : null,
+          reviewed ? (input.coverage?.reviewNote ?? null) : null,
           input.requestKey,
           input.actorUserId,
           input.recordedAt,
+          deltaMagnitude > 0 ? input.recordedAt : null,
         ],
       );
       const movementId = insertedRows[0]!.id;
 
-      await tx.query(
-        `UPDATE inventory_items
-            SET current_quantity = $2,
-                stock_revision = stock_revision + 1,
-                needs_reconciliation = $3
-          WHERE id = $1`,
-        [locked.id, balanceAfter, nextNeedsReconciliation],
-      );
+      if (deltaMagnitude > 0) {
+        await tx.query(
+          `UPDATE inventory_items
+              SET current_quantity = $2,
+                  stock_revision = stock_revision + 1,
+                  needs_reconciliation = $3
+            WHERE id = $1`,
+          [locked.id, balanceAfter, nextNeedsReconciliation],
+        );
+      }
 
       const [{ rows: movRows }, updatedItem] = await Promise.all([
         tx.query<StockMovementDbRow>(`${STOCK_MOVEMENT_SELECT} WHERE m.id = $1`, [movementId]),
         findItemById(tx, locked.id),
       ]);
 
+      const rawView = toStockMovementView(movRows[0]!);
       return {
         kind: "created" as const,
-        item: updatedItem!,
-        movement: toStockMovementView(movRows[0]!),
+        item: input.actorRole === "OWNER" ? updatedItem! : redactItemForEmployee(updatedItem!),
+        movement: input.actorRole === "OWNER" ? rawView : redactMovementForEmployee(rawView),
       };
     });
   },
@@ -1720,6 +2297,7 @@ export const inventoryRepository = {
     input: {
       requestKey: string;
       actorUserId: string;
+      actorRole?: Role;
     },
   ): Promise<
     | { status: "NOT_FOUND" }
@@ -1739,10 +2317,12 @@ export const inventoryRepository = {
       if (!item) {
         return { status: "NOT_FOUND" };
       }
+      const view = toStockMovementView(row);
+      const isOwner = (input.actorRole ?? "OWNER") === "OWNER";
       return {
         status: "SAVED",
-        item,
-        movement: toStockMovementView(row),
+        item: isOwner ? item : redactItemForEmployee(item),
+        movement: isOwner ? view : redactMovementForEmployee(view),
       };
     }
 
@@ -1767,6 +2347,7 @@ export const inventoryRepository = {
       movementType: "STOCK_RECEIVED" | "STOCK_USED";
       requestKey: string;
       actorUserId: string;
+      actorRole?: Role;
       cancelledAt: Date;
     },
   ): Promise<
@@ -1808,10 +2389,12 @@ export const inventoryRepository = {
           return { kind: "key-conflict" as const };
         }
         const currentItem = await findItemById(tx, locked.id);
+        const view = toStockMovementView(existing);
+        const isOwner = (input.actorRole ?? "OWNER") === "OWNER";
         return {
           kind: "already-saved" as const,
-          item: currentItem!,
-          movement: toStockMovementView(existing),
+          item: isOwner ? currentItem! : redactItemForEmployee(currentItem!),
+          movement: isOwner ? view : redactMovementForEmployee(view),
         };
       }
 
@@ -1854,10 +2437,23 @@ export const inventoryRepository = {
   async listReconciliations(
     db: Queryable,
     target: OpeningStockTarget,
-  ): Promise<{ found: boolean; reconciliations: StockReconciliationView[] }> {
+    options: { sinceDate?: string } = {},
+  ): Promise<{
+    found: boolean;
+    reconciliations: StockReconciliationView[];
+    openingCountCoversDate: boolean;
+  }> {
     const item = await findItemByTarget(db, target);
     if (!item) {
-      return { found: false, reconciliations: [] };
+      return { found: false, reconciliations: [], openingCountCoversDate: false };
+    }
+    if (options.sinceDate) {
+      const counts = await loadApplicableCountsForDate(db, item.id, options.sinceDate);
+      return {
+        found: true,
+        reconciliations: counts.applicableReconciliations,
+        openingCountCoversDate: counts.openingCountCoversDate,
+      };
     }
     const { rows } = await db.query<ReconciliationDbRow>(
       `${RECONCILIATION_SELECT}
@@ -1868,6 +2464,352 @@ export const inventoryRepository = {
     return {
       found: true,
       reconciliations: rows.map(toReconciliationView),
+      openingCountCoversDate: false,
+    };
+  },
+
+  async countPendingMovementReviews(db: Queryable): Promise<number> {
+    const { rows } = await db.query<{ count: string }>(
+      `SELECT COUNT(*)::text AS count
+         FROM inventory_stock_movements
+        WHERE entry_status = 'PENDING_REVIEW'`,
+    );
+    return Number(rows[0]?.count ?? 0);
+  },
+
+  async listPendingMovementReviews(db: Queryable): Promise<PendingMovementReviewView[]> {
+    const { rows } = await db.query<StockMovementDbRow>(
+      `${STOCK_MOVEMENT_SELECT}
+        WHERE m.entry_status = 'PENDING_REVIEW'
+        ORDER BY m.recorded_at ASC, m.id ASC`,
+    );
+    if (rows.length === 0) {
+      return [];
+    }
+
+    const itemIds = [...new Set(rows.map((r) => r.itemId))];
+    const { rows: itemRows } = await db.query<InventoryItemDbRow>(
+      `${ITEM_SELECT} WHERE i.id = ANY($1::uuid[])`,
+      [itemIds],
+    );
+    const [holdsByItem, saleReviewsByItem] = await Promise.all([
+      loadActiveHoldsByItemIds(db, itemIds),
+      loadPendingSaleActionReviewsByItemIds(db, itemRows),
+    ]);
+    const itemMap = new Map<string, InventoryItemView>();
+    for (const row of itemRows) {
+      itemMap.set(
+        row.id,
+        toInventoryItemView(row, holdsByItem.get(row.id) ?? [], saleReviewsByItem.get(row.id) ?? []),
+      );
+    }
+
+    const reviews: PendingMovementReviewView[] = [];
+    for (const row of rows) {
+      const item = itemMap.get(row.itemId);
+      if (!item) continue;
+      const view = toStockMovementView(row);
+      const sinceDate = view.effectiveDate ?? formatManilaDate(toDate(row.recordedAt));
+      const counts = await loadApplicableCountsForDate(db, row.itemId, sinceDate);
+      reviews.push({
+        entry: view,
+        item,
+        applicableReconciliations: counts.applicableReconciliations,
+        openingCountCoversDate: counts.openingCountCoversDate,
+      });
+    }
+    return reviews;
+  },
+
+  async resolvePendingMovementReview(
+    db: Database,
+    input: {
+      entryId: string;
+      expectedRevision: number;
+      expectedCurrentQuantity: number;
+      requestKey: string | null;
+      reviewerUserId: string;
+      reviewedAt: Date;
+      coverage: LateCoverageSelectionInput;
+    },
+  ): Promise<ResolvePendingReviewResult> {
+    return db.transaction(async (tx) => {
+      if (input.requestKey) {
+        const { rows: replayRows } = await tx.query<StockMovementDbRow>(
+          `${STOCK_MOVEMENT_SELECT} WHERE m.review_request_key = $1`,
+          [input.requestKey],
+        );
+        const replayed = replayRows[0];
+        if (replayed) {
+          if (replayed.id !== input.entryId) {
+            return { kind: "key-conflict" as const };
+          }
+          const currentItem = await findItemById(tx, replayed.itemId);
+          return {
+            kind: "replayed" as const,
+            item: currentItem!,
+            movement: toStockMovementView(replayed),
+          };
+        }
+      }
+
+      const { rows: entrySeedRows } = await tx.query<{ itemId: string }>(
+        `SELECT item_id AS "itemId" FROM inventory_stock_movements WHERE id = $1`,
+        [input.entryId],
+      );
+      if (!entrySeedRows[0]) {
+        return { kind: "not-found" as const };
+      }
+
+      const { rows: lockedItemRows } = await tx.query<LockedItemRow>(
+        `SELECT id,
+                code,
+                name,
+                category,
+                container_shape AS "containerShape",
+                unit,
+                allow_decimal_quantity AS "allowDecimalQuantity",
+                needs_reconciliation AS "needsReconciliation",
+                current_quantity AS "currentQuantity",
+                stock_revision AS "stockRevision",
+                archived_at AS "archivedAt"
+           FROM inventory_items
+          WHERE id = $1
+          FOR UPDATE`,
+        [entrySeedRows[0].itemId],
+      );
+      const locked = lockedItemRows[0];
+      if (!locked || locked.currentQuantity === null) {
+        return { kind: "not-found" as const };
+      }
+
+      const { rows: lockedMovRows } = await tx.query<StockMovementDbRow>(
+        `${STOCK_MOVEMENT_SELECT} WHERE m.id = $1 FOR UPDATE OF m`,
+        [input.entryId],
+      );
+      const existing = lockedMovRows[0];
+      if (!existing) {
+        return { kind: "not-found" as const };
+      }
+
+      if (existing.entryStatus !== "PENDING_REVIEW") {
+        const currentItem = await findItemById(tx, locked.id);
+        return {
+          kind: "already-resolved" as const,
+          item: currentItem!,
+          movement: toStockMovementView(existing),
+        };
+      }
+
+      if (
+        existing.movementType !== "STOCK_RECEIVED" &&
+        existing.movementType !== "STOCK_USED"
+      ) {
+        return { kind: "not-found" as const };
+      }
+
+      const allowDecimal = Boolean(locked.allowDecimalQuantity);
+      const enteredQuantity =
+        existing.enteredQuantity !== null && existing.enteredQuantity !== undefined
+          ? Number(existing.enteredQuantity)
+          : Math.abs(Number(existing.quantityDelta));
+      const sinceDate =
+        toOptionalDateString(existing.effectiveDate) ??
+        formatManilaDate(toDate(existing.recordedAt));
+      const counts = await loadApplicableCountsForDate(tx, locked.id, sinceDate);
+
+      const mode = input.coverage.coverageMode;
+      if (mode !== "NONE" && mode !== "FULL" && mode !== "PARTIAL") {
+        return {
+          kind: "invalid-coverage" as const,
+          message: "Choose No Coverage, Full Coverage, or Partial Coverage to resolve a pending review.",
+        };
+      }
+
+      const coverageOutcome = evaluateOwnerCoverageSelection({
+        enteredQuantity,
+        allowDecimal,
+        applicableReconciliations: counts.applicableReconciliations,
+        openingCountCoversDate: counts.openingCountCoversDate,
+        selection: { ...input.coverage, coverageMode: mode },
+        requireExplicitWhenCountsExist: true,
+      });
+      if (!coverageOutcome.ok) {
+        if (coverageOutcome.kind === "stale-review") {
+          const latestItem = await findItemById(tx, locked.id);
+          return {
+            kind: "stale-review" as const,
+            item: latestItem!,
+            entry: toStockMovementView(existing),
+            applicableReconciliations: counts.applicableReconciliations,
+            openingCountCoversDate: counts.openingCountCoversDate,
+          };
+        }
+        return {
+          kind: "invalid-coverage" as const,
+          message: coverageOutcome.message,
+        };
+      }
+
+      const currentQuantity = Number(locked.currentQuantity);
+      const stockRevision = Number(locked.stockRevision);
+      if (coverageOutcome.deltaMagnitude > 0) {
+        const validatedBaseline = parseStoredBalanceBaseline(input.expectedCurrentQuantity, {
+          allowDecimal,
+          allowNegative: locked.category === "OPERATING_SUPPLY",
+        });
+        if (validatedBaseline === null) {
+          return {
+            kind: "invalid-baseline" as const,
+            allowDecimalQuantity: allowDecimal,
+            unit: locked.unit,
+          };
+        }
+        if (
+          stockRevision !== input.expectedRevision ||
+          !quantitiesEqual(currentQuantity, validatedBaseline)
+        ) {
+          const latestItem = await findItemById(tx, locked.id);
+          return {
+            kind: "stale" as const,
+            item: latestItem!,
+            entry: toStockMovementView(existing),
+            applicableReconciliations: counts.applicableReconciliations,
+            openingCountCoversDate: counts.openingCountCoversDate,
+          };
+        }
+      }
+
+      const deltaMagnitude = coverageOutcome.deltaMagnitude;
+      const signedDelta =
+        deltaMagnitude === 0
+          ? 0
+          : existing.movementType === "STOCK_RECEIVED"
+            ? deltaMagnitude
+            : subtractQuantities(0, deltaMagnitude);
+      const balanceAfter =
+        signedDelta === 0
+          ? currentQuantity
+          : existing.movementType === "STOCK_RECEIVED"
+            ? addQuantities(currentQuantity, deltaMagnitude)
+            : subtractQuantities(currentQuantity, deltaMagnitude);
+
+      await tx.query(
+        `UPDATE inventory_stock_movements
+            SET entry_status = 'APPLIED',
+                coverage_mode = $2,
+                covered_quantity = $3,
+                quantity_delta = $4,
+                balance_before = $5,
+                balance_after = $6,
+                supporting_reconciliation_id = $7,
+                covered_by_opening_count = $8,
+                reviewed_by_user_id = $9,
+                reviewed_at = $10,
+                review_note = $11,
+                review_request_key = $12,
+                balance_applied_at = $13
+          WHERE id = $1`,
+        [
+          existing.id,
+          coverageOutcome.coverageMode,
+          coverageOutcome.coveredQuantity,
+          signedDelta,
+          currentQuantity,
+          balanceAfter,
+          coverageOutcome.supportingReconciliationId,
+          coverageOutcome.coveredByOpeningCount,
+          input.reviewerUserId,
+          input.reviewedAt,
+          input.coverage.reviewNote ?? null,
+          input.requestKey,
+          signedDelta !== 0 ? input.reviewedAt : null,
+        ],
+      );
+
+      if (signedDelta !== 0) {
+        const nextNeedsReconciliation =
+          existing.movementType === "STOCK_USED"
+            ? Boolean(locked.needsReconciliation) || balanceAfter < 0
+            : Boolean(locked.needsReconciliation);
+        await tx.query(
+          `UPDATE inventory_items
+              SET current_quantity = $2,
+                  stock_revision = stock_revision + 1,
+                  needs_reconciliation = $3
+            WHERE id = $1`,
+          [locked.id, balanceAfter, nextNeedsReconciliation],
+        );
+      }
+
+      const [{ rows: updatedMovRows }, updatedItem] = await Promise.all([
+        tx.query<StockMovementDbRow>(`${STOCK_MOVEMENT_SELECT} WHERE m.id = $1`, [existing.id]),
+        findItemById(tx, locked.id),
+      ]);
+
+      return {
+        kind: "resolved" as const,
+        item: updatedItem!,
+        movement: toStockMovementView(updatedMovRows[0]!),
+      };
+    });
+  },
+
+  async listItemHistory(
+    db: Queryable,
+    input: {
+      target: OpeningStockTarget;
+      role: Role;
+      actorUserId: string;
+    },
+  ): Promise<InventoryItemHistoryView | null> {
+    const item = await findItemByTarget(db, input.target);
+    if (!item) {
+      return null;
+    }
+
+    if (input.role === "EMPLOYEE") {
+      if (item.archivedAt !== null) {
+        return null;
+      }
+      const { rows: movRows } = await db.query<StockMovementDbRow>(
+        `${STOCK_MOVEMENT_SELECT}
+          WHERE m.item_id = $1
+            AND m.actor_user_id = $2
+            AND m.movement_type = 'STOCK_USED'
+          ORDER BY m.recorded_at DESC, m.id DESC`,
+        [item.id, input.actorUserId],
+      );
+      return {
+        scope: "OWN_USAGE",
+        item: redactItemForEmployee(item),
+        openingStock: null,
+        movements: movRows.map((row) => redactMovementForEmployee(toStockMovementView(row))),
+        reconciliations: [],
+      };
+    }
+
+    const [{ rows: movRows }, { rows: recRows }] = await Promise.all([
+      db.query<StockMovementDbRow>(
+        `${STOCK_MOVEMENT_SELECT}
+          WHERE m.item_id = $1
+          ORDER BY m.recorded_at DESC, m.id DESC`,
+        [item.id],
+      ),
+      db.query<ReconciliationDbRow>(
+        `${RECONCILIATION_SELECT}
+          WHERE r.item_id = $1
+          ORDER BY r.recorded_at DESC, r.id DESC`,
+        [item.id],
+      ),
+    ]);
+
+    return {
+      scope: "FULL",
+      item,
+      openingStock: item.openingStock,
+      movements: movRows.map(toStockMovementView),
+      reconciliations: recRows.map(toReconciliationView),
     };
   },
 };

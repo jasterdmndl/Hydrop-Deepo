@@ -213,6 +213,9 @@ describe("Inventory Round/Slim opening stock and merchandise products (DEC-065, 
       canRecordReceiving: true,
       canRecordUsage: true,
       canReconcile: true,
+      canViewFullHistory: true,
+      canViewOwnUsageHistory: true,
+      canReviewPendingEntries: true,
     });
     expect(ownerRes.body.items).toHaveLength(2);
     expect(ownerRes.body.items[0]).toMatchObject({
@@ -247,6 +250,9 @@ describe("Inventory Round/Slim opening stock and merchandise products (DEC-065, 
       canRecordReceiving: false,
       canRecordUsage: true,
       canReconcile: false,
+      canViewFullHistory: false,
+      canViewOwnUsageHistory: true,
+      canReviewPendingEntries: false,
     });
     expect(cashierRes.body.items).toEqual(ownerRes.body.items);
 
@@ -906,9 +912,15 @@ describe("Inventory Round/Slim opening stock and merchandise products (DEC-065, 
     expect(verifyRec.status).toBe(201);
     expect(verifyRec.body.reconciliation.quantityDelta).toBe(0);
 
-    const recHistory = await request(ctx.app)
+    const empRecHistory = await request(ctx.app)
       .get(`/api/inventory/items/${encodeURIComponent(faucetId)}/reconciliations`)
       .set("Cookie", cashier.cookie);
+    expect(empRecHistory.status).toBe(403);
+    expect(empRecHistory.body.error.code).toBe("FORBIDDEN");
+
+    const recHistory = await request(ctx.app)
+      .get(`/api/inventory/items/${encodeURIComponent(faucetId)}/reconciliations`)
+      .set("Cookie", owner.cookie);
     expect(recHistory.status).toBe(200);
     expect(recHistory.body.reconciliations).toHaveLength(2);
 
@@ -1359,11 +1371,12 @@ describe("Final Inventory Task 1 — operating supplies, receiving, usage, and D
         [roundId, merchId, saleId, empId],
       );
 
-      // Apply migrations 0021 and 0022 onto the populated database.
+      // Apply migrations 0021 through 0023 onto the populated database.
       const newlyApplied = await runMigrations(db, MIGRATIONS_DIR);
       expect(newlyApplied).toEqual([
         "0021_inventory_supplies_and_movements.sql",
         "0022_inventory_movement_request_tombstones.sql",
+        "0023_inventory_late_entries_and_reviews.sql",
       ]);
 
       const afterItems = await request(app).get("/api/inventory/items").set("Cookie", empAcct.cookie);
@@ -1525,16 +1538,16 @@ describe("Final Inventory Task 1 — operating supplies, receiving, usage, and D
       openingStock: { quantity: 1.25, unit: "L" },
     });
 
-    // Late/future effectiveDate is blocked in Task 1 until Task 2 adds count-coverage review.
+    // Future effectiveDate is rejected (400), and Owner late entry without coverage when opening count covers the date is rejected (400).
     expect(
       (
         await postUsage(ctx, employee, liquidId, {
           quantity: 0.25,
-          purpose: "Yesterday wash",
-          effectiveDate: "2026-11-26",
+          purpose: "Future wash",
+          effectiveDate: "2026-11-28",
           expectedRevision: liquidRev,
           expectedCurrentQuantity: 1.25,
-          requestKey: "late-use-guard",
+          requestKey: "future-use-guard",
         })
       ).status,
     ).toBe(400);
@@ -1955,7 +1968,8 @@ describe("Final Inventory Task 1 — operating supplies, receiving, usage, and D
     expect(unsavedStatus.status).toBe(200);
     expect(unsavedStatus.body).toEqual({ status: "NOT_FOUND" });
 
-    // New backdated entries on 2026-11-28 with effectiveDate 2026-11-27 are still rejected (400).
+    // On 2026-11-28, new backdated Employee usage when opening count on 2026-11-27 covers the date saves as PENDING_REVIEW (zero stock effect),
+    // and Owner late receiving without explicit coverage confirmation is rejected (400).
     const newBackdatedUse = await postUsage(ctx, lateEmployee, supplyId, {
       quantity: 1,
       purpose: "New backdated attempt",
@@ -1964,7 +1978,14 @@ describe("Final Inventory Task 1 — operating supplies, receiving, usage, and D
       expectedCurrentQuantity: 11,
       requestKey: "fresh-backdated-use",
     });
-    expect(newBackdatedUse.status).toBe(400);
+    expect(newBackdatedUse.status).toBe(201);
+    expect(newBackdatedUse.body.movement).toMatchObject({
+      entryStatus: "PENDING_REVIEW",
+      quantity: 1,
+      quantityDelta: 0,
+      effectiveDate: "2026-11-27",
+    });
+    expect(newBackdatedUse.body.item.currentQuantity).toBe(11);
 
     const newBackdatedRecv = await postReceiving(ctx, lateOwner, supplyId, {
       quantity: 1,
@@ -2564,5 +2585,493 @@ describe("Final Inventory Task 1 — operating supplies, receiving, usage, and D
       .send({ itemKey: supplyId, movementType: "STOCK_USED" });
     expect(wrongTypeOwnerConflict.status).toBe(409);
     expect(wrongTypeOwnerConflict.body.error.code).toBe("REQUEST_KEY_CONFLICT");
+  });
+});
+
+describe("Final Inventory Task 2 — late-entry review and role-scoped history (INV-023..030, INV-040, INV-041)", () => {
+  let ctx: TestContext;
+  let owner: Activated;
+  let employee: Activated;
+
+  beforeEach(async () => {
+    ctx = await createTestContext({ clock: new ManualClock("2026-11-23T09:00:00+08:00") });
+    owner = await activatedAccount(ctx, "owner1", "OWNER");
+    employee = await activatedAccount(ctx, "emp1", "EMPLOYEE");
+  });
+
+  afterEach(async () => {
+    await ctx.close();
+  });
+
+  it("handles partial/full/unclear late receipts, pending review resolution, stale count recheck, and Dashboard Trend consistency", async () => {
+    // 2026-11-24: Create supply and open count at 10 L.
+    const supplyRes = await postProduct(ctx, owner, {
+      category: "OPERATING_SUPPLY",
+      name: "Sanitizing Liquid",
+      unit: "L",
+      allowDecimalQuantity: true,
+      unitConfirmed: true,
+    });
+    expect(supplyRes.status).toBe(201);
+    const supplyId = supplyRes.body.item.id as string;
+
+    const openRes = await postOpeningStock(ctx, owner, supplyId, { quantity: 10 });
+    expect(openRes.status).toBe(201);
+
+    // 2026-11-25: Physical count reconciliation sets balance to 9 L (r1).
+    ctx.clock.set("2026-11-25T10:00:00+08:00");
+    const ownerDay2 = await signIn(ctx.app, "owner1", owner.password);
+    const rec1 = await postReconciliation(ctx, ownerDay2, supplyId, {
+      physicalCount: 9,
+      reason: "Tuesday physical shelf count",
+      expectedRevision: openRes.body.item.stockRevision,
+      expectedCurrentQuantity: 10,
+      requestKey: "t2-rec-1",
+    });
+    expect(rec1.status).toBe(201);
+    const rec1Id = rec1.body.reconciliation.id as string;
+
+    // 2026-11-27: Owner saves a late receipt of 5 L for 2026-11-24 with 2 L covered by r1 -> adds 3 L (9 -> 12 L).
+    ctx.clock.set("2026-11-27T11:00:00+08:00");
+    const ownerDay4 = await signIn(ctx.app, "owner1", owner.password);
+    const empDay4 = await signIn(ctx.app, "emp1", employee.password);
+
+    const partialRecv = await postReceiving(ctx, ownerDay4, supplyId, {
+      quantity: 5,
+      effectiveDate: "2026-11-24",
+      note: "Sunday partial covered delivery",
+      coverageMode: "PARTIAL",
+      coveredQuantity: 2,
+      supportingReconciliationId: rec1Id,
+      reviewNote: "Tuesday count included 2 L",
+      expectedLatestReconciliationId: rec1Id,
+      expectedOpeningCountCoversDate: false,
+      expectedRevision: rec1.body.item.stockRevision,
+      expectedCurrentQuantity: 9,
+      requestKey: "t2-partial-recv-1",
+    });
+    expect(partialRecv.status).toBe(201);
+    expect(partialRecv.body.item.currentQuantity).toBe(12);
+    expect(partialRecv.body.movement).toMatchObject({
+      entryStatus: "APPLIED",
+      quantity: 5,
+      enteredQuantity: 5,
+      appliedQuantity: 3,
+      quantityDelta: 3,
+      coveredQuantity: 2,
+      coverageMode: "PARTIAL",
+      effectiveDate: "2026-11-24",
+      recordedBy: "owner1",
+      reviewedBy: "owner1",
+      reviewNote: "Tuesday count included 2 L",
+      supportingReconciliationId: rec1Id,
+    });
+    expect(partialRecv.body.movement.supportingReconciliation).toMatchObject({
+      id: rec1Id,
+      physicalCount: 9,
+      reason: "Tuesday physical shelf count",
+    });
+
+    // Late receipt of 4 L fully covered by r1 saves history with zero stock effect (balance stays 12 L).
+    const fullRecv = await postReceiving(ctx, ownerDay4, supplyId, {
+      quantity: 4,
+      effectiveDate: "2026-11-24",
+      note: "Fully counted batch",
+      coverageMode: "FULL",
+      supportingReconciliationId: rec1Id,
+      expectedLatestReconciliationId: rec1Id,
+      expectedOpeningCountCoversDate: false,
+      expectedRevision: partialRecv.body.item.stockRevision,
+      expectedCurrentQuantity: 12,
+      requestKey: "t2-full-recv-1",
+    });
+    expect(fullRecv.status).toBe(201);
+    expect(fullRecv.body.item.currentQuantity).toBe(12);
+    expect(fullRecv.body.movement).toMatchObject({
+      entryStatus: "APPLIED",
+      coverageMode: "FULL",
+      quantity: 4,
+      enteredQuantity: 4,
+      coveredQuantity: 4,
+      quantityDelta: 0,
+      balanceBefore: 12,
+      balanceAfter: 12,
+    });
+
+    // Owner submits an unclear late receipt of 2 L -> stays PENDING_REVIEW with zero stock effect.
+    const unclearRecv = await postReceiving(ctx, ownerDay4, supplyId, {
+      quantity: 2,
+      effectiveDate: "2026-11-24",
+      note: "Unclear coverage delivery",
+      coverageMode: "UNCLEAR",
+      expectedLatestReconciliationId: rec1Id,
+      expectedOpeningCountCoversDate: false,
+      expectedRevision: fullRecv.body.item.stockRevision,
+      expectedCurrentQuantity: 12,
+      requestKey: "t2-unclear-recv-1",
+    });
+    expect(unclearRecv.status).toBe(201);
+    expect(unclearRecv.body.item.currentQuantity).toBe(12);
+    expect(unclearRecv.body.movement).toMatchObject({
+      entryStatus: "PENDING_REVIEW",
+      coverageMode: "UNCLEAR",
+      quantity: 2,
+      quantityDelta: 0,
+    });
+
+    // Employee records 3 L used on 2026-11-24 -> automatically PENDING_REVIEW (because r1 on 2026-11-25 exists), zero stock effect, and no reconciliation leak.
+    const empLateUsePending = await postUsage(ctx, empDay4, supplyId, {
+      quantity: 3,
+      purpose: "Sunday bottle wash",
+      effectiveDate: "2026-11-24",
+      expectedRevision: unclearRecv.body.item.stockRevision,
+      expectedCurrentQuantity: 12,
+      requestKey: "t2-emp-late-use-1",
+    });
+    expect(empLateUsePending.status).toBe(201);
+    expect(empLateUsePending.body.item.currentQuantity).toBe(12);
+    expect(empLateUsePending.body.item.latestReconciliation).toBeNull();
+    expect(empLateUsePending.body.movement).toMatchObject({
+      entryStatus: "PENDING_REVIEW",
+      coverageMode: "UNCLEAR",
+      quantity: 3,
+      quantityDelta: 0,
+      effectiveDate: "2026-11-24",
+      supportingReconciliationId: null,
+      supportingReconciliation: null,
+    });
+    const pendingUseId = empLateUsePending.body.movement.id as string;
+    const originalRecordedAt = empLateUsePending.body.movement.recordedAt as string;
+
+    // Dashboard Trend shows ONLY opening (10), r1 (9), and partial +3 (12) — zero points for FULL or PENDING_REVIEW.
+    const trendBeforeResolve = await request(ctx.app)
+      .get(`/api/dashboard/stocks/${encodeURIComponent(supplyId)}/trend`)
+      .set("Cookie", ownerDay4.cookie);
+    expect(trendBeforeResolve.status).toBe(200);
+    expect(trendBeforeResolve.body.historyState).toBe("COMPLETE");
+    expect(
+      trendBeforeResolve.body.points.map((p: any) => ({
+        movementType: p.movementType,
+        quantityDelta: p.quantityDelta,
+        balanceAfter: p.balanceAfter,
+      })),
+    ).toEqual([
+      { movementType: "OPENING_COUNT", quantityDelta: 0, balanceAfter: 10 },
+      { movementType: "PHYSICAL_COUNT_RECONCILIATION", quantityDelta: -1, balanceAfter: 9 },
+      { movementType: "STOCK_RECEIVED", quantityDelta: 3, balanceAfter: 12 },
+    ]);
+
+    // Owner records a fresh count (r2 = 13 L) BEFORE resolving empLateUsePending -> resolving with stale expectedLatestReconciliationId = rec1Id returns 409 STALE_REVIEW_CONTEXT.
+    ctx.clock.set("2026-11-27T11:05:00+08:00");
+    const rec2 = await postReconciliation(ctx, ownerDay4, supplyId, {
+      physicalCount: 13,
+      reason: "Recount before pending review",
+      expectedRevision: empLateUsePending.body.item.stockRevision,
+      expectedCurrentQuantity: 12,
+      requestKey: "t2-rec-2",
+    });
+    expect(rec2.status).toBe(201);
+    const rec2Id = rec2.body.reconciliation.id as string;
+
+    const staleResolve = await request(ctx.app)
+      .post(`/api/inventory/pending-reviews/${encodeURIComponent(pendingUseId)}/resolve`)
+      .set("Cookie", ownerDay4.cookie)
+      .set("X-CSRF-Token", ownerDay4.csrfToken)
+      .send({
+        coverageMode: "PARTIAL",
+        coveredQuantity: 2,
+        supportingReconciliationId: rec1Id,
+        expectedLatestReconciliationId: rec1Id,
+        expectedOpeningCountCoversDate: false,
+        expectedRevision: empLateUsePending.body.item.stockRevision,
+        expectedCurrentQuantity: 12,
+        requestKey: "t2-resolve-use-1",
+      });
+    expect(staleResolve.status).toBe(409);
+    expect(staleResolve.body.error.code).toBe("STALE_REVIEW_CONTEXT");
+    expect(staleResolve.body.item.currentQuantity).toBe(13);
+    expect(staleResolve.body.applicableReconciliations.map((r: any) => r.id)).toEqual([rec2Id, rec1Id]);
+
+    // Resolving against refreshed context (rec2Id, 13 L) applies -1 (3 - 2 covered) once, preserving original entry id, actor, and recordedAt.
+    ctx.clock.set("2026-11-27T11:10:00+08:00");
+    const resolvedUse = await request(ctx.app)
+      .post(`/api/inventory/pending-reviews/${encodeURIComponent(pendingUseId)}/resolve`)
+      .set("Cookie", ownerDay4.cookie)
+      .set("X-CSRF-Token", ownerDay4.csrfToken)
+      .send({
+        coverageMode: "PARTIAL",
+        coveredQuantity: 2,
+        supportingReconciliationId: rec2Id,
+        reviewNote: "Recount covered 2 L",
+        expectedLatestReconciliationId: rec2Id,
+        expectedOpeningCountCoversDate: false,
+        expectedRevision: rec2.body.item.stockRevision,
+        expectedCurrentQuantity: 13,
+        requestKey: "t2-resolve-use-1",
+      });
+    expect(resolvedUse.status).toBe(200);
+    expect(resolvedUse.body.replayed).toBe(false);
+    expect(resolvedUse.body.item.currentQuantity).toBe(12);
+    expect(resolvedUse.body.movement).toMatchObject({
+      id: pendingUseId,
+      entryStatus: "APPLIED",
+      coverageMode: "PARTIAL",
+      quantity: 3,
+      enteredQuantity: 3,
+      coveredQuantity: 2,
+      appliedQuantity: 1,
+      quantityDelta: -1,
+      balanceBefore: 13,
+      balanceAfter: 12,
+      effectiveDate: "2026-11-24",
+      recordedBy: "emp1",
+      recordedAt: originalRecordedAt,
+      reviewedBy: "owner1",
+      supportingReconciliationId: rec2Id,
+      reviewNote: "Recount covered 2 L",
+    });
+
+    // Idempotent retry of the review requestKey returns 200 replayed: true; a new key fails with 409 MOVEMENT_ALREADY_RESOLVED.
+    const replayResolve = await request(ctx.app)
+      .post(`/api/inventory/pending-reviews/${encodeURIComponent(pendingUseId)}/resolve`)
+      .set("Cookie", ownerDay4.cookie)
+      .set("X-CSRF-Token", ownerDay4.csrfToken)
+      .send({
+        coverageMode: "PARTIAL",
+        coveredQuantity: 2,
+        supportingReconciliationId: rec2Id,
+        expectedLatestReconciliationId: rec2Id,
+        expectedOpeningCountCoversDate: false,
+        expectedRevision: rec2.body.item.stockRevision,
+        expectedCurrentQuantity: 13,
+        requestKey: "t2-resolve-use-1",
+      });
+    expect(replayResolve.status).toBe(200);
+    expect(replayResolve.body.replayed).toBe(true);
+    expect(replayResolve.body.item.currentQuantity).toBe(12);
+
+    const alreadyResolved = await request(ctx.app)
+      .post(`/api/inventory/pending-reviews/${encodeURIComponent(pendingUseId)}/resolve`)
+      .set("Cookie", ownerDay4.cookie)
+      .set("X-CSRF-Token", ownerDay4.csrfToken)
+      .send({
+        coverageMode: "FULL",
+        supportingReconciliationId: rec2Id,
+        expectedLatestReconciliationId: rec2Id,
+        expectedOpeningCountCoversDate: false,
+        expectedRevision: resolvedUse.body.item.stockRevision,
+        expectedCurrentQuantity: 12,
+        requestKey: "t2-resolve-use-2",
+      });
+    expect(alreadyResolved.status).toBe(409);
+    expect(alreadyResolved.body.error.code).toBe("MOVEMENT_ALREADY_RESOLVED");
+
+    // Owner full-coverage resolution on unclearRecv leaves balance at 12 and adds zero Trend points.
+    const unclearRecvId = unclearRecv.body.movement.id as string;
+    const resolveFullRecv = await request(ctx.app)
+      .post(`/api/inventory/pending-reviews/${encodeURIComponent(unclearRecvId)}/resolve`)
+      .set("Cookie", ownerDay4.cookie)
+      .set("X-CSRF-Token", ownerDay4.csrfToken)
+      .send({
+        coverageMode: "FULL",
+        supportingReconciliationId: rec2Id,
+        expectedLatestReconciliationId: rec2Id,
+        expectedOpeningCountCoversDate: false,
+        expectedRevision: resolvedUse.body.item.stockRevision,
+        expectedCurrentQuantity: 12,
+        requestKey: "t2-resolve-full-recv",
+      });
+    expect(resolveFullRecv.status).toBe(200);
+    expect(resolveFullRecv.body.item.currentQuantity).toBe(12);
+    expect(resolveFullRecv.body.movement).toMatchObject({
+      entryStatus: "APPLIED",
+      coverageMode: "FULL",
+      quantityDelta: 0,
+      coveredQuantity: 2,
+    });
+
+    // Dashboard Trend now cleanly plots: opening (10) -> r1 (9) -> partial recv (12) -> r2 (13) -> resolved use (12), ignoring fullRecv & resolveFullRecv!
+    const trendAfterResolve = await request(ctx.app)
+      .get(`/api/dashboard/stocks/${encodeURIComponent(supplyId)}/trend`)
+      .set("Cookie", ownerDay4.cookie);
+    expect(trendAfterResolve.status).toBe(200);
+    expect(trendAfterResolve.body.historyState).toBe("COMPLETE");
+    expect(trendAfterResolve.body.points.map((p: any) => p.balanceAfter)).toEqual([10, 9, 12, 13, 12]);
+  });
+
+  it("enforces role-scoped history and blocks Employee from full history, reconciliations, and pending reviews (INV-040, INV-041)", async () => {
+    const supplyRes = await postProduct(ctx, owner, {
+      category: "OPERATING_SUPPLY",
+      name: "Salt",
+      unit: "kg",
+      allowDecimalQuantity: true,
+      unitConfirmed: true,
+    });
+    const supplyId = supplyRes.body.item.id as string;
+
+    const archivedSupplyRes = await postProduct(ctx, owner, {
+      category: "OPERATING_SUPPLY",
+      name: "Old Filter",
+      unit: "pcs",
+      allowDecimalQuantity: false,
+      unitConfirmed: true,
+    });
+    const archivedSupplyId = archivedSupplyRes.body.item.id as string;
+    await archiveProduct(ctx, owner, archivedSupplyId);
+
+    const openRes = await postOpeningStock(ctx, owner, supplyId, { quantity: 20 });
+    expect(openRes.status).toBe(201);
+
+    // Next day: Owner records receiving + usage; Employee records late usage after no intervening reconciliation.
+    ctx.clock.set("2026-11-25T10:00:00+08:00");
+    const ownerDay2 = await signIn(ctx.app, "owner1", owner.password);
+
+    const ownerRecv = await postReceiving(ctx, ownerDay2, supplyId, {
+      quantity: 5,
+      note: "Restock bags",
+      expectedRevision: openRes.body.item.stockRevision,
+      expectedCurrentQuantity: 20,
+      requestKey: "rbac-owner-recv",
+    });
+    const ownerUse = await postUsage(ctx, ownerDay2, supplyId, {
+      quantity: 2,
+      purpose: "Owner brine test",
+      expectedRevision: ownerRecv.body.item.stockRevision,
+      expectedCurrentQuantity: 25,
+      requestKey: "rbac-owner-use",
+    });
+    // Employee records late usage on 2026-11-25 after opening on 2026-11-24 with NO intervening reconciliation -> applies immediately!
+    ctx.clock.set("2026-11-26T10:00:00+08:00");
+    const empDay3 = await signIn(ctx.app, "emp1", employee.password);
+    const empLateUseNoCount = await postUsage(ctx, empDay3, supplyId, {
+      quantity: 1.5,
+      purpose: "Backwash brine",
+      effectiveDate: "2026-11-25",
+      expectedRevision: ownerUse.body.item.stockRevision,
+      expectedCurrentQuantity: 23,
+      requestKey: "rbac-emp-use-late",
+    });
+    expect(empLateUseNoCount.status).toBe(201);
+    expect(empLateUseNoCount.body.item.currentQuantity).toBe(21.5);
+    expect(empLateUseNoCount.body.movement).toMatchObject({
+      entryStatus: "APPLIED",
+      coverageMode: "NONE",
+      quantity: 1.5,
+      quantityDelta: -1.5,
+      effectiveDate: "2026-11-25",
+    });
+
+    // Reconcile once as Owner, then submit an unclear pending entry so Owner's review queue is non-empty.
+    const ownerDay3 = await signIn(ctx.app, "owner1", owner.password);
+    const recRes = await postReconciliation(ctx, ownerDay3, supplyId, {
+      physicalCount: 21,
+      reason: "Check brine tank",
+      expectedRevision: empLateUseNoCount.body.item.stockRevision,
+      expectedCurrentQuantity: 21.5,
+      requestKey: "rbac-owner-rec",
+    });
+    expect(recRes.status).toBe(201);
+    const pendingEmpUse = await postUsage(ctx, empDay3, supplyId, {
+      quantity: 1,
+      purpose: "Yesterday missed entry",
+      effectiveDate: "2026-11-25",
+      expectedRevision: recRes.body.item.stockRevision,
+      expectedCurrentQuantity: 21,
+      requestKey: "rbac-emp-use-pending",
+    });
+    expect(pendingEmpUse.status).toBe(201);
+    expect(pendingEmpUse.body.movement.entryStatus).toBe("PENDING_REVIEW");
+
+    // 1. Direct API RBAC checks for Employee:
+    expect(
+      (await request(ctx.app).get("/api/inventory/pending-reviews").set("Cookie", empDay3.cookie)).status,
+    ).toBe(403);
+    expect(
+      (
+        await request(ctx.app)
+          .get(`/api/inventory/items/${encodeURIComponent(supplyId)}/reconciliations`)
+          .set("Cookie", empDay3.cookie)
+      ).status,
+    ).toBe(403);
+    expect(
+      (
+        await request(ctx.app)
+          .post(`/api/inventory/pending-reviews/${encodeURIComponent(pendingEmpUse.body.movement.id)}/resolve`)
+          .set("Cookie", empDay3.cookie)
+          .set("X-CSRF-Token", empDay3.csrfToken)
+          .send({
+            coverageMode: "NONE",
+            expectedRevision: recRes.body.item.stockRevision,
+            expectedCurrentQuantity: 21,
+          })
+      ).status,
+    ).toBe(403);
+    expect(
+      (
+        await postUsage(ctx, empDay3, supplyId, {
+          quantity: 1,
+          purpose: "Attempt coverage override",
+          effectiveDate: "2026-11-25",
+          coverageMode: "FULL",
+          expectedRevision: recRes.body.item.stockRevision,
+          expectedCurrentQuantity: 21,
+        })
+      ).status,
+    ).toBe(403);
+
+    // 2. GET /items?includeArchived=true as Employee omits archived items, latestReconciliation, and pendingMovementReviewsCount.
+    const empItemsRes = await request(ctx.app)
+      .get("/api/inventory/items?includeArchived=true")
+      .set("Cookie", empDay3.cookie);
+    expect(empItemsRes.status).toBe(200);
+    expect(empItemsRes.body.permissions).toMatchObject({
+      canViewFullHistory: false,
+      canViewOwnUsageHistory: true,
+      canReviewPendingEntries: false,
+    });
+    expect(empItemsRes.body.pendingMovementReviewsCount).toBe(0);
+    expect(empItemsRes.body.items.some((i: any) => i.id === archivedSupplyId)).toBe(false);
+    const empSaltItem = empItemsRes.body.items.find((i: any) => i.id === supplyId);
+    expect(empSaltItem.currentQuantity).toBe(21);
+    expect(empSaltItem.latestReconciliation).toBeNull();
+    expect(empSaltItem.pendingStockReviews).toEqual([]);
+
+    // 3. GET /items/:key/history as Employee returns ONLY emp1's own STOCK_USED movements (no owner1 usage, no receiving, no reconciliations, no archived item access).
+    const empHistory = await request(ctx.app)
+      .get(`/api/inventory/items/${encodeURIComponent(supplyId)}/history`)
+      .set("Cookie", empDay3.cookie);
+    expect(empHistory.status).toBe(200);
+    expect(empHistory.body.scope).toBe("OWN_USAGE");
+    expect(empHistory.body.openingStock).toBeNull();
+    expect(empHistory.body.reconciliations).toEqual([]);
+    expect(empHistory.body.movements).toHaveLength(2);
+    expect(empHistory.body.movements.every((m: any) => m.recordedBy === "emp1" && m.movementType === "STOCK_USED")).toBe(true);
+    expect(empHistory.body.movements.every((m: any) => m.supportingReconciliation === null && m.supportingReconciliationId === null)).toBe(true);
+
+    expect(
+      (
+        await request(ctx.app)
+          .get(`/api/inventory/items/${encodeURIComponent(archivedSupplyId)}/history`)
+          .set("Cookie", empDay3.cookie)
+      ).status,
+    ).toBe(404);
+
+    // 4. GET /items/:key/history & GET /pending-reviews as Owner return full history, reconciliations, and pending review queue.
+    const ownerHistory = await request(ctx.app)
+      .get(`/api/inventory/items/${encodeURIComponent(supplyId)}/history`)
+      .set("Cookie", ownerDay3.cookie);
+    expect(ownerHistory.status).toBe(200);
+    expect(ownerHistory.body.scope).toBe("FULL");
+    expect(ownerHistory.body.openingStock).toMatchObject({ quantity: 20, unit: "kg" });
+    expect(ownerHistory.body.reconciliations).toHaveLength(1);
+    expect(ownerHistory.body.movements).toHaveLength(5);
+
+    const ownerPendingRes = await request(ctx.app)
+      .get("/api/inventory/pending-reviews")
+      .set("Cookie", ownerDay3.cookie);
+    expect(ownerPendingRes.status).toBe(200);
+    expect(ownerPendingRes.body.reviews).toHaveLength(1);
+    expect(ownerPendingRes.body.reviews[0].entry.id).toBe(pendingEmpUse.body.movement.id);
+    expect(ownerPendingRes.body.reviews[0].applicableReconciliations).toHaveLength(1);
   });
 });

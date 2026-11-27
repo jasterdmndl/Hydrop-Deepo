@@ -99,19 +99,68 @@ export interface InventoryItemView {
   createdAt?: string;
 }
 
+export type StockMovementType =
+  | "POS_SALE"
+  | "PRIOR_DAY_SETTLEMENT"
+  | "PHYSICAL_COUNT_RECONCILIATION"
+  | "SALE_ACTION_DEDUCTION"
+  | "SALE_ACTION_RESTORATION"
+  | "STOCK_RECEIVED"
+  | "STOCK_USED";
+
+export type MovementEntryStatus = "APPLIED" | "PENDING_REVIEW";
+export type MovementCoverageMode = "NONE" | "FULL" | "PARTIAL" | "UNCLEAR";
+
+export interface SupportingReconciliationSummary {
+  id: string;
+  physicalCount: number;
+  quantityDelta: number;
+  unit: string;
+  reason: string;
+  recordedBy: string;
+  recordedAt: string;
+}
+
 export interface StockMovementView {
   id: string;
   itemId: string;
-  movementType: "STOCK_RECEIVED" | "STOCK_USED";
+  movementType: StockMovementType;
+  entryStatus?: MovementEntryStatus;
   quantity: number;
+  enteredQuantity?: number | null;
+  appliedQuantity?: number;
   quantityDelta: number;
   balanceBefore: number;
   balanceAfter: number;
   unit: string;
   effectiveDate: string | null;
   note: string | null;
+  coverageMode?: MovementCoverageMode | null;
+  coveredQuantity?: number;
+  supportingReconciliationId?: string | null;
+  supportingReconciliation?: SupportingReconciliationSummary | null;
+  coveredByOpeningCount?: boolean;
+  posReference?: string | null;
   recordedBy: string;
   recordedAt: string;
+  reviewedBy?: string | null;
+  reviewedAt?: string | null;
+  reviewNote?: string | null;
+}
+
+export interface PendingMovementReviewView {
+  entry: StockMovementView;
+  item: InventoryItemView;
+  applicableReconciliations: StockReconciliationView[];
+  openingCountCoversDate: boolean;
+}
+
+export interface InventoryItemHistoryView {
+  scope: "FULL" | "OWN_USAGE";
+  item: InventoryItemView;
+  openingStock: OpeningStockRecord | null;
+  movements: StockMovementView[];
+  reconciliations: StockReconciliationView[];
 }
 
 export interface InventoryPermissions {
@@ -121,6 +170,9 @@ export interface InventoryPermissions {
   canRecordReceiving?: boolean;
   canRecordUsage?: boolean;
   canReconcile?: boolean;
+  canViewFullHistory?: boolean;
+  canViewOwnUsageHistory?: boolean;
+  canReviewPendingEntries?: boolean;
 }
 
 export interface InventoryItemsResponse {
@@ -128,6 +180,7 @@ export interface InventoryItemsResponse {
   items: InventoryItemView[];
   posSections?: PosSectionView[];
   pendingStockReviews?: PendingSaleActionStockReviewView[];
+  pendingMovementReviewsCount?: number;
 }
 
 export const DEFAULT_POS_SECTIONS: readonly PosSectionView[] = [
@@ -862,6 +915,24 @@ export function isValidStockMovementPayload(value: unknown): value is StockMovem
   ) {
     return false;
   }
+  if (
+    candidate.entryStatus !== undefined &&
+    candidate.entryStatus !== "APPLIED" &&
+    candidate.entryStatus !== "PENDING_REVIEW"
+  ) {
+    return false;
+  }
+  if (
+    candidate.coverageMode !== undefined &&
+    candidate.coverageMode !== null &&
+    candidate.coverageMode !== "NONE" &&
+    candidate.coverageMode !== "FULL" &&
+    candidate.coverageMode !== "PARTIAL" &&
+    candidate.coverageMode !== "UNCLEAR"
+  ) {
+    return false;
+  }
+
   const scaledQty = parseExactFourDecimalScaled(candidate.quantity);
   const scaledDelta = parseExactFourDecimalScaled(candidate.quantityDelta);
   const scaledBefore = parseExactFourDecimalScaled(candidate.balanceBefore);
@@ -870,19 +941,37 @@ export function isValidStockMovementPayload(value: unknown): value is StockMovem
     scaledQty === null ||
     scaledQty <= 0 ||
     scaledDelta === null ||
-    scaledDelta === 0 ||
     scaledBefore === null ||
     scaledAfter === null
   ) {
     return false;
   }
+
+  const allowsZeroEffect =
+    candidate.entryStatus === "PENDING_REVIEW" || candidate.coverageMode === "FULL";
+  if (scaledDelta === 0) {
+    return allowsZeroEffect && scaledBefore === scaledAfter;
+  }
+
   const signMatches =
     candidate.movementType === "STOCK_RECEIVED" ? scaledDelta > 0 : scaledDelta < 0;
-  return (
-    signMatches &&
-    Math.abs(scaledDelta) === scaledQty &&
-    scaledBefore + scaledDelta === scaledAfter
-  );
+  if (!signMatches || scaledBefore + scaledDelta !== scaledAfter) {
+    return false;
+  }
+
+  if (candidate.coverageMode === "PARTIAL") {
+    const scaledCovered =
+      typeof candidate.coveredQuantity === "number"
+        ? parseExactFourDecimalScaled(candidate.coveredQuantity)
+        : null;
+    return (
+      scaledCovered !== null &&
+      scaledCovered > 0 &&
+      Math.abs(scaledDelta) + scaledCovered === scaledQty
+    );
+  }
+
+  return Math.abs(scaledDelta) === scaledQty;
 }
 
 export function matchesPendingMovementAttempt(
@@ -916,13 +1005,104 @@ export function matchesPendingMovementAttempt(
     scaledExpectedQty === null ||
     scaledMovementQty === null ||
     scaledMovementDelta === null ||
-    scaledMovementQty !== scaledExpectedQty ||
-    Math.abs(scaledMovementDelta) !== scaledExpectedQty
+    scaledMovementQty !== scaledExpectedQty
   ) {
     return false;
   }
+
+  if (movement.entryStatus === "PENDING_REVIEW" || movement.coverageMode === "FULL") {
+    if (scaledMovementDelta !== 0) {
+      return false;
+    }
+  } else if (movement.coverageMode === "PARTIAL") {
+    const scaledCovered =
+      typeof movement.coveredQuantity === "number"
+        ? parseExactFourDecimalScaled(movement.coveredQuantity)
+        : null;
+    if (
+      scaledCovered === null ||
+      scaledCovered <= 0 ||
+      Math.abs(scaledMovementDelta) + scaledCovered !== scaledExpectedQty
+    ) {
+      return false;
+    }
+  } else if (Math.abs(scaledMovementDelta) !== scaledExpectedQty) {
+    return false;
+  }
+
   const expectedNote = attempt.noteOrPurposeInput.trim().replace(/\s+/g, " ") || null;
   return (movement.note ?? null) === expectedNote;
+}
+
+export interface LateCoveragePreview {
+  enteredQuantity: number;
+  coveredQuantity: number;
+  uncoveredQuantity: number;
+  signedDelta: number;
+  projectedBalance: number | null;
+  pendingReview: boolean;
+}
+
+export function computeLateCoveragePreview(params: {
+  movementType: "STOCK_RECEIVED" | "STOCK_USED";
+  currentQuantity: number | null;
+  enteredQuantity: number;
+  coverageMode: MovementCoverageMode;
+  coveredQuantity?: number | null;
+}): LateCoveragePreview | null {
+  const enteredScaled = parseExactFourDecimalScaled(params.enteredQuantity);
+  if (enteredScaled === null || enteredScaled <= 0) return null;
+
+  if (params.coverageMode === "UNCLEAR") {
+    return {
+      enteredQuantity: enteredScaled / QUANTITY_SCALE,
+      coveredQuantity: 0,
+      uncoveredQuantity: 0,
+      signedDelta: 0,
+      projectedBalance: params.currentQuantity,
+      pendingReview: true,
+    };
+  }
+
+  let coveredScaled = 0;
+  if (params.coverageMode === "FULL") {
+    coveredScaled = enteredScaled;
+  } else if (params.coverageMode === "PARTIAL") {
+    const parsedCov =
+      typeof params.coveredQuantity === "number"
+        ? parseExactFourDecimalScaled(params.coveredQuantity)
+        : null;
+    if (parsedCov === null || parsedCov <= 0 || parsedCov >= enteredScaled) {
+      return null;
+    }
+    coveredScaled = parsedCov;
+  }
+
+  const uncoveredScaled = enteredScaled - coveredScaled;
+  const signedScaledDelta =
+    uncoveredScaled === 0
+      ? 0
+      : params.movementType === "STOCK_RECEIVED"
+        ? uncoveredScaled
+        : -uncoveredScaled;
+
+  let projectedBalance = params.currentQuantity;
+  if (params.currentQuantity !== null) {
+    const currentScaled = parseExactFourDecimalScaled(params.currentQuantity);
+    projectedBalance =
+      currentScaled !== null
+        ? (currentScaled + signedScaledDelta) / QUANTITY_SCALE
+        : params.currentQuantity + signedScaledDelta / QUANTITY_SCALE;
+  }
+
+  return {
+    enteredQuantity: enteredScaled / QUANTITY_SCALE,
+    coveredQuantity: coveredScaled / QUANTITY_SCALE,
+    uncoveredQuantity: uncoveredScaled / QUANTITY_SCALE,
+    signedDelta: signedScaledDelta / QUANTITY_SCALE,
+    projectedBalance,
+    pendingReview: false,
+  };
 }
 
 export type PendingMovementStatusResult =

@@ -418,11 +418,16 @@ export const dashboardRepository = {
                 m.pos_reference AS "posReference",
                 m.note,
                 u.username AS "actor",
-                to_char(m.recorded_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US"Z"') AS "recordedAt",
-                m.recorded_at AS "recordedAtSort"
+                to_char(
+                  COALESCE(m.balance_applied_at, m.recorded_at) AT TIME ZONE 'UTC',
+                  'YYYY-MM-DD"T"HH24:MI:SS.US"Z"'
+                ) AS "recordedAt",
+                COALESCE(m.balance_applied_at, m.recorded_at) AS "recordedAtSort"
            FROM inventory_stock_movements m
            JOIN target_item ti ON ti.id = m.item_id
            JOIN app_users u ON u.id = m.actor_user_id
+          WHERE m.quantity_delta <> 0
+            AND m.entry_status = 'APPLIED'
        )
        SELECT (SELECT row_to_json(ti) FROM target_item ti) AS item,
               (SELECT row_to_json(op) FROM opening_row op) AS "openingStock",

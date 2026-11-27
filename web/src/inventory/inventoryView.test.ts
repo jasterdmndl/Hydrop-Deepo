@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  computeLateCoveragePreview,
   computeReconciliationPreview,
   DEFAULT_POS_SECTIONS,
   filterInventoryItems,
@@ -896,8 +897,128 @@ describe("inventoryView helpers", () => {
         item: exactFourDecSaved.item,
         movement: exactFourDecSaved.movement,
       });
+
+      // Task 2: PENDING_REVIEW and FULL-coverage zero-delta movements match when delta is 0.
+      const pendingSaved = {
+        status: "SAVED",
+        item: { ...savedItem, currentQuantity: 10 },
+        movement: {
+          ...savedMovement,
+          entryStatus: "PENDING_REVIEW",
+          coverageMode: "UNCLEAR",
+          quantity: 1,
+          quantityDelta: 0,
+          balanceBefore: 10,
+          balanceAfter: 10,
+        },
+      };
+      mockPayload = { kind: "json", body: pendingSaved };
+      expect(await requestPendingMovementStatus(empAttempt)).toEqual({
+        kind: "SAVED",
+        item: pendingSaved.item,
+        movement: pendingSaved.movement,
+      });
+      expect(await requestPendingMovementCancel(empAttempt, "supply-1")).toEqual({
+        kind: "SAVED",
+        item: pendingSaved.item,
+        movement: pendingSaved.movement,
+      });
+
+      // Task 2: PARTIAL coverage (entered 5, covered 2 -> +3 delta) matches cleanly.
+      const ownerRecvAttempt: PendingStockMovementAttempt = {
+        ...empAttempt,
+        movementType: "STOCK_RECEIVED",
+        quantityInput: "5",
+      };
+      const partialSaved = {
+        status: "SAVED",
+        item: { ...savedItem, currentQuantity: 13 },
+        movement: {
+          ...savedMovement,
+          movementType: "STOCK_RECEIVED",
+          entryStatus: "APPLIED",
+          coverageMode: "PARTIAL",
+          quantity: 5,
+          coveredQuantity: 2,
+          quantityDelta: 3,
+          balanceBefore: 10,
+          balanceAfter: 13,
+        },
+      };
+      mockPayload = { kind: "json", body: partialSaved };
+      expect(await requestPendingMovementStatus(ownerRecvAttempt)).toEqual({
+        kind: "SAVED",
+        item: partialSaved.item,
+        movement: partialSaved.movement,
+      });
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+
+  it("computes exact late-entry count coverage previews for receiving and usage (Task 2)", () => {
+    // Late receipt of 5 with 2 covered adds 3 (balance 9 -> 12).
+    expect(
+      computeLateCoveragePreview({
+        movementType: "STOCK_RECEIVED",
+        currentQuantity: 9,
+        enteredQuantity: 5,
+        coverageMode: "PARTIAL",
+        coveredQuantity: 2,
+      }),
+    ).toEqual({
+      enteredQuantity: 5,
+      coveredQuantity: 2,
+      uncoveredQuantity: 3,
+      signedDelta: 3,
+      projectedBalance: 12,
+      pendingReview: false,
+    });
+
+    // Full coverage leaves zero stock effect.
+    expect(
+      computeLateCoveragePreview({
+        movementType: "STOCK_USED",
+        currentQuantity: 8,
+        enteredQuantity: 2,
+        coverageMode: "FULL",
+        coveredQuantity: 2,
+      }),
+    ).toEqual({
+      enteredQuantity: 2,
+      coveredQuantity: 2,
+      uncoveredQuantity: 0,
+      signedDelta: 0,
+      projectedBalance: 8,
+      pendingReview: false,
+    });
+
+    // Unclear marks pending review with zero stock change.
+    expect(
+      computeLateCoveragePreview({
+        movementType: "STOCK_USED",
+        currentQuantity: 8,
+        enteredQuantity: 3,
+        coverageMode: "UNCLEAR",
+      }),
+    ).toEqual({
+      enteredQuantity: 3,
+      coveredQuantity: 0,
+      uncoveredQuantity: 0,
+      signedDelta: 0,
+      projectedBalance: 8,
+      pendingReview: true,
+    });
+
+    // Partial with invalid or >= entered covered quantity returns null.
+    expect(
+      computeLateCoveragePreview({
+        movementType: "STOCK_RECEIVED",
+        currentQuantity: 9,
+        enteredQuantity: 5,
+        coverageMode: "PARTIAL",
+        coveredQuantity: 5,
+      }),
+    ).toBeNull();
   });
 });

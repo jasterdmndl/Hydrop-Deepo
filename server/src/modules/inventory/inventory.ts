@@ -46,6 +46,12 @@ export interface InventoryPermissions {
   canRecordUsage: boolean;
   /** Only the Owner can run physical-count reconciliations (INV-009). */
   canReconcile: boolean;
+  /** Only the Owner can inspect full stock history, reconciliations, and pending reviews (INV-040, INV-041). */
+  canViewFullHistory: boolean;
+  /** Signed-in operators can view their own recorded Stock Used history (INV-041). */
+  canViewOwnUsageHistory: boolean;
+  /** Only the Owner can confirm count coverage and resolve pending late entries (INV-025, INV-029, INV-040). */
+  canReviewPendingEntries: boolean;
 }
 
 export function inventoryPermissions(role: Role): InventoryPermissions {
@@ -57,6 +63,9 @@ export function inventoryPermissions(role: Role): InventoryPermissions {
     canRecordReceiving: isOwner,
     canRecordUsage: true,
     canReconcile: isOwner,
+    canViewFullHistory: isOwner,
+    canViewOwnUsageHistory: true,
+    canReviewPendingEntries: isOwner,
   };
 }
 
@@ -146,19 +155,68 @@ export interface InventoryItemView {
   createdAt: string;
 }
 
+export type StockMovementType =
+  | "POS_SALE"
+  | "PRIOR_DAY_SETTLEMENT"
+  | "PHYSICAL_COUNT_RECONCILIATION"
+  | "SALE_ACTION_DEDUCTION"
+  | "SALE_ACTION_RESTORATION"
+  | "STOCK_RECEIVED"
+  | "STOCK_USED";
+
+export type MovementEntryStatus = "APPLIED" | "PENDING_REVIEW";
+export type MovementCoverageMode = "NONE" | "FULL" | "PARTIAL" | "UNCLEAR";
+
+export interface SupportingReconciliationSummary {
+  id: string;
+  physicalCount: number;
+  quantityDelta: number;
+  unit: string;
+  reason: string;
+  recordedBy: string;
+  recordedAt: string;
+}
+
 export interface StockMovementView {
   id: string;
   itemId: string;
-  movementType: "STOCK_RECEIVED" | "STOCK_USED";
+  movementType: StockMovementType;
+  entryStatus: MovementEntryStatus;
   quantity: number;
+  enteredQuantity: number | null;
+  appliedQuantity: number;
   quantityDelta: number;
   balanceBefore: number;
   balanceAfter: number;
   unit: string;
   effectiveDate: string | null;
   note: string | null;
+  coverageMode: MovementCoverageMode | null;
+  coveredQuantity: number;
+  supportingReconciliationId: string | null;
+  supportingReconciliation: SupportingReconciliationSummary | null;
+  coveredByOpeningCount: boolean;
+  posReference: string | null;
   recordedBy: string;
   recordedAt: string;
+  reviewedBy: string | null;
+  reviewedAt: string | null;
+  reviewNote: string | null;
+}
+
+export interface PendingMovementReviewView {
+  entry: StockMovementView;
+  item: InventoryItemView;
+  applicableReconciliations: StockReconciliationView[];
+  openingCountCoversDate: boolean;
+}
+
+export interface InventoryItemHistoryView {
+  scope: "FULL" | "OWN_USAGE";
+  item: InventoryItemView;
+  openingStock: OpeningStockRecord | null;
+  movements: StockMovementView[];
+  reconciliations: StockReconciliationView[];
 }
 
 const CANONICAL_DECIMAL_REGEX = /^(-?)(\d+)(?:\.(\d{1,4}))?$/;
@@ -404,6 +462,20 @@ export function parseManilaDate(raw: unknown): string | null {
     return null;
   }
   return trimmed;
+}
+
+export function parseCoverageMode(raw: unknown): MovementCoverageMode | null {
+  if (typeof raw !== "string") return null;
+  const normalized = raw.trim().toUpperCase();
+  if (
+    normalized === "NONE" ||
+    normalized === "FULL" ||
+    normalized === "PARTIAL" ||
+    normalized === "UNCLEAR"
+  ) {
+    return normalized;
+  }
+  return null;
 }
 
 export function parseFaucetReportingType(

@@ -131,6 +131,9 @@ describe("shared sign-in and module entry", () => {
         canRecordReceiving: true,
         canRecordUsage: true,
         canReconcile: true,
+        canViewFullHistory: true,
+        canViewOwnUsageHistory: true,
+        canReviewPendingEntries: true,
       });
       expect(cashierInvAccess.body).toEqual({
         canView: true,
@@ -139,6 +142,9 @@ describe("shared sign-in and module entry", () => {
         canRecordReceiving: false,
         canRecordUsage: true,
         canReconcile: false,
+        canViewFullHistory: false,
+        canViewOwnUsageHistory: true,
+        canReviewPendingEntries: false,
       });
     });
 

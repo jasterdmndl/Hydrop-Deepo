@@ -9,7 +9,9 @@ import {
   inventoryPermissions,
   isUuid,
   MAX_OPENING_QUANTITY,
+  type MovementCoverageMode,
   parseContainerShape,
+  parseCoverageMode,
   parseFaucetReportingType,
   parseLowStockLevel,
   parseManilaDate,
@@ -28,7 +30,12 @@ import {
   parseUnitPriceCentavos,
   type PosSection,
 } from "./inventory.js";
-import { inventoryRepository as repo, type OpeningStockTarget } from "./repository.js";
+import {
+  inventoryRepository as repo,
+  type LateCoverageSelectionInput,
+  type OpeningStockTarget,
+  redactItemForEmployee,
+} from "./repository.js";
 
 const CREATE_PRODUCT_KEYS = new Set([
   "category",
@@ -70,6 +77,13 @@ const RECEIVING_KEYS = new Set([
   "expectedRevision",
   "expectedCurrentQuantity",
   "requestKey",
+  "coverageMode",
+  "coveredQuantity",
+  "supportingReconciliationId",
+  "coveredByOpeningCount",
+  "reviewNote",
+  "expectedLatestReconciliationId",
+  "expectedOpeningCountCoversDate",
 ]);
 const USAGE_KEYS = new Set([
   "quantity",
@@ -78,8 +92,129 @@ const USAGE_KEYS = new Set([
   "expectedRevision",
   "expectedCurrentQuantity",
   "requestKey",
+  "coverageMode",
+  "coveredQuantity",
+  "supportingReconciliationId",
+  "coveredByOpeningCount",
+  "reviewNote",
+  "expectedLatestReconciliationId",
+  "expectedOpeningCountCoversDate",
+]);
+const RESOLVE_REVIEW_KEYS = new Set([
+  "coverageMode",
+  "coveredQuantity",
+  "supportingReconciliationId",
+  "coveredByOpeningCount",
+  "reviewNote",
+  "expectedRevision",
+  "expectedCurrentQuantity",
+  "expectedLatestReconciliationId",
+  "expectedOpeningCountCoversDate",
+  "requestKey",
 ]);
 const CANCEL_MOVEMENT_KEYS = new Set(["itemKey", "movementType"]);
+
+function parseCoverageRequestFields(
+  body: Record<string, unknown>,
+  options: { requireMode: boolean },
+):
+  | { ok: true; value: LateCoverageSelectionInput; hasCoverageFields: boolean }
+  | { ok: false; message: string } {
+  const hasCoverageFields =
+    body.coverageMode !== undefined ||
+    body.coveredQuantity !== undefined ||
+    body.supportingReconciliationId !== undefined ||
+    body.coveredByOpeningCount !== undefined ||
+    body.reviewNote !== undefined ||
+    body.expectedLatestReconciliationId !== undefined ||
+    body.expectedOpeningCountCoversDate !== undefined;
+
+  let coverageMode: MovementCoverageMode | null | undefined = undefined;
+  if (body.coverageMode !== undefined && body.coverageMode !== null) {
+    const parsed = parseCoverageMode(body.coverageMode);
+    if (!parsed) {
+      return { ok: false, message: "Choose a valid count-coverage option." };
+    }
+    coverageMode = parsed;
+  } else if (options.requireMode) {
+    return { ok: false, message: "Choose a valid count-coverage option." };
+  }
+
+  let coveredQuantity: number | null | undefined = undefined;
+  if (body.coveredQuantity !== undefined && body.coveredQuantity !== null) {
+    const parsed = parseQuantity(body.coveredQuantity, { allowDecimal: true, allowZero: false });
+    if (parsed === null) {
+      return { ok: false, message: "Enter a positive covered quantity (up to 4 decimals)." };
+    }
+    coveredQuantity = parsed;
+  }
+
+  let supportingReconciliationId: string | null | undefined = undefined;
+  if (
+    body.supportingReconciliationId !== undefined &&
+    body.supportingReconciliationId !== null &&
+    body.supportingReconciliationId !== ""
+  ) {
+    if (
+      typeof body.supportingReconciliationId !== "string" ||
+      !isUuid(body.supportingReconciliationId.trim())
+    ) {
+      return { ok: false, message: "Choose a valid supporting physical count." };
+    }
+    supportingReconciliationId = body.supportingReconciliationId.trim();
+  } else if (body.supportingReconciliationId === null) {
+    supportingReconciliationId = null;
+  }
+
+  let coveredByOpeningCount: boolean | undefined = undefined;
+  if (body.coveredByOpeningCount !== undefined) {
+    if (typeof body.coveredByOpeningCount !== "boolean") {
+      return { ok: false, message: "Invalid opening-count coverage flag." };
+    }
+    coveredByOpeningCount = body.coveredByOpeningCount;
+  }
+
+  const reviewNoteResult = parseMovementNote(body.reviewNote, { required: false });
+  if (!reviewNoteResult.ok) {
+    return { ok: false, message: "Review note must be 240 characters or fewer." };
+  }
+
+  let expectedLatestReconciliationId: string | null | undefined = undefined;
+  if (body.expectedLatestReconciliationId !== undefined) {
+    if (body.expectedLatestReconciliationId === null) {
+      expectedLatestReconciliationId = null;
+    } else if (
+      typeof body.expectedLatestReconciliationId === "string" &&
+      isUuid(body.expectedLatestReconciliationId.trim())
+    ) {
+      expectedLatestReconciliationId = body.expectedLatestReconciliationId.trim();
+    } else {
+      return { ok: false, message: "Invalid count-review revision reference." };
+    }
+  }
+
+  let expectedOpeningCountCoversDate: boolean | undefined = undefined;
+  if (body.expectedOpeningCountCoversDate !== undefined) {
+    if (typeof body.expectedOpeningCountCoversDate !== "boolean") {
+      return { ok: false, message: "Invalid opening-count review reference." };
+    }
+    expectedOpeningCountCoversDate = body.expectedOpeningCountCoversDate;
+  }
+
+  return {
+    ok: true,
+    hasCoverageFields,
+    value: {
+      coverageMode,
+      coveredQuantity,
+      supportingReconciliationId,
+      coveredByOpeningCount,
+      reviewNote: reviewNoteResult.value,
+      expectedLatestReconciliationId,
+      expectedOpeningCountCoversDate,
+    },
+  };
+}
 
 function resolveItemTarget(rawKey: string): OpeningStockTarget | null {
   const shape = parseContainerShape(rawKey);
@@ -106,17 +241,22 @@ export function inventoryRoutes(db: Database): Router {
   });
 
   router.get("/items", async (req, res) => {
-    const includeArchived = req.query.includeArchived === "true";
-    const [items, posSections] = await Promise.all([
+    const role = req.auth!.user.role;
+    const includeArchived = role === "OWNER" && req.query.includeArchived === "true";
+    const [rawItems, posSections, pendingMovementReviewsCount] = await Promise.all([
       repo.listItems(db, { includeArchived }),
       repo.listPosSections(db),
+      role === "OWNER" ? repo.countPendingMovementReviews(db) : Promise.resolve(0),
     ]);
-    const pendingStockReviews = items.flatMap((item) => item.pendingStockReviews ?? []);
+    const items = role === "OWNER" ? rawItems : rawItems.map(redactItemForEmployee);
+    const pendingStockReviews =
+      role === "OWNER" ? items.flatMap((item) => item.pendingStockReviews ?? []) : [];
     res.json({
-      permissions: inventoryPermissions(req.auth!.user.role),
+      permissions: inventoryPermissions(role),
       items,
       posSections,
       pendingStockReviews,
+      pendingMovementReviewsCount,
     });
   });
 
@@ -131,6 +271,7 @@ export function inventoryRoutes(db: Database): Router {
     const found = await repo.findStockMovementByRequestKey(db, {
       requestKey: parsedKey.value,
       actorUserId: req.auth!.user.id,
+      actorRole: req.auth!.user.role,
     });
     if (found.status === "NOT_FOUND") {
       res.json({ status: "NOT_FOUND" });
@@ -189,6 +330,7 @@ export function inventoryRoutes(db: Database): Router {
       movementType: body.movementType,
       requestKey: parsedKey.value,
       actorUserId: req.auth!.user.id,
+      actorRole: req.auth!.user.role,
       cancelledAt: req.now,
     });
 
@@ -815,7 +957,7 @@ export function inventoryRoutes(db: Database): Router {
     res.status(201).json({ item: outcome.item });
   });
 
-  router.get("/items/:itemKey/reconciliations", async (req, res) => {
+  router.get("/items/:itemKey/reconciliations", requireRole("OWNER"), async (req, res) => {
     const rawKey = typeof req.params.itemKey === "string" ? req.params.itemKey.trim() : "";
     const target = resolveItemTarget(rawKey);
     if (!target) {
@@ -823,13 +965,177 @@ export function inventoryRoutes(db: Database): Router {
       return;
     }
 
-    const result = await repo.listReconciliations(db, target);
+    let sinceDate: string | undefined = undefined;
+    if (req.query.sinceDate !== undefined) {
+      const parsed = parseManilaDate(req.query.sinceDate);
+      if (!parsed) {
+        sendError(res, 400, "VALIDATION_FAILED", "Enter a valid date (YYYY-MM-DD).");
+        return;
+      }
+      sinceDate = parsed;
+    }
+
+    const result = await repo.listReconciliations(db, target, { sinceDate });
     if (!result.found) {
       sendError(res, 404, "NOT_FOUND", "Inventory item not found.");
       return;
     }
 
-    res.json({ reconciliations: result.reconciliations });
+    res.json({
+      reconciliations: result.reconciliations,
+      openingCountCoversDate: result.openingCountCoversDate,
+    });
+  });
+
+  router.get("/items/:itemKey/history", async (req, res) => {
+    const rawKey = typeof req.params.itemKey === "string" ? req.params.itemKey.trim() : "";
+    const target = resolveItemTarget(rawKey);
+    if (!target) {
+      sendError(res, 400, "VALIDATION_FAILED", "Choose a valid Inventory item.");
+      return;
+    }
+
+    const history = await repo.listItemHistory(db, {
+      target,
+      role: req.auth!.user.role,
+      actorUserId: req.auth!.user.id,
+    });
+    if (!history) {
+      sendError(res, 404, "NOT_FOUND", "Inventory item not found.");
+      return;
+    }
+
+    res.json(history);
+  });
+
+  router.get("/pending-reviews", requireRole("OWNER"), async (_req, res) => {
+    const reviews = await repo.listPendingMovementReviews(db);
+    res.json({ reviews });
+  });
+
+  router.post("/pending-reviews/:entryId/resolve", requireRole("OWNER"), async (req, res) => {
+    const rawEntryId = typeof req.params.entryId === "string" ? req.params.entryId.trim() : "";
+    if (!isUuid(rawEntryId)) {
+      sendError(res, 400, "VALIDATION_FAILED", "Choose a valid pending inventory entry.");
+      return;
+    }
+
+    const body = req.body as Record<string, unknown> | null | undefined;
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      sendError(res, 400, "VALIDATION_FAILED", "Enter valid count-coverage details.");
+      return;
+    }
+
+    const extraKeys = Object.keys(body).filter((key) => !RESOLVE_REVIEW_KEYS.has(key));
+    if (extraKeys.length > 0) {
+      sendError(res, 400, "VALIDATION_FAILED", "Unexpected pending-review fields provided.");
+      return;
+    }
+
+    const coverageParsed = parseCoverageRequestFields(body, { requireMode: true });
+    if (!coverageParsed.ok) {
+      sendError(res, 400, "VALIDATION_FAILED", coverageParsed.message);
+      return;
+    }
+
+    if (
+      typeof body.expectedRevision !== "number" ||
+      !Number.isInteger(body.expectedRevision) ||
+      body.expectedRevision < 0
+    ) {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid stock revision baseline.");
+      return;
+    }
+
+    const expectedCurrentQuantity = parseStoredBalanceBaseline(body.expectedCurrentQuantity, {
+      allowDecimal: true,
+      allowNegative: true,
+    });
+    if (expectedCurrentQuantity === null) {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid recorded stock baseline.");
+      return;
+    }
+
+    const requestKeyResult = parseRequestKey(body.requestKey);
+    if (!requestKeyResult.ok) {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid review confirmation request key.");
+      return;
+    }
+
+    const outcome = await repo.resolvePendingMovementReview(db, {
+      entryId: rawEntryId,
+      expectedRevision: body.expectedRevision,
+      expectedCurrentQuantity,
+      requestKey: requestKeyResult.value,
+      reviewerUserId: req.auth!.user.id,
+      reviewedAt: req.now,
+      coverage: coverageParsed.value,
+    });
+
+    if (outcome.kind === "not-found") {
+      sendError(res, 404, "NOT_FOUND", "Pending inventory entry not found.");
+      return;
+    }
+    if (outcome.kind === "already-resolved") {
+      res.status(409).json({
+        error: {
+          code: "MOVEMENT_ALREADY_RESOLVED",
+          message: "This pending inventory entry has already been resolved.",
+        },
+        item: outcome.item,
+        movement: outcome.movement,
+      });
+      return;
+    }
+    if (outcome.kind === "key-conflict") {
+      sendError(
+        res,
+        409,
+        "REQUEST_KEY_CONFLICT",
+        "This review confirmation request key was already used for another entry.",
+      );
+      return;
+    }
+    if (outcome.kind === "invalid-coverage") {
+      sendError(res, 400, "VALIDATION_FAILED", outcome.message);
+      return;
+    }
+    if (outcome.kind === "invalid-baseline") {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid recorded stock baseline.");
+      return;
+    }
+    if (outcome.kind === "stale-review") {
+      res.status(409).json({
+        error: {
+          code: "STALE_REVIEW_CONTEXT",
+          message: `New physical-count history was recorded for ${outcome.item.name}. Review the updated counts before confirming coverage.`,
+        },
+        item: outcome.item,
+        entry: outcome.entry,
+        applicableReconciliations: outcome.applicableReconciliations,
+        openingCountCoversDate: outcome.openingCountCoversDate,
+      });
+      return;
+    }
+    if (outcome.kind === "stale") {
+      res.status(409).json({
+        error: {
+          code: "STALE_STOCK_BALANCE",
+          message: `Recorded stock for ${outcome.item.name} changed to ${outcome.item.currentQuantity} ${outcome.item.unit} before confirming. Review the refreshed balance and confirm again.`,
+        },
+        item: outcome.item,
+        entry: outcome.entry,
+        applicableReconciliations: outcome.applicableReconciliations,
+        openingCountCoversDate: outcome.openingCountCoversDate,
+      });
+      return;
+    }
+
+    res.json({
+      item: outcome.item,
+      movement: outcome.movement,
+      replayed: outcome.kind === "replayed",
+    });
   });
 
   router.post("/items/:itemKey/reconciliations", requireRole("OWNER"), async (req, res) => {
@@ -1081,6 +1387,12 @@ export function inventoryRoutes(db: Database): Router {
       return;
     }
 
+    const coverageParsed = parseCoverageRequestFields(body, { requireMode: false });
+    if (!coverageParsed.ok) {
+      sendError(res, 400, "VALIDATION_FAILED", coverageParsed.message);
+      return;
+    }
+
     const outcome = await repo.recordStockReceived(db, {
       target,
       quantity,
@@ -1092,6 +1404,7 @@ export function inventoryRoutes(db: Database): Router {
       requestKey: requestKeyResult.value,
       actorUserId: req.auth!.user.id,
       recordedAt: req.now,
+      coverage: coverageParsed.value,
     });
 
     if (outcome.kind === "not-found") {
@@ -1111,13 +1424,20 @@ export function inventoryRoutes(db: Database): Router {
       sendError(res, 400, "VALIDATION_FAILED", "Invalid recorded stock baseline.");
       return;
     }
-    if (outcome.kind === "late-date-not-enabled") {
-      sendError(
-        res,
-        400,
-        "VALIDATION_FAILED",
-        "Late Stock Received entries require count-coverage review, which is not yet enabled.",
-      );
+    if (outcome.kind === "invalid-coverage") {
+      sendError(res, 400, "VALIDATION_FAILED", outcome.message);
+      return;
+    }
+    if (outcome.kind === "stale-review") {
+      res.status(409).json({
+        error: {
+          code: "STALE_REVIEW_CONTEXT",
+          message: `New physical-count history was recorded for ${outcome.item.name}. Review the updated counts before confirming coverage.`,
+        },
+        item: outcome.item,
+        applicableReconciliations: outcome.applicableReconciliations,
+        openingCountCoversDate: outcome.openingCountCoversDate,
+      });
       return;
     }
     if (outcome.kind === "archived") {
@@ -1259,6 +1579,22 @@ export function inventoryRoutes(db: Database): Router {
       return;
     }
 
+    const coverageParsed = parseCoverageRequestFields(body, { requireMode: false });
+    if (!coverageParsed.ok) {
+      sendError(res, 400, "VALIDATION_FAILED", coverageParsed.message);
+      return;
+    }
+
+    if (req.auth!.user.role !== "OWNER" && coverageParsed.hasCoverageFields) {
+      sendError(
+        res,
+        403,
+        "FORBIDDEN",
+        "Only the Owner can confirm count coverage for late Stock Used entries.",
+      );
+      return;
+    }
+
     const outcome = await repo.recordStockUsed(db, {
       target,
       quantity,
@@ -1269,7 +1605,9 @@ export function inventoryRoutes(db: Database): Router {
       expectedCurrentQuantity,
       requestKey: requestKeyResult.value,
       actorUserId: req.auth!.user.id,
+      actorRole: req.auth!.user.role,
       recordedAt: req.now,
+      coverage: coverageParsed.value,
     });
 
     if (outcome.kind === "not-found") {
@@ -1298,13 +1636,20 @@ export function inventoryRoutes(db: Database): Router {
       sendError(res, 400, "VALIDATION_FAILED", "Invalid recorded stock baseline.");
       return;
     }
-    if (outcome.kind === "late-date-not-enabled") {
-      sendError(
-        res,
-        400,
-        "VALIDATION_FAILED",
-        "Late Stock Used entries require count-coverage review, which is not yet enabled.",
-      );
+    if (outcome.kind === "invalid-coverage") {
+      sendError(res, 400, "VALIDATION_FAILED", outcome.message);
+      return;
+    }
+    if (outcome.kind === "stale-review") {
+      res.status(409).json({
+        error: {
+          code: "STALE_REVIEW_CONTEXT",
+          message: `New physical-count history was recorded for ${outcome.item.name}. Review the updated counts before confirming coverage.`,
+        },
+        item: outcome.item,
+        applicableReconciliations: outcome.applicableReconciliations,
+        openingCountCoversDate: outcome.openingCountCoversDate,
+      });
       return;
     }
     if (outcome.kind === "archived") {
