@@ -1,17 +1,18 @@
 /** Pure formatting, grouping, reconciliation, and input helpers for Inventory. */
+import { api } from "../api";
 
 export type ContainerShape = "ROUND" | "SLIM";
-export type InventoryCategory = "CONTAINER" | "MERCHANDISE";
+export type InventoryCategory = "CONTAINER" | "MERCHANDISE" | "OPERATING_SUPPLY";
 export type PosSection = string;
 export type FaucetReportingType = "PUSH_TYPE" | "TWIST_TYPE";
 export type OpeningStockStatus = "NOT_SET" | "INITIALIZED";
 export type InventoryCategoryFilter = string;
-export type StockStatusTone = "unset" | "out" | "in";
+export type StockStatusTone = "unset" | "out" | "in" | "low" | "discrepancy";
 export type InventoryLoadPhase = "initial-loading" | "initial-error" | "ready" | "refresh-error";
 
 export interface StockStatusMeta {
   tone: StockStatusTone;
-  label: "Not Set" | "No Stock" | "In Stock";
+  label: "Not Set" | "No Stock" | "In Stock" | "Low Stock" | "Needs Reconciliation";
 }
 
 export interface OpeningStockRecord {
@@ -76,6 +77,8 @@ export interface InventoryItemView {
   shape: ContainerShape | null;
   description?: string | null;
   unit: string;
+  allowDecimalQuantity?: boolean;
+  needsReconciliation?: boolean;
   unitPriceCentavos?: number | null;
   showInPos?: boolean;
   posSection?: PosSection | null;
@@ -96,10 +99,80 @@ export interface InventoryItemView {
   createdAt?: string;
 }
 
+export type StockMovementType =
+  | "POS_SALE"
+  | "PRIOR_DAY_SETTLEMENT"
+  | "PHYSICAL_COUNT_RECONCILIATION"
+  | "SALE_ACTION_DEDUCTION"
+  | "SALE_ACTION_RESTORATION"
+  | "STOCK_RECEIVED"
+  | "STOCK_USED";
+
+export type MovementEntryStatus = "APPLIED" | "PENDING_REVIEW";
+export type MovementCoverageMode = "NONE" | "FULL" | "PARTIAL" | "UNCLEAR";
+
+export interface SupportingReconciliationSummary {
+  id: string;
+  physicalCount: number;
+  quantityDelta: number;
+  unit: string;
+  reason: string;
+  recordedBy: string;
+  recordedAt: string;
+}
+
+export interface StockMovementView {
+  id: string;
+  itemId: string;
+  movementType: StockMovementType;
+  entryStatus?: MovementEntryStatus;
+  quantity: number;
+  enteredQuantity?: number | null;
+  appliedQuantity?: number;
+  quantityDelta: number;
+  balanceBefore: number;
+  balanceAfter: number;
+  unit: string;
+  effectiveDate: string | null;
+  note: string | null;
+  coverageMode?: MovementCoverageMode | null;
+  coveredQuantity?: number;
+  supportingReconciliationId?: string | null;
+  supportingReconciliation?: SupportingReconciliationSummary | null;
+  coveredByOpeningCount?: boolean;
+  posReference?: string | null;
+  recordedBy: string;
+  recordedAt: string;
+  reviewedBy?: string | null;
+  reviewedAt?: string | null;
+  reviewNote?: string | null;
+}
+
+export interface PendingMovementReviewView {
+  entry: StockMovementView;
+  item: InventoryItemView;
+  applicableReconciliations: StockReconciliationView[];
+  openingCountCoversDate: boolean;
+}
+
+export interface InventoryItemHistoryView {
+  scope: "FULL" | "OWN_USAGE";
+  item: InventoryItemView;
+  openingStock: OpeningStockRecord | null;
+  movements: StockMovementView[];
+  reconciliations: StockReconciliationView[];
+}
+
 export interface InventoryPermissions {
   canView: boolean;
   canInitializeOpeningStock: boolean;
   canCreateProduct?: boolean;
+  canRecordReceiving?: boolean;
+  canRecordUsage?: boolean;
+  canReconcile?: boolean;
+  canViewFullHistory?: boolean;
+  canViewOwnUsageHistory?: boolean;
+  canReviewPendingEntries?: boolean;
 }
 
 export interface InventoryItemsResponse {
@@ -107,6 +180,7 @@ export interface InventoryItemsResponse {
   items: InventoryItemView[];
   posSections?: PosSectionView[];
   pendingStockReviews?: PendingSaleActionStockReviewView[];
+  pendingMovementReviewsCount?: number;
 }
 
 export const DEFAULT_POS_SECTIONS: readonly PosSectionView[] = [
@@ -115,60 +189,125 @@ export const DEFAULT_POS_SECTIONS: readonly PosSectionView[] = [
   { code: "CHANGE_OF_GRIPO", name: "Change of Gripo", isBuiltIn: true, sortOrder: 30 },
 ];
 
+export const QUANTITY_SCALE = 10_000;
 export const MAX_OPENING_QUANTITY = 1_000_000;
 export const MAX_UNIT_PRICE_CENTAVOS = 10_000_000;
 
 const MANILA_OFFSET_MS = 8 * 60 * 60 * 1000;
 const SHORT_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"] as const;
 
-export function parseOpeningQuantityInput(
+function parseQuantityInputInternal(
   raw: string,
-  unit = "containers",
+  unit: string,
+  options: { allowDecimal: boolean; allowZero: boolean },
 ): { ok: true; quantity: number } | { ok: false; message: string } {
   const trimmed = raw.trim();
   const unitNoun = unit === "containers" ? "container" : unit;
   if (!trimmed) {
-    return { ok: false, message: `Enter the actual ${unitNoun} count (0 or more).` };
+    return {
+      ok: false,
+      message: options.allowZero
+        ? `Enter the actual ${unitNoun} count (0 or more).`
+        : `Enter a positive quantity of ${unit}.`,
+    };
   }
-  if (!/^\d+$/.test(trimmed)) {
-    return { ok: false, message: `Enter a whole number of ${unit} (0 or more).` };
+
+  const pattern = options.allowDecimal ? /^(?:\d+|\d*\.\d+)$/ : /^\d+$/;
+  if (!pattern.test(trimmed)) {
+    return {
+      ok: false,
+      message: options.allowDecimal
+        ? `Enter a valid number of ${unit} (up to 4 decimal places).`
+        : options.allowZero
+          ? `Enter a whole number of ${unit} (0 or more).`
+          : `Enter a positive whole number of ${unit}.`,
+    };
   }
+
+  if (options.allowDecimal && trimmed.includes(".")) {
+    const decimals = trimmed.split(".")[1] ?? "";
+    if (decimals.length > 4) {
+      return {
+        ok: false,
+        message: `Enter at most 4 decimal places for ${unit}.`,
+      };
+    }
+  }
+
   const quantity = Number(trimmed);
-  if (!Number.isSafeInteger(quantity) || quantity < 0 || quantity > MAX_OPENING_QUANTITY) {
-    return { ok: false, message: "Enter a whole number from 0 to 1,000,000." };
+  if (!Number.isFinite(quantity)) {
+    return { ok: false, message: `Enter a valid number of ${unit}.` };
   }
-  return { ok: true, quantity };
+  const scaled = Math.round(quantity * QUANTITY_SCALE);
+  const normalized = scaled / QUANTITY_SCALE;
+
+  if (options.allowZero) {
+    if (scaled < 0 || normalized > MAX_OPENING_QUANTITY) {
+      return {
+        ok: false,
+        message: options.allowDecimal
+          ? "Enter a quantity from 0 to 1,000,000."
+          : "Enter a whole number from 0 to 1,000,000.",
+      };
+    }
+  } else if (scaled <= 0 || normalized > MAX_OPENING_QUANTITY) {
+    return {
+      ok: false,
+      message: options.allowDecimal
+        ? "Enter a positive quantity up to 1,000,000."
+        : "Enter a whole number from 1 to 1,000,000.",
+    };
+  }
+
+  return { ok: true, quantity: normalized };
+}
+
+export function parseOpeningQuantityInput(
+  raw: string,
+  unit = "containers",
+  allowDecimal = false,
+): { ok: true; quantity: number } | { ok: false; message: string } {
+  return parseQuantityInputInternal(raw, unit, { allowDecimal, allowZero: true });
 }
 
 export function parsePhysicalCountInput(
   raw: string,
   unit = "containers",
+  allowDecimal = false,
 ): { ok: true; quantity: number } | { ok: false; message: string } {
-  return parseOpeningQuantityInput(raw, unit);
+  return parseQuantityInputInternal(raw, unit, { allowDecimal, allowZero: true });
+}
+
+export function parseMovementQuantityInput(
+  raw: string,
+  unit: string,
+  allowDecimal = false,
+): { ok: true; quantity: number } | { ok: false; message: string } {
+  return parseQuantityInputInternal(raw, unit, { allowDecimal, allowZero: false });
 }
 
 export function parseLowStockLevelInput(
   raw: string,
   unit = "units",
+  allowDecimal = false,
 ): { ok: true; value: number | null } | { ok: false; message: string } {
   const trimmed = raw.trim();
   if (!trimmed) {
     return { ok: true, value: null };
   }
-  if (!/^\d+$/.test(trimmed)) {
+  const parsed = parseQuantityInputInternal(trimmed, unit, {
+    allowDecimal,
+    allowZero: false,
+  });
+  if (!parsed.ok) {
     return {
       ok: false,
-      message: `Enter a positive whole number of ${unit} (1 or more), or leave blank to clear.`,
+      message: allowDecimal
+        ? `Enter a positive quantity of ${unit} (up to 4 decimals), or leave blank to clear.`
+        : `Enter a positive whole number of ${unit} (1 or more), or leave blank to clear.`,
     };
   }
-  const value = Number(trimmed);
-  if (!Number.isSafeInteger(value) || value < 1 || value > MAX_OPENING_QUANTITY) {
-    return {
-      ok: false,
-      message: `Enter a whole number from 1 to ${MAX_OPENING_QUANTITY.toLocaleString("en-US")}, or leave blank to clear.`,
-    };
-  }
-  return { ok: true, value };
+  return { ok: true, value: parsed.quantity };
 }
 
 export function formatFaucetReportingTypeLabel(
@@ -193,20 +332,34 @@ export function computeReconciliationPreview(
   delta: number;
   after: number;
 } {
+  const delta =
+    (Math.round(physicalCount * QUANTITY_SCALE) - Math.round(currentQuantity * QUANTITY_SCALE)) /
+    QUANTITY_SCALE;
   return {
     before: currentQuantity,
     physicalCount,
-    delta: physicalCount - currentQuantity,
+    delta: Object.is(delta, -0) ? 0 : delta,
     after: physicalCount,
   };
 }
 
+export function formatQuantityNumber(value: number): string {
+  const scaled = Math.round(value * QUANTITY_SCALE);
+  if (scaled === 0) return "0";
+  const normalized = scaled / QUANTITY_SCALE;
+  const abs = Math.abs(normalized);
+  const text = Number.isInteger(abs) ? String(abs) : String(Number(abs.toFixed(4)));
+  return normalized < 0 ? `−${text}` : text;
+}
+
 export function formatSignedDelta(delta: number, unit: string): string {
-  if (delta === 0) {
+  const scaled = Math.round(delta * QUANTITY_SCALE);
+  if (scaled === 0) {
     return `0 ${unit === "containers" ? "containers" : unit} (Verified match)`;
   }
-  const absLabel = formatQuantityLabel(Math.abs(delta), unit);
-  return delta > 0 ? `+${absLabel}` : `−${absLabel}`;
+  const absVal = Math.abs(scaled / QUANTITY_SCALE);
+  const absLabel = formatQuantityLabel(absVal, unit);
+  return scaled > 0 ? `+${absLabel}` : `−${absLabel}`;
 }
 
 export function parsePesoPriceToCentavos(raw: string): number | null {
@@ -242,8 +395,142 @@ export function formatQuantityLabel(quantity: number | null, unit: string): stri
   if (quantity === null) {
     return "Not Set";
   }
-  const unitLabel = quantity === 1 && unit === "containers" ? "container" : unit;
-  return `${quantity} ${unitLabel}`;
+  const unitLabel = Math.abs(quantity) === 1 && unit === "containers" ? "container" : unit;
+  return `${formatQuantityNumber(quantity)} ${unitLabel}`;
+}
+
+export function getTodayManilaDateString(now: Date = new Date()): string {
+  const shifted = new Date(now.getTime() + MANILA_OFFSET_MS);
+  const year = shifted.getUTCFullYear();
+  const month = String(shifted.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(shifted.getUTCDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
+}
+
+export function isUncertainSubmissionError(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return true;
+  }
+  const maybeStatus = (error as { status?: unknown }).status;
+  const maybeCode = (error as { code?: unknown }).code;
+  if (maybeCode === "NETWORK_ERROR") {
+    return true;
+  }
+  if (typeof maybeStatus === "number") {
+    return maybeStatus === 0 || maybeStatus >= 500;
+  }
+  return true;
+}
+
+export interface PendingStockMovementAttempt {
+  movementType: "STOCK_RECEIVED" | "STOCK_USED";
+  itemKey: string;
+  itemName: string;
+  unit: string;
+  quantityInput: string;
+  noteOrPurposeInput: string;
+  effectiveDate: string;
+  requestKey: string;
+  expectedRevision: number;
+  expectedCurrentQuantity: number;
+}
+
+export interface StorageLike {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+  removeItem(key: string): void;
+}
+
+const PENDING_MOVEMENT_STORAGE_PREFIX = "hydrop_inventory_pending_movements_v1:";
+
+export function pendingMovementStorageKey(username: string): string {
+  return `${PENDING_MOVEMENT_STORAGE_PREFIX}${username.trim().toLowerCase()}`;
+}
+
+function browserLocalStorage(): StorageLike | null {
+  try {
+    if (typeof window === "undefined") return null;
+    return window.localStorage;
+  } catch {
+    return null;
+  }
+}
+
+function isValidPendingMovementAttempt(value: unknown): value is PendingStockMovementAttempt {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    (candidate.movementType === "STOCK_RECEIVED" || candidate.movementType === "STOCK_USED") &&
+    typeof candidate.itemKey === "string" &&
+    candidate.itemKey.length > 0 &&
+    typeof candidate.itemName === "string" &&
+    typeof candidate.unit === "string" &&
+    typeof candidate.quantityInput === "string" &&
+    typeof candidate.noteOrPurposeInput === "string" &&
+    typeof candidate.effectiveDate === "string" &&
+    typeof candidate.requestKey === "string" &&
+    candidate.requestKey.length > 0 &&
+    typeof candidate.expectedRevision === "number" &&
+    Number.isInteger(candidate.expectedRevision) &&
+    typeof candidate.expectedCurrentQuantity === "number" &&
+    Number.isFinite(candidate.expectedCurrentQuantity)
+  );
+}
+
+export function loadPendingMovementAttempts(
+  username: string,
+  storage: StorageLike | null = browserLocalStorage(),
+): PendingStockMovementAttempt[] {
+  const normalizedUser = username.trim().toLowerCase();
+  if (!normalizedUser || !storage) return [];
+  try {
+    const raw = storage.getItem(pendingMovementStorageKey(normalizedUser));
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(isValidPendingMovementAttempt);
+  } catch {
+    return [];
+  }
+}
+
+export function savePendingMovementAttempts(
+  username: string,
+  attempts: PendingStockMovementAttempt[],
+  storage: StorageLike | null = browserLocalStorage(),
+): void {
+  const normalizedUser = username.trim().toLowerCase();
+  if (!normalizedUser || !storage) return;
+  try {
+    const key = pendingMovementStorageKey(normalizedUser);
+    if (attempts.length === 0) {
+      storage.removeItem(key);
+    } else {
+      storage.setItem(key, JSON.stringify(attempts));
+    }
+  } catch {
+    // Ignore quota/storage availability errors; in-memory state remains active.
+  }
+}
+
+export function upsertPendingMovementAttempt(
+  attempts: PendingStockMovementAttempt[],
+  next: PendingStockMovementAttempt,
+): PendingStockMovementAttempt[] {
+  const filtered = attempts.filter(
+    (entry) => !(entry.movementType === next.movementType && entry.itemKey === next.itemKey),
+  );
+  return [...filtered, next];
+}
+
+export function removePendingMovementAttempt(
+  attempts: PendingStockMovementAttempt[],
+  movementType: "STOCK_RECEIVED" | "STOCK_USED",
+  itemKey: string,
+): PendingStockMovementAttempt[] {
+  return attempts.filter(
+    (entry) => !(entry.movementType === movementType && entry.itemKey === itemKey),
+  );
 }
 
 export function formatRecordedAtManila(iso: string): string {
@@ -279,8 +566,19 @@ export function getStockStatusMeta(item: InventoryItemView): StockStatusMeta {
   if (item.status === "NOT_SET" || item.currentQuantity === null) {
     return { tone: "unset", label: "Not Set" };
   }
+  if (item.needsReconciliation || item.currentQuantity < 0) {
+    return { tone: "discrepancy", label: "Needs Reconciliation" };
+  }
   if (item.currentQuantity === 0) {
     return { tone: "out", label: "No Stock" };
+  }
+  if (
+    item.lowStockLevel !== undefined &&
+    item.lowStockLevel !== null &&
+    item.lowStockLevel > 0 &&
+    item.currentQuantity <= item.lowStockLevel
+  ) {
+    return { tone: "low", label: "Low Stock" };
   }
   return { tone: "in", label: "In Stock" };
 }
@@ -299,7 +597,7 @@ export function getInventorySummaryCounts(items: InventoryItemView[]): {
     const { tone } = getStockStatusMeta(item);
     if (tone === "unset") {
       notSet += 1;
-    } else if (tone === "out") {
+    } else if (tone === "out" || (item.currentQuantity !== null && item.currentQuantity <= 0)) {
       noStock += 1;
     } else {
       inStock += 1;
@@ -349,6 +647,9 @@ export function getInventoryItemGroup(
 ): string {
   if (item.category === "CONTAINER") {
     return "CONTAINER";
+  }
+  if (item.category === "OPERATING_SUPPLY") {
+    return "OPERATING_SUPPLY";
   }
   if (item.posSection && item.posSection !== "CONTAINERS") {
     const known =
@@ -423,6 +724,16 @@ export function groupInventoryItems(
     });
   }
 
+  const supplyItems = buckets.get("OPERATING_SUPPLY");
+  if (supplyItems && supplyItems.length > 0) {
+    result.push({
+      key: "OPERATING_SUPPLY",
+      title: "Operating Supplies",
+      metaPrefix: "Station supplies",
+      items: supplyItems,
+    });
+  }
+
   return result;
 }
 
@@ -470,7 +781,7 @@ export function getOpeningSubmitLabel(
   return "Save Opening Count";
 }
 
-function getItemMergeKey(item: InventoryItemView): string {
+export function getInventoryItemKey(item: InventoryItemView): string {
   return item.id ?? item.shape ?? item.code;
 }
 
@@ -479,16 +790,15 @@ export function mergeRefreshedInventoryItems(
   fetchedItems: InventoryItemView[],
 ): InventoryItemView[] {
   const currentByKey = new Map<string, InventoryItemView>(
-    currentItems.map((item) => [getItemMergeKey(item), item]),
+    currentItems.map((item) => [getInventoryItemKey(item), item]),
   );
 
   return fetchedItems.map((fetched) => {
-    const existing = currentByKey.get(getItemMergeKey(fetched));
+    const existing = currentByKey.get(getInventoryItemKey(fetched));
     if (
       existing &&
       existing.status === "INITIALIZED" &&
-      existing.openingStock !== null &&
-      (fetched.status === "NOT_SET" || fetched.openingStock === null)
+      fetched.status === "NOT_SET"
     ) {
       return existing;
     }
@@ -502,4 +812,396 @@ export function mergeRefreshedInventoryItems(
     }
     return fetched;
   });
+}
+
+const CANONICAL_DECIMAL_REGEX = /^(-?)(\d+)(?:\.(\d{1,4}))?$/;
+
+function parseExactFourDecimalScaled(value: number): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  const match = CANONICAL_DECIMAL_REGEX.exec(String(value));
+  if (!match) return null;
+  const sign = match[1] === "-" ? -1 : 1;
+  const whole = Number(match[2]);
+  const frac = Number((match[3] ?? "").padEnd(4, "0"));
+  const scaled = sign * (whole * QUANTITY_SCALE + frac);
+  return Number.isSafeInteger(scaled) ? scaled : null;
+}
+
+function isValidOpeningStockRecord(value: unknown): value is OpeningStockRecord {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  const scaledQuantity =
+    typeof candidate.quantity === "number" ? parseExactFourDecimalScaled(candidate.quantity) : null;
+  return (
+    scaledQuantity !== null &&
+    scaledQuantity >= 0 &&
+    typeof candidate.unit === "string" &&
+    candidate.unit.length > 0 &&
+    typeof candidate.recordedBy === "string" &&
+    candidate.recordedBy.length > 0 &&
+    typeof candidate.recordedAt === "string" &&
+    candidate.recordedAt.length > 0
+  );
+}
+
+export function isValidInventoryItemPayload(value: unknown): value is InventoryItemView {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  if (
+    typeof candidate.id !== "string" ||
+    candidate.id.length === 0 ||
+    typeof candidate.code !== "string" ||
+    candidate.code.length === 0 ||
+    typeof candidate.name !== "string" ||
+    candidate.name.length === 0 ||
+    typeof candidate.unit !== "string" ||
+    candidate.unit.length === 0 ||
+    (candidate.category !== "CONTAINER" &&
+      candidate.category !== "MERCHANDISE" &&
+      candidate.category !== "OPERATING_SUPPLY") ||
+    typeof candidate.stockRevision !== "number" ||
+    !Number.isInteger(candidate.stockRevision) ||
+    candidate.stockRevision < 0
+  ) {
+    return false;
+  }
+  if (candidate.status === "NOT_SET") {
+    return candidate.currentQuantity === null && candidate.openingStock === null;
+  }
+  if (candidate.status === "INITIALIZED") {
+    const validOpeningStock =
+      candidate.openingStock === null
+        ? candidate.category === "OPERATING_SUPPLY"
+        : isValidOpeningStockRecord(candidate.openingStock);
+    return (
+      typeof candidate.currentQuantity === "number" &&
+      parseExactFourDecimalScaled(candidate.currentQuantity) !== null &&
+      validOpeningStock
+    );
+  }
+  return false;
+}
+
+export function isValidSavedMovementItemPayload(value: unknown): value is InventoryItemView {
+  return (
+    isValidInventoryItemPayload(value) &&
+    value.status === "INITIALIZED" &&
+    typeof value.currentQuantity === "number" &&
+    parseExactFourDecimalScaled(value.currentQuantity) !== null &&
+    typeof value.id === "string" &&
+    value.id.length > 0
+  );
+}
+
+export function isValidStockMovementPayload(value: unknown): value is StockMovementView {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  if (
+    typeof candidate.id !== "string" ||
+    candidate.id.length === 0 ||
+    typeof candidate.itemId !== "string" ||
+    candidate.itemId.length === 0 ||
+    (candidate.movementType !== "STOCK_RECEIVED" && candidate.movementType !== "STOCK_USED") ||
+    typeof candidate.quantity !== "number" ||
+    typeof candidate.quantityDelta !== "number" ||
+    typeof candidate.balanceBefore !== "number" ||
+    typeof candidate.balanceAfter !== "number" ||
+    typeof candidate.unit !== "string" ||
+    candidate.unit.length === 0 ||
+    typeof candidate.effectiveDate !== "string" ||
+    !/^\d{4}-\d{2}-\d{2}$/.test(candidate.effectiveDate) ||
+    (candidate.note !== null && typeof candidate.note !== "string") ||
+    typeof candidate.recordedBy !== "string" ||
+    candidate.recordedBy.length === 0 ||
+    typeof candidate.recordedAt !== "string" ||
+    candidate.recordedAt.length === 0
+  ) {
+    return false;
+  }
+  if (
+    candidate.entryStatus !== undefined &&
+    candidate.entryStatus !== "APPLIED" &&
+    candidate.entryStatus !== "PENDING_REVIEW"
+  ) {
+    return false;
+  }
+  if (
+    candidate.coverageMode !== undefined &&
+    candidate.coverageMode !== null &&
+    candidate.coverageMode !== "NONE" &&
+    candidate.coverageMode !== "FULL" &&
+    candidate.coverageMode !== "PARTIAL" &&
+    candidate.coverageMode !== "UNCLEAR"
+  ) {
+    return false;
+  }
+
+  const scaledQty = parseExactFourDecimalScaled(candidate.quantity);
+  const scaledDelta = parseExactFourDecimalScaled(candidate.quantityDelta);
+  const scaledBefore = parseExactFourDecimalScaled(candidate.balanceBefore);
+  const scaledAfter = parseExactFourDecimalScaled(candidate.balanceAfter);
+  if (
+    scaledQty === null ||
+    scaledQty <= 0 ||
+    scaledDelta === null ||
+    scaledBefore === null ||
+    scaledAfter === null
+  ) {
+    return false;
+  }
+
+  const allowsZeroEffect =
+    candidate.entryStatus === "PENDING_REVIEW" || candidate.coverageMode === "FULL";
+  if (scaledDelta === 0) {
+    return allowsZeroEffect && scaledBefore === scaledAfter;
+  }
+
+  const signMatches =
+    candidate.movementType === "STOCK_RECEIVED" ? scaledDelta > 0 : scaledDelta < 0;
+  if (!signMatches || scaledBefore + scaledDelta !== scaledAfter) {
+    return false;
+  }
+
+  if (candidate.coverageMode === "PARTIAL") {
+    const scaledCovered =
+      typeof candidate.coveredQuantity === "number"
+        ? parseExactFourDecimalScaled(candidate.coveredQuantity)
+        : null;
+    return (
+      scaledCovered !== null &&
+      scaledCovered > 0 &&
+      Math.abs(scaledDelta) + scaledCovered === scaledQty
+    );
+  }
+
+  return Math.abs(scaledDelta) === scaledQty;
+}
+
+export function matchesPendingMovementAttempt(
+  attempt: PendingStockMovementAttempt,
+  item: InventoryItemView,
+  movement: StockMovementView,
+): boolean {
+  if (typeof item.id !== "string" || item.id !== movement.itemId) {
+    return false;
+  }
+  if (getInventoryItemKey(item) !== attempt.itemKey) {
+    return false;
+  }
+  if (movement.movementType !== attempt.movementType) {
+    return false;
+  }
+  if (item.unit !== attempt.unit || movement.unit !== attempt.unit) {
+    return false;
+  }
+  if (movement.effectiveDate !== attempt.effectiveDate) {
+    return false;
+  }
+  const parsedQty = parseMovementQuantityInput(attempt.quantityInput, attempt.unit, true);
+  if (!parsedQty.ok) {
+    return false;
+  }
+  const scaledExpectedQty = parseExactFourDecimalScaled(parsedQty.quantity);
+  const scaledMovementQty = parseExactFourDecimalScaled(movement.quantity);
+  const scaledMovementDelta = parseExactFourDecimalScaled(movement.quantityDelta);
+  if (
+    scaledExpectedQty === null ||
+    scaledMovementQty === null ||
+    scaledMovementDelta === null ||
+    scaledMovementQty !== scaledExpectedQty
+  ) {
+    return false;
+  }
+
+  if (movement.entryStatus === "PENDING_REVIEW" || movement.coverageMode === "FULL") {
+    if (scaledMovementDelta !== 0) {
+      return false;
+    }
+  } else if (movement.coverageMode === "PARTIAL") {
+    const scaledCovered =
+      typeof movement.coveredQuantity === "number"
+        ? parseExactFourDecimalScaled(movement.coveredQuantity)
+        : null;
+    if (
+      scaledCovered === null ||
+      scaledCovered <= 0 ||
+      Math.abs(scaledMovementDelta) + scaledCovered !== scaledExpectedQty
+    ) {
+      return false;
+    }
+  } else if (Math.abs(scaledMovementDelta) !== scaledExpectedQty) {
+    return false;
+  }
+
+  const expectedNote = attempt.noteOrPurposeInput.trim().replace(/\s+/g, " ") || null;
+  return (movement.note ?? null) === expectedNote;
+}
+
+export interface LateCoveragePreview {
+  enteredQuantity: number;
+  coveredQuantity: number;
+  uncoveredQuantity: number;
+  signedDelta: number;
+  projectedBalance: number | null;
+  pendingReview: boolean;
+}
+
+export function computeLateCoveragePreview(params: {
+  movementType: "STOCK_RECEIVED" | "STOCK_USED";
+  currentQuantity: number | null;
+  enteredQuantity: number;
+  coverageMode: MovementCoverageMode;
+  coveredQuantity?: number | null;
+}): LateCoveragePreview | null {
+  const enteredScaled = parseExactFourDecimalScaled(params.enteredQuantity);
+  if (enteredScaled === null || enteredScaled <= 0) return null;
+
+  if (params.coverageMode === "UNCLEAR") {
+    return {
+      enteredQuantity: enteredScaled / QUANTITY_SCALE,
+      coveredQuantity: 0,
+      uncoveredQuantity: 0,
+      signedDelta: 0,
+      projectedBalance: params.currentQuantity,
+      pendingReview: true,
+    };
+  }
+
+  let coveredScaled = 0;
+  if (params.coverageMode === "FULL") {
+    coveredScaled = enteredScaled;
+  } else if (params.coverageMode === "PARTIAL") {
+    const parsedCov =
+      typeof params.coveredQuantity === "number"
+        ? parseExactFourDecimalScaled(params.coveredQuantity)
+        : null;
+    if (parsedCov === null || parsedCov <= 0 || parsedCov >= enteredScaled) {
+      return null;
+    }
+    coveredScaled = parsedCov;
+  }
+
+  const uncoveredScaled = enteredScaled - coveredScaled;
+  const signedScaledDelta =
+    uncoveredScaled === 0
+      ? 0
+      : params.movementType === "STOCK_RECEIVED"
+        ? uncoveredScaled
+        : -uncoveredScaled;
+
+  let projectedBalance = params.currentQuantity;
+  if (params.currentQuantity !== null) {
+    const currentScaled = parseExactFourDecimalScaled(params.currentQuantity);
+    projectedBalance =
+      currentScaled !== null
+        ? (currentScaled + signedScaledDelta) / QUANTITY_SCALE
+        : params.currentQuantity + signedScaledDelta / QUANTITY_SCALE;
+  }
+
+  return {
+    enteredQuantity: enteredScaled / QUANTITY_SCALE,
+    coveredQuantity: coveredScaled / QUANTITY_SCALE,
+    uncoveredQuantity: uncoveredScaled / QUANTITY_SCALE,
+    signedDelta: signedScaledDelta / QUANTITY_SCALE,
+    projectedBalance,
+    pendingReview: false,
+  };
+}
+
+export type PendingMovementStatusResult =
+  | { kind: "SAVED"; item: InventoryItemView; movement: StockMovementView }
+  | { kind: "CANCELLED" }
+  | { kind: "NOT_FOUND" }
+  | { kind: "UNEXPECTED" };
+
+export type PendingMovementCancelResult =
+  | { kind: "SAVED"; item: InventoryItemView; movement: StockMovementView }
+  | { kind: "CANCELLED" }
+  | { kind: "UNEXPECTED" };
+
+export function parsePendingMovementStatusResponse(
+  payload: unknown,
+  attempt: PendingStockMovementAttempt,
+): PendingMovementStatusResult {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return { kind: "UNEXPECTED" };
+  }
+  const candidate = payload as Record<string, unknown>;
+  if (candidate.status === "SAVED") {
+    if (
+      isValidSavedMovementItemPayload(candidate.item) &&
+      isValidStockMovementPayload(candidate.movement) &&
+      matchesPendingMovementAttempt(attempt, candidate.item, candidate.movement)
+    ) {
+      return {
+        kind: "SAVED",
+        item: candidate.item,
+        movement: candidate.movement,
+      };
+    }
+    return { kind: "UNEXPECTED" };
+  }
+  if (candidate.status === "CANCELLED") {
+    return { kind: "CANCELLED" };
+  }
+  if (candidate.status === "NOT_FOUND") {
+    return { kind: "NOT_FOUND" };
+  }
+  return { kind: "UNEXPECTED" };
+}
+
+export function parsePendingMovementCancelResponse(
+  payload: unknown,
+  attempt: PendingStockMovementAttempt,
+): PendingMovementCancelResult {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return { kind: "UNEXPECTED" };
+  }
+  const candidate = payload as Record<string, unknown>;
+  if (candidate.status === "SAVED") {
+    if (
+      isValidSavedMovementItemPayload(candidate.item) &&
+      isValidStockMovementPayload(candidate.movement) &&
+      matchesPendingMovementAttempt(attempt, candidate.item, candidate.movement)
+    ) {
+      return {
+        kind: "SAVED",
+        item: candidate.item,
+        movement: candidate.movement,
+      };
+    }
+    return { kind: "UNEXPECTED" };
+  }
+  if (candidate.status === "CANCELLED") {
+    return { kind: "CANCELLED" };
+  }
+  return { kind: "UNEXPECTED" };
+}
+
+export async function requestPendingMovementStatus(
+  attempt: PendingStockMovementAttempt,
+  fetcher: typeof api = api,
+): Promise<PendingMovementStatusResult> {
+  const payload = await fetcher<unknown>(
+    `/api/inventory/movements/by-request-key/${encodeURIComponent(attempt.requestKey)}`,
+  );
+  return parsePendingMovementStatusResponse(payload, attempt);
+}
+
+export async function requestPendingMovementCancel(
+  attempt: PendingStockMovementAttempt,
+  endpointItemKey: string,
+  fetcher: typeof api = api,
+): Promise<PendingMovementCancelResult> {
+  const payload = await fetcher<unknown>(
+    `/api/inventory/movements/by-request-key/${encodeURIComponent(attempt.requestKey)}/cancel`,
+    {
+      method: "POST",
+      body: {
+        itemKey: endpointItemKey,
+        movementType: attempt.movementType,
+      },
+    },
+  );
+  return parsePendingMovementCancelResponse(payload, attempt);
 }

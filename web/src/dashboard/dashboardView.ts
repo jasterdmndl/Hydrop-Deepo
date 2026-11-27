@@ -38,7 +38,9 @@ export type StockTrendMovementType =
   | "PRIOR_DAY_SETTLEMENT"
   | "PHYSICAL_COUNT_RECONCILIATION"
   | "SALE_ACTION_DEDUCTION"
-  | "SALE_ACTION_RESTORATION";
+  | "SALE_ACTION_RESTORATION"
+  | "STOCK_RECEIVED"
+  | "STOCK_USED";
 
 export const MAX_CUSTOM_RANGE_DAYS = 366;
 
@@ -608,7 +610,7 @@ export function buildStocksSnapshot(
         quantity: null,
         unit: item.unit,
       });
-    } else if (item.currentQuantity < 0) {
+    } else if (item.needsReconciliation || item.currentQuantity < 0) {
       alerts.push({
         key,
         productName: item.name,
@@ -735,5 +737,9 @@ export function formatStockMovementTypeLabel(type: StockTrendMovementType): stri
       return "Sale Correction Deduction";
     case "SALE_ACTION_RESTORATION":
       return "Sale Return Restoration";
+    case "STOCK_RECEIVED":
+      return "Stock Received";
+    case "STOCK_USED":
+      return "Stock Used";
   }
 }

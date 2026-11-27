@@ -2,11 +2,11 @@ import type { Role } from "../auth/policy.js";
 
 /**
  * Inventory domain rules and validation for Round/Slim containers,
- * Owner-created merchandise products, reusable POS sections, archiving,
- * and INV-009 physical-count reconciliation (DEC-065, DEC-068–070, DEC-073, DEC-074).
+ * Owner-created merchandise and operating supply products, reusable POS sections,
+ * archiving, Stock Received / Stock Used movements, and INV-009 reconciliations.
  */
 export type ContainerShape = "ROUND" | "SLIM";
-export type InventoryCategory = "CONTAINER" | "MERCHANDISE";
+export type InventoryCategory = "CONTAINER" | "MERCHANDISE" | "OPERATING_SUPPLY";
 export type PosSection = string;
 export type FaucetReportingType = "PUSH_TYPE" | "TWIST_TYPE";
 
@@ -18,7 +18,10 @@ export const BUILT_IN_POS_SECTIONS = {
   CHANGE_OF_GRIPO: "CHANGE_OF_GRIPO",
 } as const;
 
+export const QUANTITY_SCALE = 10_000;
 export const MAX_OPENING_QUANTITY = 1_000_000;
+/** Stored balances use numeric(12, 4), so accumulated balances can exceed single-entry caps up to 99,999,999.9999. */
+export const MAX_STORED_BALANCE = 99_999_999.9999;
 export const MAX_UNIT_PRICE_CENTAVOS = 10_000_000;
 export const MAX_PRODUCT_NAME_LENGTH = 80;
 export const MAX_PRODUCT_DESCRIPTION_LENGTH = 160;
@@ -26,22 +29,43 @@ export const MAX_STOCK_UNIT_LENGTH = 30;
 export const MAX_POS_SECTION_NAME_LENGTH = 60;
 export const MAX_POS_SECTION_CODE_LENGTH = 64;
 export const MAX_RECONCILIATION_REASON_LENGTH = 240;
+export const MAX_MOVEMENT_NOTE_LENGTH = 240;
 
 const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const DATE_REGEX = /^(\d{4})-(\d{2})-(\d{2})$/;
 
 export interface InventoryPermissions {
   canView: boolean;
   /** Only the Owner can record the initial physical count per item (INV-005). */
   canInitializeOpeningStock: boolean;
-  /** Only the Owner can manage Inventory products, POS visibility, sections, archiving, and stock corrections. */
+  /** Only the Owner can manage Inventory products, POS visibility, sections, and archiving. */
   canCreateProduct: boolean;
+  /** Only the Owner can record Stock Received (INV-003, INV-006). */
+  canRecordReceiving: boolean;
+  /** Both Owner and Employee can record Stock Used for operating supplies (INV-003, INV-007). */
+  canRecordUsage: boolean;
+  /** Only the Owner can run physical-count reconciliations (INV-009). */
+  canReconcile: boolean;
+  /** Only the Owner can inspect full stock history, reconciliations, and pending reviews (INV-040, INV-041). */
+  canViewFullHistory: boolean;
+  /** Signed-in operators can view their own recorded Stock Used history (INV-041). */
+  canViewOwnUsageHistory: boolean;
+  /** Only the Owner can confirm count coverage and resolve pending late entries (INV-025, INV-029, INV-040). */
+  canReviewPendingEntries: boolean;
 }
 
 export function inventoryPermissions(role: Role): InventoryPermissions {
+  const isOwner = role === "OWNER";
   return {
     canView: true,
-    canInitializeOpeningStock: role === "OWNER",
-    canCreateProduct: role === "OWNER",
+    canInitializeOpeningStock: isOwner,
+    canCreateProduct: isOwner,
+    canRecordReceiving: isOwner,
+    canRecordUsage: true,
+    canReconcile: isOwner,
+    canViewFullHistory: isOwner,
+    canViewOwnUsageHistory: true,
+    canReviewPendingEntries: isOwner,
   };
 }
 
@@ -109,6 +133,8 @@ export interface InventoryItemView {
   shape: ContainerShape | null;
   description: string | null;
   unit: string;
+  allowDecimalQuantity: boolean;
+  needsReconciliation: boolean;
   unitPriceCentavos: number | null;
   showInPos: boolean;
   posSection: PosSection | null;
@@ -129,6 +155,109 @@ export interface InventoryItemView {
   createdAt: string;
 }
 
+export type StockMovementType =
+  | "POS_SALE"
+  | "PRIOR_DAY_SETTLEMENT"
+  | "PHYSICAL_COUNT_RECONCILIATION"
+  | "SALE_ACTION_DEDUCTION"
+  | "SALE_ACTION_RESTORATION"
+  | "STOCK_RECEIVED"
+  | "STOCK_USED";
+
+export type MovementEntryStatus = "APPLIED" | "PENDING_REVIEW";
+export type MovementCoverageMode = "NONE" | "FULL" | "PARTIAL" | "UNCLEAR";
+
+export interface SupportingReconciliationSummary {
+  id: string;
+  physicalCount: number;
+  quantityDelta: number;
+  unit: string;
+  reason: string;
+  recordedBy: string;
+  recordedAt: string;
+}
+
+export interface StockMovementView {
+  id: string;
+  itemId: string;
+  movementType: StockMovementType;
+  entryStatus: MovementEntryStatus;
+  quantity: number;
+  enteredQuantity: number | null;
+  appliedQuantity: number;
+  quantityDelta: number;
+  balanceBefore: number;
+  balanceAfter: number;
+  unit: string;
+  effectiveDate: string | null;
+  note: string | null;
+  coverageMode: MovementCoverageMode | null;
+  coveredQuantity: number;
+  supportingReconciliationId: string | null;
+  supportingReconciliation: SupportingReconciliationSummary | null;
+  coveredByOpeningCount: boolean;
+  posReference: string | null;
+  recordedBy: string;
+  recordedAt: string;
+  reviewedBy: string | null;
+  reviewedAt: string | null;
+  reviewNote: string | null;
+}
+
+export interface PendingMovementReviewView {
+  entry: StockMovementView;
+  item: InventoryItemView;
+  applicableReconciliations: StockReconciliationView[];
+  openingCountCoversDate: boolean;
+}
+
+export interface InventoryItemHistoryView {
+  scope: "FULL" | "OWN_USAGE";
+  item: InventoryItemView;
+  openingStock: OpeningStockRecord | null;
+  movements: StockMovementView[];
+  reconciliations: StockReconciliationView[];
+}
+
+const CANONICAL_DECIMAL_REGEX = /^(-?)(\d+)(?:\.(\d{1,4}))?$/;
+
+function parseScaledDecimalNumber(value: number): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  const match = CANONICAL_DECIMAL_REGEX.exec(String(value));
+  if (!match) return null;
+  const sign = match[1] === "-" ? -1 : 1;
+  const whole = Number(match[2]);
+  const frac = Number((match[3] ?? "").padEnd(4, "0"));
+  if (!Number.isSafeInteger(whole)) return null;
+  const scaled = sign * (whole * QUANTITY_SCALE + frac);
+  if (!Number.isSafeInteger(scaled)) return null;
+  return scaled === 0 ? 0 : scaled;
+}
+
+export function toScaledQuantity(value: number): number {
+  const exact = parseScaledDecimalNumber(value);
+  if (exact !== null) return exact;
+  const rounded = Math.round(value * QUANTITY_SCALE);
+  return rounded === 0 ? 0 : rounded;
+}
+
+export function fromScaledQuantity(scaled: number): number {
+  const result = scaled / QUANTITY_SCALE;
+  return Object.is(result, -0) ? 0 : result;
+}
+
+export function addQuantities(a: number, b: number): number {
+  return fromScaledQuantity(toScaledQuantity(a) + toScaledQuantity(b));
+}
+
+export function subtractQuantities(a: number, b: number): number {
+  return fromScaledQuantity(toScaledQuantity(a) - toScaledQuantity(b));
+}
+
+export function quantitiesEqual(a: number, b: number): boolean {
+  return toScaledQuantity(a) === toScaledQuantity(b);
+}
+
 export function parseContainerShape(raw: unknown): ContainerShape | null {
   if (typeof raw !== "string") return null;
   const normalized = raw.trim().toUpperCase();
@@ -142,15 +271,57 @@ export function isUuid(raw: unknown): raw is string {
   return typeof raw === "string" && UUID_REGEX.test(raw.trim());
 }
 
-export function parseOpeningQuantity(raw: unknown): number | null {
-  if (typeof raw !== "number") return null;
-  if (!Number.isInteger(raw)) return null;
-  if (raw < 0 || raw > MAX_OPENING_QUANTITY) return null;
-  return raw;
+export function parseQuantity(
+  raw: unknown,
+  options: { allowDecimal: boolean; allowZero: boolean; allowNegative?: boolean; max?: number },
+): number | null {
+  const scaled = typeof raw === "number" ? parseScaledDecimalNumber(raw) : null;
+  if (scaled === null) return null;
+
+  const maxScaled = parseScaledDecimalNumber(options.max ?? MAX_OPENING_QUANTITY);
+  if (maxScaled === null) return null;
+
+  if (!options.allowDecimal && scaled % QUANTITY_SCALE !== 0) {
+    return null;
+  }
+
+  if (options.allowNegative) {
+    if (scaled < -maxScaled || scaled > maxScaled) {
+      return null;
+    }
+    if (!options.allowZero && scaled === 0) {
+      return null;
+    }
+    return fromScaledQuantity(scaled);
+  }
+
+  if (options.allowZero) {
+    if (scaled < 0 || scaled > maxScaled) return null;
+  } else {
+    if (scaled <= 0 || scaled > maxScaled) return null;
+  }
+
+  return fromScaledQuantity(scaled);
 }
 
-export function parsePhysicalCount(raw: unknown): number | null {
-  return parseOpeningQuantity(raw);
+export function parseStoredBalanceBaseline(
+  raw: unknown,
+  options: { allowDecimal: boolean; allowNegative: boolean },
+): number | null {
+  return parseQuantity(raw, {
+    allowDecimal: options.allowDecimal,
+    allowZero: true,
+    allowNegative: options.allowNegative,
+    max: MAX_STORED_BALANCE,
+  });
+}
+
+export function parseOpeningQuantity(raw: unknown, allowDecimal = false): number | null {
+  return parseQuantity(raw, { allowDecimal, allowZero: true });
+}
+
+export function parsePhysicalCount(raw: unknown, allowDecimal = false): number | null {
+  return parseQuantity(raw, { allowDecimal, allowZero: true });
 }
 
 export function parseProductName(raw: unknown): string | null {
@@ -225,17 +396,86 @@ export function parseReconciliationReason(raw: unknown): string | null {
 
 export function parseLowStockLevel(
   raw: unknown,
+  allowDecimal = false,
 ): { ok: true; value: number | null } | { ok: false } {
   if (raw === null) {
     return { ok: true, value: null };
   }
-  if (typeof raw !== "number" || !Number.isInteger(raw)) {
+  const parsed = parseQuantity(raw, { allowDecimal, allowZero: false });
+  if (parsed === null) {
     return { ok: false };
   }
-  if (raw < 1 || raw > MAX_OPENING_QUANTITY) {
+  return { ok: true, value: parsed };
+}
+
+export function parseMovementNote(
+  raw: unknown,
+  options: { required: boolean },
+): { ok: true; value: string | null } | { ok: false } {
+  if (raw === undefined || raw === null) {
+    return options.required ? { ok: false } : { ok: true, value: null };
+  }
+  if (typeof raw !== "string") {
     return { ok: false };
   }
-  return { ok: true, value: raw };
+  const trimmed = raw.trim().replace(/\s+/g, " ");
+  if (!trimmed) {
+    return options.required ? { ok: false } : { ok: true, value: null };
+  }
+  if (trimmed.length > MAX_MOVEMENT_NOTE_LENGTH) {
+    return { ok: false };
+  }
+  return { ok: true, value: trimmed };
+}
+
+export function parseRequestKey(
+  raw: unknown,
+): { ok: true; value: string | null } | { ok: false } {
+  if (raw === undefined || raw === null || raw === "") {
+    return { ok: true, value: null };
+  }
+  if (typeof raw !== "string") {
+    return { ok: false };
+  }
+  const trimmed = raw.trim();
+  if (!trimmed || trimmed.length > 128) {
+    return { ok: false };
+  }
+  return { ok: true, value: trimmed };
+}
+
+export function parseManilaDate(raw: unknown): string | null {
+  if (typeof raw !== "string") return null;
+  const trimmed = raw.trim();
+  const match = DATE_REGEX.exec(trimmed);
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const check = new Date(Date.UTC(year, month - 1, day));
+  if (
+    Number.isNaN(check.getTime()) ||
+    check.getUTCFullYear() !== year ||
+    check.getUTCMonth() !== month - 1 ||
+    check.getUTCDate() !== day
+  ) {
+    return null;
+  }
+  return trimmed;
+}
+
+export function parseCoverageMode(raw: unknown): MovementCoverageMode | null {
+  if (typeof raw !== "string") return null;
+  const normalized = raw.trim().toUpperCase();
+  if (
+    normalized === "NONE" ||
+    normalized === "FULL" ||
+    normalized === "PARTIAL" ||
+    normalized === "UNCLEAR"
+  ) {
+    return normalized;
+  }
+  return null;
 }
 
 export function parseFaucetReportingType(
@@ -270,4 +510,12 @@ export function formatManilaIso(date: Date): string {
   const minute = pad2(shifted.getUTCMinutes());
   const second = pad2(shifted.getUTCSeconds());
   return `${year}-${month}-${day}T${hour}:${minute}:${second}+08:00`;
+}
+
+export function formatManilaDate(date: Date): string {
+  const shifted = new Date(date.getTime() + MANILA_OFFSET_MS);
+  const year = shifted.getUTCFullYear();
+  const month = pad2(shifted.getUTCMonth() + 1);
+  const day = pad2(shifted.getUTCDate());
+  return `${year}-${month}-${day}`;
 }

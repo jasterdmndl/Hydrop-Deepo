@@ -1,4 +1,9 @@
-import type { ContainerShape, InventoryCategory } from "../inventory/inventory.js";
+import {
+  type ContainerShape,
+  type InventoryCategory,
+  quantitiesEqual,
+  toScaledQuantity,
+} from "../inventory/inventory.js";
 
 /**
  * Pure Stock Trend chain verification and deterministic tie ordering
@@ -12,7 +17,9 @@ export type StockTrendMovementType =
   | "PRIOR_DAY_SETTLEMENT"
   | "PHYSICAL_COUNT_RECONCILIATION"
   | "SALE_ACTION_DEDUCTION"
-  | "SALE_ACTION_RESTORATION";
+  | "SALE_ACTION_RESTORATION"
+  | "STOCK_RECEIVED"
+  | "STOCK_USED";
 
 export interface StockTrendItemSummary {
   id: string;
@@ -42,7 +49,9 @@ export interface StockTrendMovementInput {
     | "PRIOR_DAY_SETTLEMENT"
     | "PHYSICAL_COUNT_RECONCILIATION"
     | "SALE_ACTION_DEDUCTION"
-    | "SALE_ACTION_RESTORATION";
+    | "SALE_ACTION_RESTORATION"
+    | "STOCK_RECEIVED"
+    | "STOCK_USED";
   quantityDelta: number;
   balanceBefore: number;
   balanceAfter: number;
@@ -82,7 +91,7 @@ function resolveUniqueChainForTimestampGroup(
 ): StockTrendMovementInput[] | null {
   if (group.length === 1) {
     const single = group[0]!;
-    return single.balanceBefore === startBalance ? [single] : null;
+    return quantitiesEqual(single.balanceBefore, startBalance) ? [single] : null;
   }
 
   // Explore chain orderings for same-timestamp movements; abort as soon as 2+ distinct orderings exist.
@@ -104,7 +113,7 @@ function resolveUniqueChainForTimestampGroup(
     for (let i = 0; i < group.length; i += 1) {
       if (used[i]) continue;
       const candidate = group[i]!;
-      if (candidate.balanceBefore !== runningBalance) continue;
+      if (!quantitiesEqual(candidate.balanceBefore, runningBalance)) continue;
       used[i] = true;
       currentPath.push(candidate);
       dfs(candidate.balanceAfter);
@@ -178,7 +187,11 @@ export function buildDashboardStockTrend(input: {
   }
 
   for (const m of movements) {
-    if (m.unit !== item.unit || m.balanceBefore + m.quantityDelta !== m.balanceAfter) {
+    if (
+      m.unit !== item.unit ||
+      toScaledQuantity(m.balanceBefore) + toScaledQuantity(m.quantityDelta) !==
+        toScaledQuantity(m.balanceAfter)
+    ) {
       return {
         item,
         historyState: "INCOMPLETE",
@@ -236,7 +249,7 @@ export function buildDashboardStockTrend(input: {
         runningBalance = resolved[resolved.length - 1]!.balanceAfter;
       }
 
-      if (runningBalance !== item.currentQuantity) {
+      if (!quantitiesEqual(runningBalance, item.currentQuantity)) {
         return {
           item,
           historyState: "INCOMPLETE",

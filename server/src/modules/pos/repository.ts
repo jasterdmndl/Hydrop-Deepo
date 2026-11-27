@@ -1227,7 +1227,7 @@ export const posRepository = {
       id: string;
       code: string;
       name: string;
-      category: "CONTAINER" | "MERCHANDISE";
+      category: "CONTAINER" | "MERCHANDISE" | "OPERATING_SUPPLY";
       containerShape: ContainerShape | null;
       description: string | null;
       unit: string;
@@ -1299,6 +1299,7 @@ export const posRepository = {
     }
 
     for (const row of rows) {
+      if (row.category !== "CONTAINER" && row.category !== "MERCHANDISE") continue;
       if (row.category === "MERCHANDISE" && row.unitPriceCentavos === null) continue;
       map.set(row.id, {
         id: row.id,
