@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  computeCancelMovementPreview,
   computeLateCoveragePreview,
+  computeQuantityCorrectionPreview,
+  computeReceiptItemCorrectionPreview,
   computeReconciliationPreview,
   DEFAULT_POS_SECTIONS,
   filterInventoryItems,
@@ -1090,5 +1093,98 @@ describe("inventoryView helpers", () => {
         coveredQuantity: 5,
       }),
     ).toBeNull();
+  });
+
+  it("computes quantity, cancel, and two-item receipt correction previews (Task 3)", () => {
+    expect(
+      computeQuantityCorrectionPreview({
+        movementType: "STOCK_RECEIVED",
+        previousQuantity: 10,
+        newQuantity: 7,
+        currentBalance: 20,
+        category: "OPERATING_SUPPLY",
+        coverageMode: "PARTIAL",
+        coveredQuantity: 1,
+      }),
+    ).toEqual({
+      rawDelta: -3,
+      coveredQuantity: 1,
+      appliedDelta: -2,
+      projectedBalance: 18,
+      pendingReview: false,
+      requiresCountBeforeNegative: false,
+    });
+
+    expect(
+      computeCancelMovementPreview({
+        movementType: "STOCK_RECEIVED",
+        entryStatus: "APPLIED",
+        latestQuantity: 5,
+        currentBalance: 3,
+        category: "MERCHANDISE",
+        coverageMode: "NONE",
+      }),
+    ).toEqual({
+      rawDelta: -5,
+      coveredQuantity: 0,
+      appliedDelta: -5,
+      projectedBalance: -2,
+      pendingReview: false,
+      requiresCountBeforeNegative: true,
+    });
+
+    const roundItem: InventoryItemView = {
+      code: "ROUND",
+      name: "Round Container",
+      category: "CONTAINER",
+      shape: "ROUND",
+      unit: "containers",
+      status: "INITIALIZED",
+      currentQuantity: 10,
+      openingStock: {
+        quantity: 10,
+        unit: "containers",
+        recordedBy: "owner1",
+        recordedAt: "2026-11-27T08:00:00+08:00",
+      },
+    };
+    const slimItem: InventoryItemView = {
+      ...roundItem,
+      code: "SLIM",
+      name: "Slim Container",
+      shape: "SLIM",
+      currentQuantity: 12,
+    };
+
+    expect(
+      computeReceiptItemCorrectionPreview({
+        quantity: 5,
+        wrongItem: roundItem,
+        correctItem: slimItem,
+        wrongCoverageMode: "FULL",
+        correctCoverageMode: "PARTIAL",
+        correctCoveredQuantity: 2,
+      }),
+    ).toEqual({
+      kind: "SAME_UNIT",
+      wrongSide: {
+        rawDelta: -5,
+        coveredQuantity: 5,
+        appliedDelta: 0,
+        projectedBalance: 10,
+        pendingReview: false,
+        requiresCountBeforeNegative: false,
+      },
+      correctSide: {
+        rawDelta: 5,
+        coveredQuantity: 2,
+        appliedDelta: 3,
+        projectedBalance: 15,
+        pendingReview: false,
+        requiresCountBeforeNegative: false,
+      },
+      pendingReview: false,
+      requiresCountBeforeNegative: false,
+    });
   });
 });

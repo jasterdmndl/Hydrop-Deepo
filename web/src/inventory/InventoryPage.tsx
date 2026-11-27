@@ -54,6 +54,7 @@ import {
   parseOpeningQuantityInput,
   parsePesoPriceToCentavos,
   parsePhysicalCountInput,
+  type PendingCorrectionReviewView,
   type PendingMovementReviewView,
   type PendingStockMovementAttempt,
   type PosSectionView,
@@ -66,6 +67,12 @@ import {
   type StockReconciliationView,
   upsertPendingMovementAttempt,
 } from "./inventoryView";
+import {
+  MovementCorrectionAuditList,
+  MovementCorrectionDialog,
+  type MovementCorrectionModalState,
+  PendingCorrectionReviewsBanner,
+} from "./MovementCorrectionModals";
 
 interface CoverageFormState {
   mode: MovementCoverageMode;
@@ -708,6 +715,8 @@ export function InventoryPage() {
   const [useCounts, setUseCounts] = useState<ApplicableCountsState>(EMPTY_APPLICABLE_COUNTS);
 
   const [pendingMovementReviews, setPendingMovementReviews] = useState<PendingMovementReviewView[]>([]);
+  const [pendingCorrectionReviews, setPendingCorrectionReviews] = useState<PendingCorrectionReviewView[]>([]);
+  const [correctionModal, setCorrectionModal] = useState<MovementCorrectionModalState | null>(null);
   const [reviewTarget, setReviewTarget] = useState<PendingMovementReviewView | null>(null);
   const [reviewCoverage, setReviewCoverage] = useState<CoverageFormState>(defaultCoverageState);
   const [reviewRequestKey, setReviewRequestKey] = useState("");
@@ -806,15 +815,20 @@ export function InventoryPage() {
       setPermissions(response.permissions);
       setHasLoaded(true);
       if (response.permissions.canReviewPendingEntries) {
-        void api<{ reviews: PendingMovementReviewView[] }>("/api/inventory/pending-reviews")
-          .then((revRes) => {
+        void Promise.all([
+          api<{ reviews: PendingMovementReviewView[] }>("/api/inventory/pending-reviews"),
+          api<{ corrections: PendingCorrectionReviewView[] }>("/api/inventory/pending-corrections"),
+        ])
+          .then(([revRes, corrRes]) => {
             if (loadTrackerRef.current.isCurrent(requestId)) {
               setPendingMovementReviews(revRes.reviews);
+              setPendingCorrectionReviews(corrRes.corrections);
             }
           })
           .catch(() => undefined);
       } else {
         setPendingMovementReviews([]);
+        setPendingCorrectionReviews([]);
       }
       return response.items;
     } catch (err) {
@@ -937,11 +951,16 @@ export function InventoryPage() {
   const refreshPendingMovementReviews = useCallback(async () => {
     if (!permissions?.canReviewPendingEntries) {
       setPendingMovementReviews([]);
+      setPendingCorrectionReviews([]);
       return;
     }
     try {
-      const res = await api<{ reviews: PendingMovementReviewView[] }>("/api/inventory/pending-reviews");
-      setPendingMovementReviews(res.reviews);
+      const [revRes, corrRes] = await Promise.all([
+        api<{ reviews: PendingMovementReviewView[] }>("/api/inventory/pending-reviews"),
+        api<{ corrections: PendingCorrectionReviewView[] }>("/api/inventory/pending-corrections"),
+      ]);
+      setPendingMovementReviews(revRes.reviews);
+      setPendingCorrectionReviews(corrRes.corrections);
     } catch {
       // Preserve last loaded review queue on background refresh error.
     }
@@ -2430,6 +2449,7 @@ export function InventoryPage() {
   const canRecordUsage = permissions?.canRecordUsage ?? true;
   const canViewFullHistory = permissions?.canViewFullHistory ?? canInitialize;
   const canReviewPendingEntries = permissions?.canReviewPendingEntries ?? canInitialize;
+  const canCorrectMovements = permissions?.canCorrectMovements ?? canInitialize;
   const todayManila = getTodayManilaDateString();
   const hasUninitialized = items.some((item) => item.status === "NOT_SET");
   const hasOtherItems = items.some((item) => getInventoryItemGroup(item, posSections) === "OTHER");
@@ -2717,6 +2737,18 @@ export function InventoryPage() {
             ))}
           </ul>
         </section>
+      )}
+
+      {canReviewPendingEntries && (
+        <PendingCorrectionReviewsBanner
+          reviews={pendingCorrectionReviews}
+          busy={loading}
+          onResolveClick={(rev) => {
+            setHistoryItem(null);
+            setCorrectionModal({ kind: "RESOLVE_CORRECTION", review: rev });
+          }}
+          onViewHistoryClick={(item) => void openHistoryModal(item)}
+        />
       )}
 
       {items.some((item) => (item.pendingStockReviews?.length ?? 0) > 0) && (
@@ -4711,6 +4743,17 @@ export function InventoryPage() {
                     <ul className="history-timeline">
                       {historyData.movements.map((mov) => {
                         const isPending = mov.entryStatus === "PENDING_REVIEW";
+                        const isStockEntry =
+                          mov.movementType === "STOCK_RECEIVED" ||
+                          mov.movementType === "STOCK_USED";
+                        const latestQty =
+                          mov.currentQuantityValue ?? mov.enteredQuantity ?? mov.quantity;
+                        const effectiveDateDisplay =
+                          mov.currentEffectiveDate ?? mov.effectiveDate;
+                        const noteDisplay = mov.currentNote ?? mov.note;
+                        const pendingCorrectionForMov = (mov.corrections ?? []).find(
+                          (c) => c.status === "PENDING_REVIEW",
+                        );
                         const matchingReview = isPending
                           ? pendingMovementReviews.find((r) => r.entry.id === mov.id)
                           : undefined;
@@ -4720,20 +4763,36 @@ export function InventoryPage() {
                               <strong>
                                 {mov.movementType} · {formatQuantityLabel(mov.quantity, mov.unit)}{" "}
                                 ({mov.quantityDelta === 0 ? "0 stock change" : formatSignedDelta(mov.quantityDelta, mov.unit)})
+                                {mov.isCancelled ? " · CANCELLED" : ""}
                               </strong>
                               <span>{formatRecordedAtManila(mov.recordedAt)}</span>
                             </div>
                             <p className="muted-sm">
-                              {isPending
-                                ? "Status: Pending Owner Review"
-                                : mov.coverageMode === "FULL"
-                                  ? "Status: Covered by physical count (zero stock change)"
-                                  : mov.coverageMode === "PARTIAL"
-                                    ? `Status: Partial count coverage (${formatQuantityLabel(mov.coveredQuantity ?? 0, mov.unit)} covered)`
-                                    : "Status: Applied"}
-                              {mov.effectiveDate ? ` · Actual date: ${mov.effectiveDate}` : ""}
+                              {mov.isCancelled
+                                ? `Status: Cancelled${mov.cancelledAt ? ` (${formatRecordedAtManila(mov.cancelledAt)})` : ""}${mov.cancelledBy ? ` by ${mov.cancelledBy}` : ""}`
+                                : isPending
+                                  ? "Status: Pending Owner Review"
+                                  : mov.coverageMode === "FULL"
+                                    ? "Status: Covered by physical count (zero stock change)"
+                                    : mov.coverageMode === "PARTIAL"
+                                      ? `Status: Partial count coverage (${formatQuantityLabel(mov.coveredQuantity ?? 0, mov.unit)} covered)`
+                                      : "Status: Applied"}
+                              {!mov.isCancelled &&
+                              isStockEntry &&
+                              latestQty !== mov.quantity
+                                ? ` · Latest qty: ${formatQuantityLabel(latestQty, mov.unit)} (original: ${formatQuantityLabel(mov.quantity, mov.unit)})`
+                                : ""}
+                              {mov.currentItemId && mov.currentItemId !== mov.itemId && mov.currentItemName
+                                ? ` · Current item: ${mov.currentItemName}`
+                                : ""}
+                              {effectiveDateDisplay ? ` · Actual date: ${effectiveDateDisplay}` : ""}
+                              {mov.effectiveDate &&
+                              effectiveDateDisplay &&
+                              effectiveDateDisplay !== mov.effectiveDate
+                                ? ` (original: ${mov.effectiveDate})`
+                                : ""}
                               {` · Recorded by ${mov.recordedBy}`}
-                              {mov.note ? ` · ${mov.note}` : ""}
+                              {noteDisplay ? ` · ${noteDisplay}` : ""}
                             </p>
                             {historyData.scope === "FULL" && (
                               <p className="muted-sm">
@@ -4753,32 +4812,135 @@ export function InventoryPage() {
                                 {mov.reviewNote ? ` · Review note: ${mov.reviewNote}` : ""}
                               </p>
                             )}
-                            {historyData.scope === "FULL" && isPending && canReviewPendingEntries && (
-                              <div className="inventory-card-reconcile-row">
-                                <button
-                                  type="button"
-                                  className="button button--primary button--sm"
-                                  onClick={() => {
-                                    setHistoryItem(null);
-                                    if (matchingReview) {
-                                      openReviewModal(matchingReview);
-                                    } else {
-                                      void api<{ reviews: PendingMovementReviewView[] }>(
-                                        "/api/inventory/pending-reviews",
-                                      ).then((res) => {
-                                        setPendingMovementReviews(res.reviews);
-                                        const found = res.reviews.find(
-                                          (r) => r.entry.id === mov.id,
-                                        );
-                                        if (found) openReviewModal(found);
-                                      });
-                                    }
-                                  }}
-                                >
-                                  Review &amp; Resolve
-                                </button>
-                              </div>
-                            )}
+                            {historyData.scope === "FULL" &&
+                              mov.corrections &&
+                              mov.corrections.length > 0 && (
+                                <MovementCorrectionAuditList corrections={mov.corrections} />
+                              )}
+                            {historyData.scope === "FULL" &&
+                              (canReviewPendingEntries || canCorrectMovements) && (
+                                <div className="inventory-card-reconcile-row">
+                                  {isPending && canReviewPendingEntries && (
+                                    <button
+                                      type="button"
+                                      className="button button--primary button--sm"
+                                      onClick={() => {
+                                        setHistoryItem(null);
+                                        if (matchingReview) {
+                                          openReviewModal(matchingReview);
+                                        } else {
+                                          void api<{ reviews: PendingMovementReviewView[] }>(
+                                            "/api/inventory/pending-reviews",
+                                          ).then((res) => {
+                                            setPendingMovementReviews(res.reviews);
+                                            const found = res.reviews.find(
+                                              (r) => r.entry.id === mov.id,
+                                            );
+                                            if (found) openReviewModal(found);
+                                          });
+                                        }
+                                      }}
+                                    >
+                                      Review &amp; Resolve
+                                    </button>
+                                  )}
+                                  {isStockEntry && !mov.isCancelled && canCorrectMovements && (
+                                    <>
+                                      {pendingCorrectionForMov ? (
+                                        <button
+                                          type="button"
+                                          className="button button--primary button--sm"
+                                          onClick={() => {
+                                            void api<{
+                                              corrections: PendingCorrectionReviewView[];
+                                            }>("/api/inventory/pending-corrections").then((res) => {
+                                              setPendingCorrectionReviews(res.corrections);
+                                              const found = res.corrections.find(
+                                                (c) =>
+                                                  c.correction.id === pendingCorrectionForMov.id,
+                                              );
+                                              if (found) {
+                                                setHistoryItem(null);
+                                                setCorrectionModal({
+                                                  kind: "RESOLVE_CORRECTION",
+                                                  review: found,
+                                                });
+                                              }
+                                            });
+                                          }}
+                                        >
+                                          Resolve Pending Correction
+                                        </button>
+                                      ) : (
+                                        <>
+                                          {!isPending && (
+                                            <>
+                                              <button
+                                                type="button"
+                                                className="button button--ghost button--sm"
+                                                onClick={() => {
+                                                  setHistoryItem(null);
+                                                  setCorrectionModal({
+                                                    kind: "QUANTITY",
+                                                    item: historyData.item,
+                                                    movement: mov,
+                                                  });
+                                                }}
+                                              >
+                                                Correct qty
+                                              </button>
+                                              <button
+                                                type="button"
+                                                className="button button--ghost button--sm"
+                                                onClick={() => {
+                                                  setHistoryItem(null);
+                                                  setCorrectionModal({
+                                                    kind: "METADATA",
+                                                    item: historyData.item,
+                                                    movement: mov,
+                                                  });
+                                                }}
+                                              >
+                                                Edit date / note
+                                              </button>
+                                              {mov.movementType === "STOCK_RECEIVED" && (
+                                                <button
+                                                  type="button"
+                                                  className="button button--ghost button--sm"
+                                                  onClick={() => {
+                                                    setHistoryItem(null);
+                                                    setCorrectionModal({
+                                                      kind: "RECEIPT_ITEM",
+                                                      item: historyData.item,
+                                                      movement: mov,
+                                                    });
+                                                  }}
+                                                >
+                                                  Switch item
+                                                </button>
+                                              )}
+                                            </>
+                                          )}
+                                          <button
+                                            type="button"
+                                            className="button button--ghost button--sm"
+                                            onClick={() => {
+                                              setHistoryItem(null);
+                                              setCorrectionModal({
+                                                kind: "CANCEL",
+                                                item: historyData.item,
+                                                movement: mov,
+                                              });
+                                            }}
+                                          >
+                                            Cancel entry
+                                          </button>
+                                        </>
+                                      )}
+                                    </>
+                                  )}
+                                </div>
+                              )}
                           </li>
                         );
                       })}
@@ -4799,6 +4961,49 @@ export function InventoryPage() {
             </div>
           </div>
         </div>
+      )}
+
+      {correctionModal && (
+        <MovementCorrectionDialog
+          modal={correctionModal}
+          items={items}
+          todayManila={todayManila}
+          onClose={() => setCorrectionModal(null)}
+          onReconcileItem={(target) => {
+            setCorrectionModal(null);
+            openReconcileModal(target);
+          }}
+          onRecordWrongSupplyUsage={(suggestedDate) => {
+            setCorrectionModal(null);
+            if (suggestedDate) {
+              setUseEffectiveDate(suggestedDate);
+            }
+            setSaveNotice({
+              id: nextNoticeId(),
+              duration: "detailed",
+              title: "Wrong-supply usage cancelled",
+              body: "Select Stock Used on the correct operating supply and enter the actual use date.",
+            });
+          }}
+          onSuccess={({ primaryItem, secondaryItem, title, body }) => {
+            setCorrectionModal(null);
+            setItems((prev) =>
+              prev.map((entry) => {
+                const key = getInventoryItemKey(entry);
+                if (key === getInventoryItemKey(primaryItem)) return primaryItem;
+                if (secondaryItem && key === getInventoryItemKey(secondaryItem)) return secondaryItem;
+                return entry;
+              }),
+            );
+            void refreshPendingMovementReviews();
+            setSaveNotice({
+              id: nextNoticeId(),
+              duration: "detailed",
+              title,
+              body,
+            });
+          }}
+        />
       )}
     </AppShell>
   );

@@ -52,6 +52,8 @@ export interface InventoryPermissions {
   canViewOwnUsageHistory: boolean;
   /** Only the Owner can confirm count coverage and resolve pending late entries (INV-025, INV-029, INV-040). */
   canReviewPendingEntries: boolean;
+  /** Only the Owner can correct or cancel saved Stock Received / Stock Used entries (INV-010..043). */
+  canCorrectMovements: boolean;
 }
 
 export function inventoryPermissions(role: Role): InventoryPermissions {
@@ -66,6 +68,7 @@ export function inventoryPermissions(role: Role): InventoryPermissions {
     canViewFullHistory: isOwner,
     canViewOwnUsageHistory: true,
     canReviewPendingEntries: isOwner,
+    canCorrectMovements: isOwner,
   };
 }
 
@@ -162,10 +165,14 @@ export type StockMovementType =
   | "SALE_ACTION_DEDUCTION"
   | "SALE_ACTION_RESTORATION"
   | "STOCK_RECEIVED"
-  | "STOCK_USED";
+  | "STOCK_USED"
+  | "MOVEMENT_CORRECTION";
 
 export type MovementEntryStatus = "APPLIED" | "PENDING_REVIEW";
 export type MovementCoverageMode = "NONE" | "FULL" | "PARTIAL" | "UNCLEAR";
+export type CorrectionCoverageMode = MovementCoverageMode | "DIFFERENT_UNIT_RECONCILED";
+export type MovementCorrectionKind = "QUANTITY" | "CANCEL" | "RECEIPT_ITEM" | "METADATA";
+export type MovementCorrectionStatus = "APPLIED" | "PENDING_REVIEW";
 
 export interface SupportingReconciliationSummary {
   id: string;
@@ -175,6 +182,51 @@ export interface SupportingReconciliationSummary {
   reason: string;
   recordedBy: string;
   recordedAt: string;
+}
+
+export interface MovementCorrectionView {
+  id: string;
+  movementId: string;
+  correctionKind: MovementCorrectionKind;
+  status: MovementCorrectionStatus;
+  reason: string;
+  previousQuantity: number | null;
+  newQuantity: number | null;
+  previousItemId: string | null;
+  previousItemName: string | null;
+  newItemId: string | null;
+  newItemName: string | null;
+  previousUnit: string | null;
+  newUnit: string | null;
+  previousEffectiveDate: string | null;
+  newEffectiveDate: string | null;
+  previousNote: string | null;
+  newNote: string | null;
+  primaryItemId: string;
+  primaryItemName: string;
+  primaryItemUnit: string;
+  primaryRawDelta: number;
+  primaryCoverageMode: CorrectionCoverageMode | null;
+  primaryCoveredQuantity: number;
+  primaryAppliedDelta: number;
+  primarySupportingReconciliationId: string | null;
+  primarySupportingReconciliation: SupportingReconciliationSummary | null;
+  primaryCoveredByOpeningCount: boolean;
+  secondaryItemId: string | null;
+  secondaryItemName: string | null;
+  secondaryItemUnit: string | null;
+  secondaryRawDelta: number;
+  secondaryCoverageMode: CorrectionCoverageMode | null;
+  secondaryCoveredQuantity: number;
+  secondaryAppliedDelta: number;
+  secondarySupportingReconciliationId: string | null;
+  secondarySupportingReconciliation: SupportingReconciliationSummary | null;
+  secondaryCoveredByOpeningCount: boolean;
+  createdBy: string;
+  createdAt: string;
+  reviewedBy: string | null;
+  reviewedAt: string | null;
+  reviewNote: string | null;
 }
 
 export interface StockMovementView {
@@ -202,6 +254,18 @@ export interface StockMovementView {
   reviewedBy: string | null;
   reviewedAt: string | null;
   reviewNote: string | null;
+  isCancelled?: boolean;
+  cancelledAt?: string | null;
+  cancelledBy?: string | null;
+  currentQuantityValue?: number | null;
+  currentItemId?: string | null;
+  currentItemName?: string | null;
+  currentItemUnit?: string | null;
+  currentEffectiveDate?: string | null;
+  currentNote?: string | null;
+  correctionVersion?: number;
+  sourceCorrectionId?: string | null;
+  corrections?: MovementCorrectionView[];
 }
 
 export interface PendingMovementReviewView {
@@ -209,6 +273,17 @@ export interface PendingMovementReviewView {
   item: InventoryItemView;
   applicableReconciliations: StockReconciliationView[];
   openingCountCoversDate: boolean;
+}
+
+export interface PendingCorrectionReviewView {
+  correction: MovementCorrectionView;
+  movement: StockMovementView;
+  primaryItem: InventoryItemView;
+  primaryApplicableReconciliations: StockReconciliationView[];
+  primaryOpeningCountCoversDate: boolean;
+  secondaryItem: InventoryItemView | null;
+  secondaryApplicableReconciliations: StockReconciliationView[];
+  secondaryOpeningCountCoversDate: boolean;
 }
 
 export interface InventoryItemHistoryView {

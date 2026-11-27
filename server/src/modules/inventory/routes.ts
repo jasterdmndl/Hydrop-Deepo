@@ -1,4 +1,4 @@
-import { Router } from "express";
+import { Router, type Response } from "express";
 import type { Database } from "../../db/database.js";
 import { sendError } from "../../shared/http.js";
 import { requireRole } from "../auth/guards.js";
@@ -33,6 +33,7 @@ import {
 import {
   inventoryRepository as repo,
   type LateCoverageSelectionInput,
+  type MovementCorrectionActionResult,
   type OpeningStockTarget,
   redactItemForEmployee,
 } from "./repository.js";
@@ -113,6 +114,248 @@ const RESOLVE_REVIEW_KEYS = new Set([
   "requestKey",
 ]);
 const CANCEL_MOVEMENT_KEYS = new Set(["itemKey", "movementType"]);
+const COVERAGE_FIELD_KEYS = new Set([
+  "coverageMode",
+  "coveredQuantity",
+  "supportingReconciliationId",
+  "coveredByOpeningCount",
+  "reviewNote",
+  "expectedLatestReconciliationId",
+  "expectedOpeningCountCoversDate",
+]);
+const CORRECT_QUANTITY_KEYS = new Set([
+  "newQuantity",
+  "reason",
+  "expectedCorrectionVersion",
+  "expectedRevision",
+  "expectedCurrentQuantity",
+  "requestKey",
+  ...COVERAGE_FIELD_KEYS,
+]);
+const CANCEL_SAVED_MOVEMENT_KEYS = new Set([
+  "reason",
+  "expectedCorrectionVersion",
+  "expectedRevision",
+  "expectedCurrentQuantity",
+  "requestKey",
+  ...COVERAGE_FIELD_KEYS,
+]);
+const CORRECT_ITEM_KEYS = new Set([
+  "newItemKey",
+  "reason",
+  "expectedCorrectionVersion",
+  "expectedPrimaryRevision",
+  "expectedPrimaryQuantity",
+  "expectedSecondaryRevision",
+  "expectedSecondaryQuantity",
+  "primaryCoverage",
+  "secondaryCoverage",
+  "differentUnitReconciliation",
+  "requestKey",
+]);
+const CORRECT_METADATA_KEYS = new Set([
+  "effectiveDate",
+  "note",
+  "reason",
+  "expectedCorrectionVersion",
+  "expectedRevision",
+  "expectedCurrentQuantity",
+  "requestKey",
+  ...COVERAGE_FIELD_KEYS,
+]);
+const RESOLVE_CORRECTION_KEYS = new Set([
+  "expectedPrimaryRevision",
+  "expectedPrimaryQuantity",
+  "expectedSecondaryRevision",
+  "expectedSecondaryQuantity",
+  "primaryCoverage",
+  "secondaryCoverage",
+  "requestKey",
+  ...COVERAGE_FIELD_KEYS,
+  "expectedRevision",
+  "expectedCurrentQuantity",
+]);
+
+function parseNestedCoverageObject(
+  raw: unknown,
+  options: { requireMode: boolean; requireSnapshot: boolean },
+):
+  | { ok: true; value: LateCoverageSelectionInput }
+  | { ok: false; message: string } {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+    return { ok: false, message: "Provide valid count-coverage review details." };
+  }
+  const obj = raw as Record<string, unknown>;
+  const extraKeys = Object.keys(obj).filter((k) => !COVERAGE_FIELD_KEYS.has(k));
+  if (extraKeys.length > 0) {
+    return { ok: false, message: "Unexpected count-coverage fields provided." };
+  }
+  const parsed = parseCoverageRequestFields(obj, options);
+  if (!parsed.ok) return parsed;
+  return { ok: true, value: parsed.value };
+}
+
+function sendCorrectionOutcome(
+  res: Response,
+  outcome: MovementCorrectionActionResult,
+  successStatus = 200,
+): void {
+  if (outcome.kind === "not-found") {
+    sendError(res, 404, "NOT_FOUND", "Inventory entry or item not found.");
+    return;
+  }
+  if (outcome.kind === "key-conflict") {
+    sendError(
+      res,
+      409,
+      "REQUEST_KEY_CONFLICT",
+      "This correction request key was already used for another change.",
+    );
+    return;
+  }
+  if (outcome.kind === "already-cancelled") {
+    sendError(
+      res,
+      409,
+      "MOVEMENT_ALREADY_CANCELLED",
+      "This stock entry has already been cancelled.",
+    );
+    return;
+  }
+  if (outcome.kind === "pending-conflict") {
+    sendError(res, 409, "MOVEMENT_CORRECTION_PENDING", outcome.message);
+    return;
+  }
+  if (outcome.kind === "already-resolved") {
+    res.status(409).json({
+      error: {
+        code: "CORRECTION_ALREADY_RESOLVED",
+        message: "This pending inventory correction has already been resolved.",
+      },
+      primaryItem: outcome.primaryItem,
+      secondaryItem: outcome.secondaryItem,
+      movement: outcome.movement,
+      correction: outcome.correction,
+    });
+    return;
+  }
+  if (outcome.kind === "archived") {
+    sendError(res, 409, "PRODUCT_ARCHIVED", outcome.message);
+    return;
+  }
+  if (outcome.kind === "not-set") {
+    sendError(res, 409, "OPENING_STOCK_NOT_SET", outcome.message);
+    return;
+  }
+  if (outcome.kind === "invalid-target" || outcome.kind === "invalid-coverage") {
+    sendError(
+      res,
+      400,
+      "VALIDATION_FAILED",
+      outcome.message,
+    );
+    return;
+  }
+  if (outcome.kind === "invalid-quantity") {
+    sendError(
+      res,
+      400,
+      "VALIDATION_FAILED",
+      `Enter a positive whole number of ${outcome.unit}.`,
+    );
+    return;
+  }
+  if (outcome.kind === "invalid-quantity-unchanged") {
+    sendError(
+      res,
+      400,
+      "VALIDATION_FAILED",
+      `Enter a new quantity different from the current saved value (${outcome.currentQuantityValue}).`,
+    );
+    return;
+  }
+  if (outcome.kind === "invalid-baseline") {
+    sendError(res, 400, "VALIDATION_FAILED", "Invalid recorded stock baseline.");
+    return;
+  }
+  if (outcome.kind === "stale-movement") {
+    res.status(409).json({
+      error: {
+        code: "STALE_MOVEMENT",
+        message: "This stock entry was updated while you were reviewing it. Refresh history and try again.",
+      },
+      primaryItem: outcome.primaryItem,
+      secondaryItem: outcome.secondaryItem,
+      movement: outcome.movement,
+    });
+    return;
+  }
+  if (outcome.kind === "stale-stock") {
+    res.status(409).json({
+      error: {
+        code: "STALE_STOCK_BALANCE",
+        message: `Recorded stock for ${outcome.primaryItem.name} changed while confirming. Review the refreshed balance and confirm again.`,
+      },
+      item: outcome.primaryItem,
+      primaryItem: outcome.primaryItem,
+      secondaryItem: outcome.secondaryItem,
+      movement: outcome.movement,
+    });
+    return;
+  }
+  if (outcome.kind === "stale-review") {
+    res.status(409).json({
+      error: {
+        code: "STALE_REVIEW_CONTEXT",
+        message: `New physical-count history was recorded for ${outcome.primaryItem.name}. Review the updated counts before confirming.`,
+      },
+      item: outcome.primaryItem,
+      primaryItem: outcome.primaryItem,
+      secondaryItem: outcome.secondaryItem,
+      movement: outcome.movement,
+      applicableReconciliations: outcome.primaryApplicableReconciliations,
+      openingCountCoversDate: outcome.primaryOpeningCountCoversDate,
+      primaryApplicableReconciliations: outcome.primaryApplicableReconciliations,
+      primaryOpeningCountCoversDate: outcome.primaryOpeningCountCoversDate,
+      secondaryApplicableReconciliations: outcome.secondaryApplicableReconciliations,
+      secondaryOpeningCountCoversDate: outcome.secondaryOpeningCountCoversDate,
+    });
+    return;
+  }
+  if (outcome.kind === "count-required-negative") {
+    res.status(409).json({
+      error: {
+        code: "COUNT_REQUIRED_BEFORE_NEGATIVE_STOCK",
+        message: `This correction would put ${outcome.item.name} below zero (${outcome.item.currentQuantity} ${outcome.item.unit}). Count and reconcile ${outcome.item.name} first (INV-009).`,
+      },
+      item: outcome.item,
+      attemptedDelta: outcome.attemptedDelta,
+    });
+    return;
+  }
+  if (outcome.kind === "different-unit-reconciliation-required") {
+    res.status(409).json({
+      error: {
+        code: "DIFFERENT_UNIT_RECONCILIATION_REQUIRED",
+        message: `${outcome.primaryItem.name} (${outcome.primaryItem.unit}) and ${outcome.secondaryItem.name} (${outcome.secondaryItem.unit}) use different units. Count and reconcile both in their own units first, then select both supporting counts.`,
+      },
+      primaryItem: outcome.primaryItem,
+      secondaryItem: outcome.secondaryItem,
+      primaryApplicableReconciliations: outcome.primaryApplicableReconciliations,
+      secondaryApplicableReconciliations: outcome.secondaryApplicableReconciliations,
+    });
+    return;
+  }
+
+  res.status(outcome.kind === "replayed" ? 200 : successStatus).json({
+    item: outcome.primaryItem,
+    primaryItem: outcome.primaryItem,
+    secondaryItem: outcome.secondaryItem,
+    movement: outcome.movement,
+    correction: outcome.correction,
+    replayed: outcome.kind === "replayed",
+  });
+}
 
 function parseCoverageRequestFields(
   body: Record<string, unknown>,
@@ -253,11 +496,13 @@ export function inventoryRoutes(db: Database): Router {
   router.get("/items", async (req, res) => {
     const role = req.auth!.user.role;
     const includeArchived = role === "OWNER" && req.query.includeArchived === "true";
-    const [rawItems, posSections, pendingMovementReviewsCount] = await Promise.all([
-      repo.listItems(db, { includeArchived }),
-      repo.listPosSections(db),
-      role === "OWNER" ? repo.countPendingMovementReviews(db) : Promise.resolve(0),
-    ]);
+    const [rawItems, posSections, pendingMovementReviewsCount, pendingCorrectionReviewsCount] =
+      await Promise.all([
+        repo.listItems(db, { includeArchived }),
+        repo.listPosSections(db),
+        role === "OWNER" ? repo.countPendingMovementReviews(db) : Promise.resolve(0),
+        role === "OWNER" ? repo.countPendingCorrectionReviews(db) : Promise.resolve(0),
+      ]);
     const items = role === "OWNER" ? rawItems : rawItems.map(redactItemForEmployee);
     const pendingStockReviews =
       role === "OWNER" ? items.flatMap((item) => item.pendingStockReviews ?? []) : [];
@@ -267,6 +512,7 @@ export function inventoryRoutes(db: Database): Router {
       posSections,
       pendingStockReviews,
       pendingMovementReviewsCount,
+      pendingCorrectionReviewsCount,
     });
   });
 
@@ -1717,6 +1963,583 @@ export function inventoryRoutes(db: Database): Router {
       movement: outcome.movement,
       replayed: outcome.kind === "replayed",
     });
+  });
+
+  // Task 3 (INV-010..043): Owner-only correction, cancellation, receipt-item switch, metadata fix, and pending correction resolution.
+
+  router.get("/pending-corrections", requireRole("OWNER"), async (_req, res) => {
+    const corrections = await repo.listPendingCorrectionReviews(db);
+    res.json({ corrections });
+  });
+
+  router.post("/movements/:movementId/correct-quantity", requireRole("OWNER"), async (req, res) => {
+    const movementId = typeof req.params.movementId === "string" ? req.params.movementId.trim() : "";
+    if (!isUuid(movementId)) {
+      sendError(res, 400, "VALIDATION_FAILED", "Choose a valid stock entry.");
+      return;
+    }
+
+    const body = req.body as Record<string, unknown> | null | undefined;
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      sendError(res, 400, "VALIDATION_FAILED", "Enter valid quantity correction details.");
+      return;
+    }
+    if (Object.keys(body).some((k) => !CORRECT_QUANTITY_KEYS.has(k))) {
+      sendError(res, 400, "VALIDATION_FAILED", "Unexpected quantity correction fields provided.");
+      return;
+    }
+
+    const newQuantity = parseQuantity(body.newQuantity, { allowDecimal: true, allowZero: false });
+    if (newQuantity === null) {
+      sendError(
+        res,
+        400,
+        "VALIDATION_FAILED",
+        "Enter a positive corrected quantity (up to 4 decimals, max 1,000,000).",
+      );
+      return;
+    }
+
+    const reason = parseReconciliationReason(body.reason);
+    if (!reason) {
+      sendError(
+        res,
+        400,
+        "VALIDATION_FAILED",
+        "Enter a factual reason for this correction (1 to 240 characters).",
+      );
+      return;
+    }
+
+    if (
+      typeof body.expectedCorrectionVersion !== "number" ||
+      !Number.isInteger(body.expectedCorrectionVersion) ||
+      body.expectedCorrectionVersion < 0
+    ) {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid entry correction version.");
+      return;
+    }
+    if (
+      typeof body.expectedRevision !== "number" ||
+      !Number.isInteger(body.expectedRevision) ||
+      body.expectedRevision < 0
+    ) {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid stock revision baseline.");
+      return;
+    }
+    const expectedCurrentQuantity = parseStoredBalanceBaseline(body.expectedCurrentQuantity, {
+      allowDecimal: true,
+      allowNegative: true,
+    });
+    if (expectedCurrentQuantity === null) {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid recorded stock baseline.");
+      return;
+    }
+
+    const requestKeyResult = parseRequestKey(body.requestKey);
+    if (!requestKeyResult.ok || !requestKeyResult.value) {
+      sendError(res, 400, "VALIDATION_FAILED", "Correction request key is required.");
+      return;
+    }
+
+    const coverageParsed = parseCoverageRequestFields(body, {
+      requireMode: false,
+      requireSnapshot: true,
+    });
+    if (!coverageParsed.ok) {
+      sendError(res, 400, "VALIDATION_FAILED", coverageParsed.message);
+      return;
+    }
+
+    const outcome = await repo.correctMovementQuantity(db, {
+      movementId,
+      newQuantity,
+      reason,
+      expectedCorrectionVersion: body.expectedCorrectionVersion,
+      expectedRevision: body.expectedRevision,
+      expectedCurrentQuantity,
+      requestKey: requestKeyResult.value,
+      actorUserId: req.auth!.user.id,
+      correctedAt: req.now,
+      coverage: coverageParsed.value,
+    });
+
+    sendCorrectionOutcome(res, outcome);
+  });
+
+  router.post("/movements/:movementId/cancel", requireRole("OWNER"), async (req, res) => {
+    const movementId = typeof req.params.movementId === "string" ? req.params.movementId.trim() : "";
+    if (!isUuid(movementId)) {
+      sendError(res, 400, "VALIDATION_FAILED", "Choose a valid stock entry.");
+      return;
+    }
+
+    const body = req.body as Record<string, unknown> | null | undefined;
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      sendError(res, 400, "VALIDATION_FAILED", "Enter valid cancellation details.");
+      return;
+    }
+    if (Object.keys(body).some((k) => !CANCEL_SAVED_MOVEMENT_KEYS.has(k))) {
+      sendError(res, 400, "VALIDATION_FAILED", "Unexpected movement cancellation fields provided.");
+      return;
+    }
+
+    const reason = parseReconciliationReason(body.reason);
+    if (!reason) {
+      sendError(
+        res,
+        400,
+        "VALIDATION_FAILED",
+        "Enter a factual reason for cancelling this entry (1 to 240 characters).",
+      );
+      return;
+    }
+
+    if (
+      typeof body.expectedCorrectionVersion !== "number" ||
+      !Number.isInteger(body.expectedCorrectionVersion) ||
+      body.expectedCorrectionVersion < 0
+    ) {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid entry correction version.");
+      return;
+    }
+    if (
+      typeof body.expectedRevision !== "number" ||
+      !Number.isInteger(body.expectedRevision) ||
+      body.expectedRevision < 0
+    ) {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid stock revision baseline.");
+      return;
+    }
+    const expectedCurrentQuantity = parseStoredBalanceBaseline(body.expectedCurrentQuantity, {
+      allowDecimal: true,
+      allowNegative: true,
+    });
+    if (expectedCurrentQuantity === null) {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid recorded stock baseline.");
+      return;
+    }
+
+    const requestKeyResult = parseRequestKey(body.requestKey);
+    if (!requestKeyResult.ok || !requestKeyResult.value) {
+      sendError(res, 400, "VALIDATION_FAILED", "Cancellation request key is required.");
+      return;
+    }
+
+    const coverageParsed = parseCoverageRequestFields(body, {
+      requireMode: false,
+      requireSnapshot: true,
+    });
+    if (!coverageParsed.ok) {
+      sendError(res, 400, "VALIDATION_FAILED", coverageParsed.message);
+      return;
+    }
+
+    const outcome = await repo.cancelSavedMovement(db, {
+      movementId,
+      reason,
+      expectedCorrectionVersion: body.expectedCorrectionVersion,
+      expectedRevision: body.expectedRevision,
+      expectedCurrentQuantity,
+      requestKey: requestKeyResult.value,
+      actorUserId: req.auth!.user.id,
+      cancelledAt: req.now,
+      coverage: coverageParsed.value,
+    });
+
+    sendCorrectionOutcome(res, outcome);
+  });
+
+  router.post("/movements/:movementId/correct-item", requireRole("OWNER"), async (req, res) => {
+    const movementId = typeof req.params.movementId === "string" ? req.params.movementId.trim() : "";
+    if (!isUuid(movementId)) {
+      sendError(res, 400, "VALIDATION_FAILED", "Choose a valid stock receipt entry.");
+      return;
+    }
+
+    const body = req.body as Record<string, unknown> | null | undefined;
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      sendError(res, 400, "VALIDATION_FAILED", "Enter valid receipt item correction details.");
+      return;
+    }
+    if (Object.keys(body).some((k) => !CORRECT_ITEM_KEYS.has(k))) {
+      sendError(res, 400, "VALIDATION_FAILED", "Unexpected receipt item correction fields provided.");
+      return;
+    }
+
+    const newItemKey = typeof body.newItemKey === "string" ? body.newItemKey.trim() : "";
+    const newItemTarget = resolveItemTarget(newItemKey);
+    if (!newItemTarget) {
+      sendError(res, 400, "VALIDATION_FAILED", "Choose a valid destination Inventory item.");
+      return;
+    }
+
+    const reason = parseReconciliationReason(body.reason);
+    if (!reason) {
+      sendError(
+        res,
+        400,
+        "VALIDATION_FAILED",
+        "Enter a factual reason for switching the receipt item (1 to 240 characters).",
+      );
+      return;
+    }
+
+    if (
+      typeof body.expectedCorrectionVersion !== "number" ||
+      !Number.isInteger(body.expectedCorrectionVersion) ||
+      body.expectedCorrectionVersion < 0
+    ) {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid entry correction version.");
+      return;
+    }
+    if (
+      typeof body.expectedPrimaryRevision !== "number" ||
+      !Number.isInteger(body.expectedPrimaryRevision) ||
+      body.expectedPrimaryRevision < 0 ||
+      typeof body.expectedSecondaryRevision !== "number" ||
+      !Number.isInteger(body.expectedSecondaryRevision) ||
+      body.expectedSecondaryRevision < 0
+    ) {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid stock revision baseline.");
+      return;
+    }
+
+    const expectedPrimaryQuantity = parseStoredBalanceBaseline(body.expectedPrimaryQuantity, {
+      allowDecimal: true,
+      allowNegative: true,
+    });
+    const expectedSecondaryQuantity = parseStoredBalanceBaseline(body.expectedSecondaryQuantity, {
+      allowDecimal: true,
+      allowNegative: true,
+    });
+    if (expectedPrimaryQuantity === null || expectedSecondaryQuantity === null) {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid recorded stock baseline.");
+      return;
+    }
+
+    const requestKeyResult = parseRequestKey(body.requestKey);
+    if (!requestKeyResult.ok || !requestKeyResult.value) {
+      sendError(res, 400, "VALIDATION_FAILED", "Receipt correction request key is required.");
+      return;
+    }
+
+    let primaryCoverage: LateCoverageSelectionInput = {};
+    let secondaryCoverage: LateCoverageSelectionInput = {};
+    let differentUnitReconciliation:
+      | { primarySupportingReconciliationId: string | null; secondarySupportingReconciliationId: string | null }
+      | undefined = undefined;
+
+    if (body.differentUnitReconciliation !== undefined && body.differentUnitReconciliation !== null) {
+      if (
+        typeof body.differentUnitReconciliation !== "object" ||
+        Array.isArray(body.differentUnitReconciliation)
+      ) {
+        sendError(res, 400, "VALIDATION_FAILED", "Invalid supporting reconciliation selection.");
+        return;
+      }
+      const dur = body.differentUnitReconciliation as Record<string, unknown>;
+      const pRec =
+        typeof dur.primarySupportingReconciliationId === "string" &&
+        isUuid(dur.primarySupportingReconciliationId.trim())
+          ? dur.primarySupportingReconciliationId.trim()
+          : null;
+      const sRec =
+        typeof dur.secondarySupportingReconciliationId === "string" &&
+        isUuid(dur.secondarySupportingReconciliationId.trim())
+          ? dur.secondarySupportingReconciliationId.trim()
+          : null;
+      differentUnitReconciliation = {
+        primarySupportingReconciliationId: pRec,
+        secondarySupportingReconciliationId: sRec,
+      };
+    } else {
+      const pCovParsed = parseNestedCoverageObject(body.primaryCoverage, {
+        requireMode: false,
+        requireSnapshot: true,
+      });
+      if (!pCovParsed.ok) {
+        sendError(res, 400, "VALIDATION_FAILED", pCovParsed.message);
+        return;
+      }
+      const sCovParsed = parseNestedCoverageObject(body.secondaryCoverage, {
+        requireMode: false,
+        requireSnapshot: true,
+      });
+      if (!sCovParsed.ok) {
+        sendError(res, 400, "VALIDATION_FAILED", sCovParsed.message);
+        return;
+      }
+      primaryCoverage = pCovParsed.value;
+      secondaryCoverage = sCovParsed.value;
+    }
+
+    const outcome = await repo.correctReceiptItem(db, {
+      movementId,
+      newItemTarget,
+      reason,
+      expectedCorrectionVersion: body.expectedCorrectionVersion,
+      expectedPrimaryRevision: body.expectedPrimaryRevision,
+      expectedPrimaryQuantity,
+      expectedSecondaryRevision: body.expectedSecondaryRevision,
+      expectedSecondaryQuantity,
+      requestKey: requestKeyResult.value,
+      actorUserId: req.auth!.user.id,
+      correctedAt: req.now,
+      primaryCoverage,
+      secondaryCoverage,
+      differentUnitReconciliation,
+    });
+
+    sendCorrectionOutcome(res, outcome);
+  });
+
+  router.post("/movements/:movementId/correct-metadata", requireRole("OWNER"), async (req, res) => {
+    const movementId = typeof req.params.movementId === "string" ? req.params.movementId.trim() : "";
+    if (!isUuid(movementId)) {
+      sendError(res, 400, "VALIDATION_FAILED", "Choose a valid stock entry.");
+      return;
+    }
+
+    const body = req.body as Record<string, unknown> | null | undefined;
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      sendError(res, 400, "VALIDATION_FAILED", "Enter valid date or note correction details.");
+      return;
+    }
+    if (Object.keys(body).some((k) => !CORRECT_METADATA_KEYS.has(k))) {
+      sendError(res, 400, "VALIDATION_FAILED", "Unexpected date/note correction fields provided.");
+      return;
+    }
+
+    const todayManila = formatManilaDate(req.now);
+    const effectiveDateProvided = body.effectiveDate !== undefined;
+    let newEffectiveDate: string | null = null;
+    if (effectiveDateProvided) {
+      if (body.effectiveDate === null || body.effectiveDate === "") {
+        sendError(res, 400, "VALIDATION_FAILED", "Enter a valid actual date (YYYY-MM-DD).");
+        return;
+      }
+      const parsedDate = parseManilaDate(body.effectiveDate);
+      if (!parsedDate) {
+        sendError(res, 400, "VALIDATION_FAILED", "Enter a valid actual date (YYYY-MM-DD).");
+        return;
+      }
+      if (parsedDate > todayManila) {
+        sendError(res, 400, "VALIDATION_FAILED", "Actual date cannot be in the future.");
+        return;
+      }
+      newEffectiveDate = parsedDate;
+    }
+
+    const noteProvided = body.note !== undefined;
+    let newNote: string | null = null;
+    if (noteProvided) {
+      const noteParsed = parseMovementNote(body.note, { required: false });
+      if (!noteParsed.ok) {
+        sendError(res, 400, "VALIDATION_FAILED", "Note / purpose must be 240 characters or fewer.");
+        return;
+      }
+      newNote = noteParsed.value;
+    }
+
+    if (!effectiveDateProvided && !noteProvided) {
+      sendError(res, 400, "VALIDATION_FAILED", "Provide a corrected date or note.");
+      return;
+    }
+
+    const reason = parseReconciliationReason(body.reason);
+    if (!reason) {
+      sendError(
+        res,
+        400,
+        "VALIDATION_FAILED",
+        "Enter a factual reason for this correction (1 to 240 characters).",
+      );
+      return;
+    }
+
+    if (
+      typeof body.expectedCorrectionVersion !== "number" ||
+      !Number.isInteger(body.expectedCorrectionVersion) ||
+      body.expectedCorrectionVersion < 0
+    ) {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid entry correction version.");
+      return;
+    }
+    if (
+      typeof body.expectedRevision !== "number" ||
+      !Number.isInteger(body.expectedRevision) ||
+      body.expectedRevision < 0
+    ) {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid stock revision baseline.");
+      return;
+    }
+    const expectedCurrentQuantity = parseStoredBalanceBaseline(body.expectedCurrentQuantity, {
+      allowDecimal: true,
+      allowNegative: true,
+    });
+    if (expectedCurrentQuantity === null) {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid recorded stock baseline.");
+      return;
+    }
+
+    const requestKeyResult = parseRequestKey(body.requestKey);
+    if (!requestKeyResult.ok || !requestKeyResult.value) {
+      sendError(res, 400, "VALIDATION_FAILED", "Correction request key is required.");
+      return;
+    }
+
+    const coverageParsed = parseCoverageRequestFields(body, {
+      requireMode: false,
+      requireSnapshot: false,
+    });
+    if (!coverageParsed.ok) {
+      sendError(res, 400, "VALIDATION_FAILED", coverageParsed.message);
+      return;
+    }
+
+    const outcome = await repo.correctMovementMetadata(db, {
+      movementId,
+      effectiveDateProvided,
+      newEffectiveDate,
+      noteProvided,
+      newNote,
+      reason,
+      expectedCorrectionVersion: body.expectedCorrectionVersion,
+      expectedRevision: body.expectedRevision,
+      expectedCurrentQuantity,
+      requestKey: requestKeyResult.value,
+      actorUserId: req.auth!.user.id,
+      correctedAt: req.now,
+      coverage: coverageParsed.hasCoverageFields ? coverageParsed.value : undefined,
+    });
+
+    sendCorrectionOutcome(res, outcome);
+  });
+
+  router.post("/movement-corrections/:correctionId/resolve", requireRole("OWNER"), async (req, res) => {
+    const correctionId =
+      typeof req.params.correctionId === "string" ? req.params.correctionId.trim() : "";
+    if (!isUuid(correctionId)) {
+      sendError(res, 400, "VALIDATION_FAILED", "Choose a valid pending correction.");
+      return;
+    }
+
+    const body = req.body as Record<string, unknown> | null | undefined;
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      sendError(res, 400, "VALIDATION_FAILED", "Enter valid correction resolution details.");
+      return;
+    }
+    if (Object.keys(body).some((k) => !RESOLVE_CORRECTION_KEYS.has(k))) {
+      sendError(res, 400, "VALIDATION_FAILED", "Unexpected correction resolution fields provided.");
+      return;
+    }
+
+    const rawPrimaryRevision =
+      body.expectedPrimaryRevision !== undefined ? body.expectedPrimaryRevision : body.expectedRevision;
+    const rawPrimaryQuantity =
+      body.expectedPrimaryQuantity !== undefined
+        ? body.expectedPrimaryQuantity
+        : body.expectedCurrentQuantity;
+
+    if (
+      typeof rawPrimaryRevision !== "number" ||
+      !Number.isInteger(rawPrimaryRevision) ||
+      rawPrimaryRevision < 0
+    ) {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid stock revision baseline.");
+      return;
+    }
+    const expectedPrimaryQuantity = parseStoredBalanceBaseline(rawPrimaryQuantity, {
+      allowDecimal: true,
+      allowNegative: true,
+    });
+    if (expectedPrimaryQuantity === null) {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid recorded stock baseline.");
+      return;
+    }
+
+    let expectedSecondaryRevision: number | undefined = undefined;
+    let expectedSecondaryQuantity: number | undefined = undefined;
+    if (body.expectedSecondaryRevision !== undefined) {
+      if (
+        typeof body.expectedSecondaryRevision !== "number" ||
+        !Number.isInteger(body.expectedSecondaryRevision) ||
+        body.expectedSecondaryRevision < 0
+      ) {
+        sendError(res, 400, "VALIDATION_FAILED", "Invalid destination item revision baseline.");
+        return;
+      }
+      expectedSecondaryRevision = body.expectedSecondaryRevision;
+    }
+    if (body.expectedSecondaryQuantity !== undefined) {
+      const parsedSec = parseStoredBalanceBaseline(body.expectedSecondaryQuantity, {
+        allowDecimal: true,
+        allowNegative: true,
+      });
+      if (parsedSec === null) {
+        sendError(res, 400, "VALIDATION_FAILED", "Invalid destination item stock baseline.");
+        return;
+      }
+      expectedSecondaryQuantity = parsedSec;
+    }
+
+    const requestKeyResult = parseRequestKey(body.requestKey);
+    if (!requestKeyResult.ok || !requestKeyResult.value) {
+      sendError(res, 400, "VALIDATION_FAILED", "Review confirmation request key is required.");
+      return;
+    }
+
+    let primaryCoverage: LateCoverageSelectionInput;
+    if (body.primaryCoverage !== undefined) {
+      const parsed = parseNestedCoverageObject(body.primaryCoverage, {
+        requireMode: true,
+        requireSnapshot: true,
+      });
+      if (!parsed.ok) {
+        sendError(res, 400, "VALIDATION_FAILED", parsed.message);
+        return;
+      }
+      primaryCoverage = parsed.value;
+    } else {
+      const parsed = parseCoverageRequestFields(body, {
+        requireMode: true,
+        requireSnapshot: true,
+      });
+      if (!parsed.ok) {
+        sendError(res, 400, "VALIDATION_FAILED", parsed.message);
+        return;
+      }
+      primaryCoverage = parsed.value;
+    }
+
+    let secondaryCoverage: LateCoverageSelectionInput | undefined = undefined;
+    if (body.secondaryCoverage !== undefined && body.secondaryCoverage !== null) {
+      const parsed = parseNestedCoverageObject(body.secondaryCoverage, {
+        requireMode: true,
+        requireSnapshot: true,
+      });
+      if (!parsed.ok) {
+        sendError(res, 400, "VALIDATION_FAILED", parsed.message);
+        return;
+      }
+      secondaryCoverage = parsed.value;
+    }
+
+    const outcome = await repo.resolvePendingMovementCorrection(db, {
+      correctionId,
+      expectedPrimaryRevision: rawPrimaryRevision,
+      expectedPrimaryQuantity,
+      expectedSecondaryRevision,
+      expectedSecondaryQuantity,
+      requestKey: requestKeyResult.value,
+      reviewerUserId: req.auth!.user.id,
+      reviewedAt: req.now,
+      primaryCoverage,
+      secondaryCoverage,
+    });
+
+    sendCorrectionOutcome(res, outcome);
   });
 
   return router;

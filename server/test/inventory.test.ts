@@ -216,6 +216,7 @@ describe("Inventory Round/Slim opening stock and merchandise products (DEC-065, 
       canViewFullHistory: true,
       canViewOwnUsageHistory: true,
       canReviewPendingEntries: true,
+      canCorrectMovements: true,
     });
     expect(ownerRes.body.items).toHaveLength(2);
     expect(ownerRes.body.items[0]).toMatchObject({
@@ -253,6 +254,7 @@ describe("Inventory Round/Slim opening stock and merchandise products (DEC-065, 
       canViewFullHistory: false,
       canViewOwnUsageHistory: true,
       canReviewPendingEntries: false,
+      canCorrectMovements: false,
     });
     expect(cashierRes.body.items).toEqual(ownerRes.body.items);
 
@@ -1377,6 +1379,7 @@ describe("Final Inventory Task 1 — operating supplies, receiving, usage, and D
         "0021_inventory_supplies_and_movements.sql",
         "0022_inventory_movement_request_tombstones.sql",
         "0023_inventory_late_entries_and_reviews.sql",
+        "0024_inventory_movement_corrections.sql",
       ]);
 
       const afterItems = await request(app).get("/api/inventory/items").set("Cookie", empAcct.cookie);
@@ -3094,6 +3097,7 @@ describe("Final Inventory Task 2 — late-entry review and role-scoped history (
       canViewFullHistory: false,
       canViewOwnUsageHistory: true,
       canReviewPendingEntries: false,
+      canCorrectMovements: false,
     });
     expect(empItemsRes.body.pendingMovementReviewsCount).toBe(0);
     expect(empItemsRes.body.items.some((i: any) => i.id === archivedSupplyId)).toBe(false);
@@ -3167,5 +3171,673 @@ describe("Final Inventory Task 2 — late-entry review and role-scoped history (
     expect(ownerPendingRes.body.reviews).toHaveLength(1);
     expect(ownerPendingRes.body.reviews[0].entry.id).toBe(pendingEmpUse.body.movement.id);
     expect(ownerPendingRes.body.reviews[0].applicableReconciliations).toHaveLength(1);
+  });
+
+  it("supports repeated quantity fixes, count-first resolution, negative merchandise blocks, cancellations, wrong-supply workflow, and metadata/date-crossing reviews (INV-010..022, INV-037, INV-043)", async () => {
+    const supplyA = (
+      await postProduct(ctx, owner, {
+        category: "OPERATING_SUPPLY",
+        name: "Liquid Cleanser A",
+        unit: "L",
+        allowDecimalQuantity: true,
+        unitConfirmed: true,
+      })
+    ).body.item.id as string;
+    const supplyB = (
+      await postProduct(ctx, owner, {
+        category: "OPERATING_SUPPLY",
+        name: "Sanitizer B",
+        unit: "L",
+        allowDecimalQuantity: true,
+        unitConfirmed: true,
+      })
+    ).body.item.id as string;
+    const sealsRes = await postProduct(ctx, owner, {
+      category: "MERCHANDISE",
+      name: "Tamper Seals",
+      unit: "pcs",
+      unitPriceCentavos: 200,
+      showInPos: true,
+      posSection: "TAKIP_ACCESSORIES",
+      unitConfirmed: true,
+    });
+    const sealsId = sealsRes.body.item.id as string;
+
+    const openA = await postOpeningStock(ctx, owner, supplyA, { quantity: 10 });
+    const openB = await postOpeningStock(ctx, owner, supplyB, { quantity: 10 });
+    const openSeals = await postOpeningStock(ctx, owner, sealsId, { quantity: 2 });
+    expect(openA.status).toBe(201);
+    expect(openB.status).toBe(201);
+    expect(openSeals.status).toBe(201);
+
+    // Day 1: Stock Received +10 L on Supply A (effective 2026-11-27 -> balance 20 L).
+    ctx.clock.advance(60_000);
+    const recvA = await postReceiving(ctx, owner, supplyA, {
+      quantity: 10,
+      note: "Drum delivery",
+      expectedRevision: openA.body.item.stockRevision,
+      expectedCurrentQuantity: 10,
+      requestKey: "t3-recv-a-1",
+    });
+    expect(recvA.status).toBe(201);
+    const recvAId = recvA.body.movement.id as string;
+
+    // 1. Repeated quantity correction #1: 10 -> 7 L (NONE) applies -3 -> balance 17 L.
+    ctx.clock.set("2026-11-28T09:00:00+08:00");
+    const ownerDay2 = await signIn(ctx.app, "owner1", owner.password);
+    const empDay2 = await signIn(ctx.app, "emp1", employee.password);
+
+    // Employee is blocked (403) from all Task 3 endpoints.
+    expect(
+      (
+        await request(ctx.app)
+          .post(`/api/inventory/movements/${encodeURIComponent(recvAId)}/correct-quantity`)
+          .set("Cookie", empDay2.cookie)
+          .set("X-CSRF-Token", empDay2.csrfToken)
+          .send({
+            newQuantity: 7,
+            reason: "Emp attempt",
+            expectedCorrectionVersion: 0,
+            expectedRevision: recvA.body.item.stockRevision,
+            expectedCurrentQuantity: 20,
+            expectedLatestReconciliationId: null,
+            expectedOpeningCountCoversDate: false,
+            requestKey: "emp-403-qty",
+          })
+      ).status,
+    ).toBe(403);
+    expect(
+      (await request(ctx.app).get("/api/inventory/pending-corrections").set("Cookie", empDay2.cookie)).status,
+    ).toBe(403);
+
+    const qtyFix1 = await request(ctx.app)
+      .post(`/api/inventory/movements/${encodeURIComponent(recvAId)}/correct-quantity`)
+      .set("Cookie", ownerDay2.cookie)
+      .set("X-CSRF-Token", ownerDay2.csrfToken)
+      .send({
+        newQuantity: 7,
+        reason: "3 L leaked before storage",
+        coverageMode: "NONE",
+        expectedCorrectionVersion: 0,
+        expectedRevision: recvA.body.item.stockRevision,
+        expectedCurrentQuantity: 20,
+        expectedLatestReconciliationId: null,
+        expectedOpeningCountCoversDate: true,
+        requestKey: "t3-qty-fix-1",
+      });
+    expect(qtyFix1.status).toBe(200);
+    expect(qtyFix1.body.primaryItem.currentQuantity).toBe(17);
+    expect(qtyFix1.body.movement.currentQuantityValue).toBe(7);
+    expect(qtyFix1.body.movement.quantity).toBe(10); // original preserved!
+
+    // 2. Repeated correction #2 from latest saved quantity (7 -> 9) after an intervening recount at 19 L:
+    // Mark UNCLEAR first (0 stock change), recount to confirm 19 L, then resolve FULL (0 further change -> stays 19 L).
+    const recA1 = await postReconciliation(ctx, ownerDay2, supplyA, {
+      physicalCount: 19,
+      reason: "Measured full tank including missed 2 L",
+      expectedRevision: qtyFix1.body.primaryItem.stockRevision,
+      expectedCurrentQuantity: 17,
+      requestKey: "t3-rec-a1",
+    });
+    expect(recA1.status).toBe(201);
+    const recA1Id = recA1.body.reconciliation.id as string;
+
+    const qtyFix2Pending = await request(ctx.app)
+      .post(`/api/inventory/movements/${encodeURIComponent(recvAId)}/correct-quantity`)
+      .set("Cookie", ownerDay2.cookie)
+      .set("X-CSRF-Token", ownerDay2.csrfToken)
+      .send({
+        newQuantity: 9,
+        reason: "Invoice showed 9 L not 7 L",
+        coverageMode: "UNCLEAR",
+        expectedCorrectionVersion: 1,
+        expectedRevision: recA1.body.item.stockRevision,
+        expectedCurrentQuantity: 19,
+        expectedLatestReconciliationId: recA1Id,
+        expectedOpeningCountCoversDate: true,
+        requestKey: "t3-qty-fix-2",
+      });
+    expect(qtyFix2Pending.status).toBe(200);
+    expect(qtyFix2Pending.body.correction.status).toBe("PENDING_REVIEW");
+    expect(qtyFix2Pending.body.primaryItem.currentQuantity).toBe(19);
+
+    const pendingCorrList = await request(ctx.app)
+      .get("/api/inventory/pending-corrections")
+      .set("Cookie", ownerDay2.cookie);
+    expect(pendingCorrList.status).toBe(200);
+    expect(pendingCorrList.body.corrections).toHaveLength(1);
+    const pendingCorrId = qtyFix2Pending.body.correction.id as string;
+
+    const resolveQtyFix2 = await request(ctx.app)
+      .post(`/api/inventory/movement-corrections/${encodeURIComponent(pendingCorrId)}/resolve`)
+      .set("Cookie", ownerDay2.cookie)
+      .set("X-CSRF-Token", ownerDay2.csrfToken)
+      .send({
+        expectedPrimaryRevision: recA1.body.item.stockRevision,
+        expectedPrimaryQuantity: 19,
+        requestKey: "t3-resolve-qty-2",
+        coverageMode: "FULL",
+        supportingReconciliationId: recA1Id,
+        expectedLatestReconciliationId: recA1Id,
+        expectedOpeningCountCoversDate: true,
+        reviewNote: "19 L recount already included the 2 L",
+      });
+    expect(resolveQtyFix2.status).toBe(200);
+    expect(resolveQtyFix2.body.primaryItem.currentQuantity).toBe(19);
+    expect(resolveQtyFix2.body.correction).toMatchObject({
+      status: "APPLIED",
+      previousQuantity: 7,
+      newQuantity: 9,
+      primaryAppliedDelta: 0,
+      primaryCoverageMode: "FULL",
+    });
+
+    // Repeat resolve with same key replays; new key returns 409 CORRECTION_ALREADY_RESOLVED.
+    expect(
+      (
+        await request(ctx.app)
+          .post(`/api/inventory/movement-corrections/${encodeURIComponent(pendingCorrId)}/resolve`)
+          .set("Cookie", ownerDay2.cookie)
+          .set("X-CSRF-Token", ownerDay2.csrfToken)
+          .send({
+            expectedPrimaryRevision: recA1.body.item.stockRevision,
+            expectedPrimaryQuantity: 19,
+            requestKey: "t3-resolve-qty-2",
+            coverageMode: "FULL",
+            supportingReconciliationId: recA1Id,
+            expectedLatestReconciliationId: recA1Id,
+            expectedOpeningCountCoversDate: true,
+          })
+      ).body.replayed,
+    ).toBe(true);
+    expect(
+      (
+        await request(ctx.app)
+          .post(`/api/inventory/movement-corrections/${encodeURIComponent(pendingCorrId)}/resolve`)
+          .set("Cookie", ownerDay2.cookie)
+          .set("X-CSRF-Token", ownerDay2.csrfToken)
+          .send({
+            expectedPrimaryRevision: recA1.body.item.stockRevision,
+            expectedPrimaryQuantity: 19,
+            requestKey: "t3-resolve-qty-2-dup",
+            coverageMode: "FULL",
+            supportingReconciliationId: recA1Id,
+            expectedLatestReconciliationId: recA1Id,
+            expectedOpeningCountCoversDate: true,
+          })
+      ).status,
+    ).toBe(409);
+
+    // 3. Note-only correction has 0 stock change; date correction crossing recA1 (2026-11-28) requires review before stock change (INV-043).
+    const noteFix = await request(ctx.app)
+      .post(`/api/inventory/movements/${encodeURIComponent(recvAId)}/correct-metadata`)
+      .set("Cookie", ownerDay2.cookie)
+      .set("X-CSRF-Token", ownerDay2.csrfToken)
+      .send({
+        note: "Drum delivery #2 (sealed)",
+        reason: "Added delivery slip reference",
+        expectedCorrectionVersion: 2,
+        expectedRevision: recA1.body.item.stockRevision,
+        expectedCurrentQuantity: 19,
+        requestKey: "t3-meta-note",
+      });
+    expect(noteFix.status).toBe(200);
+    expect(noteFix.body.correction.status).toBe("APPLIED");
+    expect(noteFix.body.primaryItem.currentQuantity).toBe(19);
+
+    // Move receipt date forward to 2026-11-28 (now after/at recA1? Wait: recA1 was on 2026-11-28, so let's advance to 2026-11-29 and move effectiveDate to 2026-11-29!).
+    ctx.clock.set("2026-11-29T10:00:00+08:00");
+    const ownerDay3 = await signIn(ctx.app, "owner1", owner.password);
+    const empDay3 = await signIn(ctx.app, "emp1", employee.password);
+
+    const dateFixCrossPending = await request(ctx.app)
+      .post(`/api/inventory/movements/${encodeURIComponent(recvAId)}/correct-metadata`)
+      .set("Cookie", ownerDay3.cookie)
+      .set("X-CSRF-Token", ownerDay3.csrfToken)
+      .send({
+        effectiveDate: "2026-11-29",
+        reason: "Delivery actually arrived on Nov 29 after Nov 28 count",
+        expectedCorrectionVersion: 3,
+        expectedRevision: recA1.body.item.stockRevision,
+        expectedCurrentQuantity: 19,
+        requestKey: "t3-meta-date-cross",
+      });
+    expect(dateFixCrossPending.status).toBe(200);
+    expect(dateFixCrossPending.body.correction.status).toBe("PENDING_REVIEW");
+    expect(dateFixCrossPending.body.movement.currentEffectiveDate).toBe("2026-11-23");
+
+    // Resolving pending date correction with NONE (Nov 29 has no counts at/after Nov 29 -> full +9 net needed vs +7 already applied = +2 -> balance 21 L).
+    const resolveDateCross = await request(ctx.app)
+      .post(
+        `/api/inventory/movement-corrections/${encodeURIComponent(dateFixCrossPending.body.correction.id)}/resolve`,
+      )
+      .set("Cookie", ownerDay3.cookie)
+      .set("X-CSRF-Token", ownerDay3.csrfToken)
+      .send({
+        expectedPrimaryRevision: recA1.body.item.stockRevision,
+        expectedPrimaryQuantity: 19,
+        requestKey: "t3-resolve-date-cross",
+        coverageMode: "NONE",
+        expectedLatestReconciliationId: null,
+        expectedOpeningCountCoversDate: false,
+      });
+    expect(resolveDateCross.status).toBe(200);
+    expect(resolveDateCross.body.primaryItem.currentQuantity).toBe(21);
+    expect(resolveDateCross.body.movement.currentEffectiveDate).toBe("2026-11-29");
+    expect(resolveDateCross.body.movement.effectiveDate).toBe("2026-11-23"); // original preserved!
+
+    // 4. Negative merchandise block requiring count first (INV-018):
+    // Receive 5 Tamper Seals (2 -> 7), reconcile to 4 (used 3), then try to cancel receipt of 5 without covering count -> 4 - 5 = -1 -> 409!
+    const recvSeals = await postReceiving(ctx, ownerDay3, sealsId, {
+      quantity: 5,
+      note: "Wrong pack",
+      expectedRevision: openSeals.body.item.stockRevision,
+      expectedCurrentQuantity: 2,
+      requestKey: "t3-recv-seals",
+    });
+    expect(recvSeals.status).toBe(201);
+    const recSeals = await postReconciliation(ctx, ownerDay3, sealsId, {
+      physicalCount: 4,
+      reason: "3 used during packing",
+      expectedRevision: recvSeals.body.item.stockRevision,
+      expectedCurrentQuantity: 7,
+      requestKey: "t3-rec-seals",
+    });
+    expect(recSeals.status).toBe(201);
+
+    const negCancelBlocked = await request(ctx.app)
+      .post(`/api/inventory/movements/${encodeURIComponent(recvSeals.body.movement.id)}/cancel`)
+      .set("Cookie", ownerDay3.cookie)
+      .set("X-CSRF-Token", ownerDay3.csrfToken)
+      .send({
+        reason: "Delivery never arrived",
+        coverageMode: "NONE",
+        expectedCorrectionVersion: 0,
+        expectedRevision: recSeals.body.item.stockRevision,
+        expectedCurrentQuantity: 4,
+        expectedLatestReconciliationId: recSeals.body.reconciliation.id,
+        expectedOpeningCountCoversDate: false,
+        requestKey: "t3-cancel-seals-neg",
+      });
+    expect(negCancelBlocked.status).toBe(409);
+    expect(negCancelBlocked.body.error.code).toBe("COUNT_REQUIRED_BEFORE_NEGATIVE_STOCK");
+
+    // 5. Wrong-supply Stock Used cancellation + late usage on right supply (INV-022, INV-037):
+    const wrongUse = await postUsage(ctx, empDay3, supplyA, {
+      quantity: 2.5,
+      purpose: "Filter flush",
+      expectedRevision: resolveDateCross.body.primaryItem.stockRevision,
+      expectedCurrentQuantity: 21,
+      requestKey: "t3-wrong-use-a",
+    });
+    expect(wrongUse.status).toBe(201);
+    expect(wrongUse.body.item.currentQuantity).toBe(18.5);
+
+    const cancelWrongUse = await request(ctx.app)
+      .post(`/api/inventory/movements/${encodeURIComponent(wrongUse.body.movement.id)}/cancel`)
+      .set("Cookie", ownerDay3.cookie)
+      .set("X-CSRF-Token", ownerDay3.csrfToken)
+      .send({
+        reason: "Recorded against Cleanser A instead of Sanitizer B",
+        coverageMode: "NONE",
+        expectedCorrectionVersion: 0,
+        expectedRevision: wrongUse.body.item.stockRevision,
+        expectedCurrentQuantity: 18.5,
+        expectedLatestReconciliationId: null,
+        expectedOpeningCountCoversDate: false,
+        requestKey: "t3-cancel-wrong-use",
+      });
+    expect(cancelWrongUse.status).toBe(200);
+    expect(cancelWrongUse.body.primaryItem.currentQuantity).toBe(21);
+    expect(cancelWrongUse.body.movement.isCancelled).toBe(true);
+
+    // Record actual usage on Sanitizer B (2.5 L -> balance 7.5 L).
+    const rightUse = await postUsage(ctx, ownerDay3, supplyB, {
+      quantity: 2.5,
+      purpose: "Filter flush (moved from Cleanser A)",
+      expectedRevision: openB.body.item.stockRevision,
+      expectedCurrentQuantity: 10,
+      requestKey: "t3-right-use-b",
+    });
+    expect(rightUse.status).toBe(201);
+    expect(rightUse.body.item.currentQuantity).toBe(7.5);
+
+    // Dashboard Stock Trend stays COMPLETE across all corrections, pending reviews, and cancellations!
+    const trendA = await request(ctx.app)
+      .get(`/api/dashboard/stocks/${encodeURIComponent(supplyA)}/trend`)
+      .set("Cookie", ownerDay3.cookie);
+    expect(trendA.status).toBe(200);
+    expect(trendA.body.historyState).toBe("COMPLETE");
+
+    // Full history shows original values & every correction cleanly.
+    const historyA = await request(ctx.app)
+      .get(`/api/inventory/items/${encodeURIComponent(supplyA)}/history`)
+      .set("Cookie", ownerDay3.cookie);
+    expect(historyA.status).toBe(200);
+    const origRecvEntry = historyA.body.movements.find((m: any) => m.id === recvAId);
+    expect(origRecvEntry.corrections).toHaveLength(4);
+    expect(origRecvEntry.note).toBe("Drum delivery");
+    expect(origRecvEntry.currentNote).toBe("Drum delivery #2 (sealed)");
+    expect(origRecvEntry.effectiveDate).toBe("2026-11-23");
+    expect(origRecvEntry.currentEffectiveDate).toBe("2026-11-29");
+  });
+
+  it("handles two-item receipt corrections across partial coverage, pending review, negative-merchandise blocks, different units, and atomic rollback/replay (INV-031..036)", async () => {
+    const roundOpen = await postOpeningStock(ctx, owner, "ROUND", { quantity: 10 });
+    const slimOpen = await postOpeningStock(ctx, owner, "SLIM", { quantity: 10 });
+    const saltRes = await postProduct(ctx, owner, {
+      category: "OPERATING_SUPPLY",
+      name: "Industrial Salt Bags",
+      unit: "bags",
+      allowDecimalQuantity: false,
+      unitConfirmed: true,
+    });
+    const saltId = saltRes.body.item.id as string;
+    const saltOpen = await postOpeningStock(ctx, owner, saltId, { quantity: 4 });
+    expect(roundOpen.status).toBe(201);
+    expect(slimOpen.status).toBe(201);
+    expect(saltOpen.status).toBe(201);
+
+    // Receive 5 SLIM wrongly recorded against ROUND (ROUND 10 -> 15).
+    ctx.clock.advance(60_000);
+    const wrongRecv = await postReceiving(ctx, owner, "ROUND", {
+      quantity: 5,
+      note: "Container delivery",
+      expectedRevision: roundOpen.body.item.stockRevision,
+      expectedCurrentQuantity: 10,
+      requestKey: "t3-2item-wrong-recv",
+    });
+    expect(wrongRecv.status).toBe(201);
+    const wrongRecvId = wrongRecv.body.movement.id as string;
+
+    // 1. Round count fixes all 5 (10), Slim count fixes 2 of the 5 (12): Round 0 further change, Slim +3 (15)!
+    ctx.clock.set("2026-11-28T09:00:00+08:00");
+    const ownerDay2 = await signIn(ctx.app, "owner1", owner.password);
+    const recRound = await postReconciliation(ctx, ownerDay2, "ROUND", {
+      physicalCount: 10,
+      reason: "Actual count excluded Slim containers",
+      expectedRevision: wrongRecv.body.item.stockRevision,
+      expectedCurrentQuantity: 15,
+      requestKey: "t3-2item-rec-round",
+    });
+    const recSlim = await postReconciliation(ctx, ownerDay2, "SLIM", {
+      physicalCount: 12,
+      reason: "2 new Slim containers already counted",
+      expectedRevision: slimOpen.body.item.stockRevision,
+      expectedCurrentQuantity: 10,
+      requestKey: "t3-2item-rec-slim",
+    });
+    expect(recRound.status).toBe(201);
+    expect(recSlim.status).toBe(201);
+
+    // Unknown coverage on Slim leaves two-item correction PENDING_REVIEW with 0 stock change on both items.
+    const twoItemPending = await request(ctx.app)
+      .post(`/api/inventory/movements/${encodeURIComponent(wrongRecvId)}/correct-item`)
+      .set("Cookie", ownerDay2.cookie)
+      .set("X-CSRF-Token", ownerDay2.csrfToken)
+      .send({
+        newItemKey: "SLIM",
+        reason: "Delivery was Slim not Round",
+        expectedCorrectionVersion: 0,
+        expectedPrimaryRevision: recRound.body.item.stockRevision,
+        expectedPrimaryQuantity: 10,
+        expectedSecondaryRevision: recSlim.body.item.stockRevision,
+        expectedSecondaryQuantity: 12,
+        primaryCoverage: {
+          coverageMode: "FULL",
+          supportingReconciliationId: recRound.body.reconciliation.id,
+          expectedLatestReconciliationId: recRound.body.reconciliation.id,
+          expectedOpeningCountCoversDate: true,
+        },
+        secondaryCoverage: {
+          coverageMode: "UNCLEAR",
+          expectedLatestReconciliationId: recSlim.body.reconciliation.id,
+          expectedOpeningCountCoversDate: true,
+        },
+        requestKey: "t3-2item-switch-1",
+      });
+    expect(twoItemPending.status).toBe(200);
+    expect(twoItemPending.body.correction.status).toBe("PENDING_REVIEW");
+    expect(twoItemPending.body.primaryItem.currentQuantity).toBe(10);
+    expect(twoItemPending.body.secondaryItem.currentQuantity).toBe(12);
+
+    // Resolve two-item pending correction: Round FULL (0 change -> 10), Slim PARTIAL covered 2 (+3 -> 15).
+    const resolveTwoItem = await request(ctx.app)
+      .post(
+        `/api/inventory/movement-corrections/${encodeURIComponent(twoItemPending.body.correction.id)}/resolve`,
+      )
+      .set("Cookie", ownerDay2.cookie)
+      .set("X-CSRF-Token", ownerDay2.csrfToken)
+      .send({
+        expectedPrimaryRevision: recRound.body.item.stockRevision,
+        expectedPrimaryQuantity: 10,
+        expectedSecondaryRevision: recSlim.body.item.stockRevision,
+        expectedSecondaryQuantity: 12,
+        primaryCoverage: {
+          coverageMode: "FULL",
+          supportingReconciliationId: recRound.body.reconciliation.id,
+          expectedLatestReconciliationId: recRound.body.reconciliation.id,
+          expectedOpeningCountCoversDate: true,
+        },
+        secondaryCoverage: {
+          coverageMode: "PARTIAL",
+          coveredQuantity: 2,
+          supportingReconciliationId: recSlim.body.reconciliation.id,
+          expectedLatestReconciliationId: recSlim.body.reconciliation.id,
+          expectedOpeningCountCoversDate: true,
+        },
+        requestKey: "t3-2item-resolve-1",
+      });
+    expect(resolveTwoItem.status).toBe(200);
+    expect(resolveTwoItem.body.primaryItem.currentQuantity).toBe(10);
+    expect(resolveTwoItem.body.secondaryItem.currentQuantity).toBe(15);
+
+    // Visible in BOTH Round and Slim histories!
+    const roundHist = await request(ctx.app)
+      .get("/api/inventory/items/ROUND/history")
+      .set("Cookie", ownerDay2.cookie);
+    const slimHist = await request(ctx.app)
+      .get("/api/inventory/items/SLIM/history")
+      .set("Cookie", ownerDay2.cookie);
+    expect(roundHist.body.movements.some((m: any) => m.id === wrongRecvId)).toBe(true);
+    expect(slimHist.body.movements.some((m: any) => m.id === wrongRecvId)).toBe(true);
+
+    // 2. Different units (SLIM containers vs Industrial Salt Bags bags) requires counts on both first (INV-036).
+    const diffUnitsBlocked = await request(ctx.app)
+      .post(`/api/inventory/movements/${encodeURIComponent(wrongRecvId)}/correct-item`)
+      .set("Cookie", ownerDay2.cookie)
+      .set("X-CSRF-Token", ownerDay2.csrfToken)
+      .send({
+        newItemKey: saltId,
+        reason: "Unit mismatch test",
+        expectedCorrectionVersion: 1,
+        expectedPrimaryRevision: resolveTwoItem.body.secondaryItem.stockRevision,
+        expectedPrimaryQuantity: 15,
+        expectedSecondaryRevision: saltOpen.body.item.stockRevision,
+        expectedSecondaryQuantity: 4,
+        primaryCoverage: {
+          coverageMode: "NONE",
+          expectedLatestReconciliationId: recSlim.body.reconciliation.id,
+          expectedOpeningCountCoversDate: false,
+        },
+        secondaryCoverage: {
+          coverageMode: "NONE",
+          expectedLatestReconciliationId: null,
+          expectedOpeningCountCoversDate: false,
+        },
+        requestKey: "t3-diff-unit-need-rec",
+      });
+    expect(diffUnitsBlocked.status).toBe(409);
+    expect(diffUnitsBlocked.body.error.code).toBe("DIFFERENT_UNIT_RECONCILIATION_REQUIRED");
+
+    ctx.clock.advance(60_000);
+    const recSlimDiff = await postReconciliation(ctx, ownerDay2, "SLIM", {
+      physicalCount: 10,
+      reason: "Reconcile Slim in containers",
+      expectedRevision: resolveTwoItem.body.secondaryItem.stockRevision,
+      expectedCurrentQuantity: 15,
+      requestKey: "t3-diff-rec-slim",
+    });
+    const recSaltDiff = await postReconciliation(ctx, ownerDay2, saltId, {
+      physicalCount: 6,
+      reason: "Reconcile Salt in bags",
+      expectedRevision: saltOpen.body.item.stockRevision,
+      expectedCurrentQuantity: 4,
+      requestKey: "t3-diff-rec-salt",
+    });
+    const diffUnitsOk = await request(ctx.app)
+      .post(`/api/inventory/movements/${encodeURIComponent(wrongRecvId)}/correct-item`)
+      .set("Cookie", ownerDay2.cookie)
+      .set("X-CSRF-Token", ownerDay2.csrfToken)
+      .send({
+        newItemKey: saltId,
+        reason: "Was 2 bags salt not 5 containers",
+        expectedCorrectionVersion: 1,
+        expectedPrimaryRevision: recSlimDiff.body.item.stockRevision,
+        expectedPrimaryQuantity: 10,
+        expectedSecondaryRevision: recSaltDiff.body.item.stockRevision,
+        expectedSecondaryQuantity: 6,
+        differentUnitReconciliation: {
+          primarySupportingReconciliationId: recSlimDiff.body.reconciliation.id,
+          secondarySupportingReconciliationId: recSaltDiff.body.reconciliation.id,
+        },
+        requestKey: "t3-diff-unit-ok",
+      });
+    expect(diffUnitsOk.status).toBe(200);
+    expect(diffUnitsOk.body.correction.primaryCoverageMode).toBe("DIFFERENT_UNIT_RECONCILED");
+    expect(diffUnitsOk.body.primaryItem.currentQuantity).toBe(10);
+    expect(diffUnitsOk.body.secondaryItem.currentQuantity).toBe(6);
+
+    // 3. Insufficient wrong-item merchandise (< delivery qty) + atomic mid-transaction rollback & idempotent retry.
+    const slimRecvNegTest = await postReceiving(ctx, ownerDay2, "SLIM", {
+      quantity: 6,
+      note: "For neg and atomic test",
+      expectedRevision: recSlimDiff.body.item.stockRevision,
+      expectedCurrentQuantity: 10,
+      requestKey: "t3-2item-neg-recv",
+    });
+    expect(slimRecvNegTest.status).toBe(201);
+    ctx.clock.advance(60_000);
+    const slimRecDown = await postReconciliation(ctx, ownerDay2, "SLIM", {
+      physicalCount: 2,
+      reason: "Sold/used down before correction",
+      expectedRevision: slimRecvNegTest.body.item.stockRevision,
+      expectedCurrentQuantity: 16,
+      requestKey: "t3-2item-rec-down",
+    });
+    expect(slimRecDown.status).toBe(201);
+
+    const negSwitchBlocked = await request(ctx.app)
+      .post(`/api/inventory/movements/${encodeURIComponent(slimRecvNegTest.body.movement.id)}/correct-item`)
+      .set("Cookie", ownerDay2.cookie)
+      .set("X-CSRF-Token", ownerDay2.csrfToken)
+      .send({
+        newItemKey: "ROUND",
+        reason: "Blocked negative wrong-item switch",
+        expectedCorrectionVersion: 0,
+        expectedPrimaryRevision: slimRecDown.body.item.stockRevision,
+        expectedPrimaryQuantity: 2,
+        expectedSecondaryRevision: resolveTwoItem.body.primaryItem.stockRevision,
+        expectedSecondaryQuantity: 10,
+        primaryCoverage: {
+          coverageMode: "NONE",
+          expectedLatestReconciliationId: slimRecDown.body.reconciliation.id,
+          expectedOpeningCountCoversDate: false,
+        },
+        secondaryCoverage: {
+          coverageMode: "NONE",
+          expectedLatestReconciliationId: recRound.body.reconciliation.id,
+          expectedOpeningCountCoversDate: false,
+        },
+        requestKey: "t3-2item-neg-blocked",
+      });
+    expect(negSwitchBlocked.status).toBe(409);
+    expect(negSwitchBlocked.body.error.code).toBe("COUNT_REQUIRED_BEFORE_NEGATIVE_STOCK");
+
+    // Atomic failure injection on a valid same-unit Round -> Slim receipt switch (6 containers, Round has 10):
+    const roundRecvAtomic = await postReceiving(ctx, ownerDay2, "ROUND", {
+      quantity: 4,
+      note: "Atomic switch test",
+      expectedRevision: resolveTwoItem.body.primaryItem.stockRevision,
+      expectedCurrentQuantity: 10,
+      requestKey: "t3-atomic-recv",
+    });
+    expect(roundRecvAtomic.status).toBe(201); // ROUND 14
+
+    const origTransaction = ctx.db.transaction.bind(ctx.db);
+    let injectedOnce = false;
+    ctx.db.transaction = async <T>(fn: (tx: any) => Promise<T>): Promise<T> =>
+      origTransaction(async (tx) => {
+        const wrappedTx = {
+          exec: tx.exec.bind(tx),
+          query: async (sql: string, params?: unknown[]) => {
+            if (
+              !injectedOnce &&
+              sql.includes("UPDATE inventory_stock_movements") &&
+              sql.includes("current_item_id")
+            ) {
+              injectedOnce = true;
+              throw new Error("Simulated mid-two-item commit failure");
+            }
+            return tx.query(sql, params);
+          },
+        };
+        return fn(wrappedTx);
+      });
+
+    const atomicSwitchPayload = {
+      newItemKey: "SLIM",
+      reason: "Atomic rollback verification",
+      expectedCorrectionVersion: 0,
+      expectedPrimaryRevision: roundRecvAtomic.body.item.stockRevision,
+      expectedPrimaryQuantity: 14,
+      expectedSecondaryRevision: slimRecDown.body.item.stockRevision,
+      expectedSecondaryQuantity: 2,
+      primaryCoverage: {
+        coverageMode: "NONE",
+        expectedLatestReconciliationId: recRound.body.reconciliation.id,
+        expectedOpeningCountCoversDate: false,
+      },
+      secondaryCoverage: {
+        coverageMode: "NONE",
+        expectedLatestReconciliationId: slimRecDown.body.reconciliation.id,
+        expectedOpeningCountCoversDate: false,
+      },
+      requestKey: "t3-atomic-switch-key",
+    };
+
+    const failedAttempt = await request(ctx.app)
+      .post(`/api/inventory/movements/${encodeURIComponent(roundRecvAtomic.body.movement.id)}/correct-item`)
+      .set("Cookie", ownerDay2.cookie)
+      .set("X-CSRF-Token", ownerDay2.csrfToken)
+      .send(atomicSwitchPayload);
+    expect(failedAttempt.status).toBe(500);
+    ctx.db.transaction = origTransaction;
+
+    // Both balances remained completely rolled back (ROUND=14, SLIM=2)!
+    const afterFailItems = await request(ctx.app).get("/api/inventory/items").set("Cookie", ownerDay2.cookie);
+    expect(afterFailItems.body.items.find((i: any) => i.shape === "ROUND").currentQuantity).toBe(14);
+    expect(afterFailItems.body.items.find((i: any) => i.shape === "SLIM").currentQuantity).toBe(2);
+
+    // Repeating with the exact same requestKey now commits atomically (ROUND=10, SLIM=6), and a replay leaves it unchanged!
+    const retryOk = await request(ctx.app)
+      .post(`/api/inventory/movements/${encodeURIComponent(roundRecvAtomic.body.movement.id)}/correct-item`)
+      .set("Cookie", ownerDay2.cookie)
+      .set("X-CSRF-Token", ownerDay2.csrfToken)
+      .send(atomicSwitchPayload);
+    expect(retryOk.status).toBe(200);
+    expect(retryOk.body.replayed).toBe(false);
+    expect(retryOk.body.primaryItem.currentQuantity).toBe(10);
+    expect(retryOk.body.secondaryItem.currentQuantity).toBe(6);
+
+    const replayOk = await request(ctx.app)
+      .post(`/api/inventory/movements/${encodeURIComponent(roundRecvAtomic.body.movement.id)}/correct-item`)
+      .set("Cookie", ownerDay2.cookie)
+      .set("X-CSRF-Token", ownerDay2.csrfToken)
+      .send(atomicSwitchPayload);
+    expect(replayOk.status).toBe(200);
+    expect(replayOk.body.replayed).toBe(true);
+    expect(replayOk.body.primaryItem.currentQuantity).toBe(10);
+    expect(replayOk.body.secondaryItem.currentQuantity).toBe(6);
   });
 });
