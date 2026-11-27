@@ -793,7 +793,71 @@ describe("inventoryView helpers", () => {
       });
       expect(await requestPendingMovementStatus(wrongNoteAttempt)).toEqual({ kind: "UNEXPECTED" });
 
-      // 4. Readable, complete, matching SAVED response recovers on BOTH endpoints.
+      // 4. Over-precision (>4 decimals) quantities, deltas, or balances on BOTH endpoints must return UNEXPECTED.
+      const overPrecisionQuantityAndDelta = {
+        status: "SAVED",
+        item: savedItem,
+        movement: {
+          ...savedMovement,
+          quantity: 1.00001,
+          quantityDelta: -1.00001,
+          balanceAfter: 8.99999,
+        },
+      };
+      mockPayload = { kind: "json", body: overPrecisionQuantityAndDelta };
+      expect(await requestPendingMovementCancel(empAttempt, "supply-1")).toEqual({
+        kind: "UNEXPECTED",
+      });
+      expect(await requestPendingMovementStatus(empAttempt)).toEqual({ kind: "UNEXPECTED" });
+
+      const overPrecisionWithRoundedBalance = {
+        status: "SAVED",
+        item: savedItem,
+        movement: {
+          ...savedMovement,
+          quantity: 1.00001,
+          quantityDelta: -1.00001,
+          balanceAfter: 9,
+        },
+      };
+      mockPayload = { kind: "json", body: overPrecisionWithRoundedBalance };
+      expect(await requestPendingMovementCancel(empAttempt, "supply-1")).toEqual({
+        kind: "UNEXPECTED",
+      });
+      expect(await requestPendingMovementStatus(empAttempt)).toEqual({ kind: "UNEXPECTED" });
+
+      const overPrecisionDeltaOnly = {
+        status: "SAVED",
+        item: savedItem,
+        movement: {
+          ...savedMovement,
+          quantity: 1,
+          quantityDelta: -1.00001,
+        },
+      };
+      mockPayload = { kind: "json", body: overPrecisionDeltaOnly };
+      expect(await requestPendingMovementCancel(empAttempt, "supply-1")).toEqual({
+        kind: "UNEXPECTED",
+      });
+      expect(await requestPendingMovementStatus(empAttempt)).toEqual({ kind: "UNEXPECTED" });
+
+      const overPrecisionItemBalance = {
+        status: "SAVED",
+        item: {
+          ...savedItem,
+          currentQuantity: 9.00001,
+        },
+        movement: savedMovement,
+      };
+      mockPayload = { kind: "json", body: overPrecisionItemBalance };
+      expect(await requestPendingMovementCancel(empAttempt, "supply-1")).toEqual({
+        kind: "UNEXPECTED",
+      });
+      expect(await requestPendingMovementStatus(empAttempt)).toEqual({ kind: "UNEXPECTED" });
+      expect(loadPendingMovementAttempts("emp1", memoryStorage)).toEqual([empAttempt]);
+
+      // 5. Readable, complete, matching SAVED response recovers on BOTH endpoints.
+      mockPayload = { kind: "json", body: validCompleteSaved };
       expect(await requestPendingMovementStatus(empAttempt)).toEqual({
         kind: "SAVED",
         item: savedItem,
@@ -803,6 +867,34 @@ describe("inventoryView helpers", () => {
         kind: "SAVED",
         item: savedItem,
         movement: savedMovement,
+      });
+
+      // Exact 4-decimal valid quantity recovers cleanly on both endpoints too.
+      const exactFourDecAttempt: PendingStockMovementAttempt = {
+        ...empAttempt,
+        quantityInput: "1.0001",
+      };
+      const exactFourDecSaved = {
+        status: "SAVED",
+        item: { ...savedItem, currentQuantity: 8.9999 },
+        movement: {
+          ...savedMovement,
+          quantity: 1.0001,
+          quantityDelta: -1.0001,
+          balanceBefore: 10,
+          balanceAfter: 8.9999,
+        },
+      };
+      mockPayload = { kind: "json", body: exactFourDecSaved };
+      expect(await requestPendingMovementStatus(exactFourDecAttempt)).toEqual({
+        kind: "SAVED",
+        item: exactFourDecSaved.item,
+        movement: exactFourDecSaved.movement,
+      });
+      expect(await requestPendingMovementCancel(exactFourDecAttempt, "supply-1")).toEqual({
+        kind: "SAVED",
+        item: exactFourDecSaved.item,
+        movement: exactFourDecSaved.movement,
       });
     } finally {
       globalThis.fetch = originalFetch;

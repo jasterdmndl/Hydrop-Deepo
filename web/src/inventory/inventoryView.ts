@@ -762,13 +762,27 @@ export function mergeRefreshedInventoryItems(
   });
 }
 
+const CANONICAL_DECIMAL_REGEX = /^(-?)(\d+)(?:\.(\d{1,4}))?$/;
+
+function parseExactFourDecimalScaled(value: number): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  const match = CANONICAL_DECIMAL_REGEX.exec(String(value));
+  if (!match) return null;
+  const sign = match[1] === "-" ? -1 : 1;
+  const whole = Number(match[2]);
+  const frac = Number((match[3] ?? "").padEnd(4, "0"));
+  const scaled = sign * (whole * QUANTITY_SCALE + frac);
+  return Number.isSafeInteger(scaled) ? scaled : null;
+}
+
 function isValidOpeningStockRecord(value: unknown): value is OpeningStockRecord {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const candidate = value as Record<string, unknown>;
+  const scaledQuantity =
+    typeof candidate.quantity === "number" ? parseExactFourDecimalScaled(candidate.quantity) : null;
   return (
-    typeof candidate.quantity === "number" &&
-    Number.isFinite(candidate.quantity) &&
-    candidate.quantity >= 0 &&
+    scaledQuantity !== null &&
+    scaledQuantity >= 0 &&
     typeof candidate.unit === "string" &&
     candidate.unit.length > 0 &&
     typeof candidate.recordedBy === "string" &&
@@ -805,7 +819,7 @@ export function isValidInventoryItemPayload(value: unknown): value is InventoryI
   if (candidate.status === "INITIALIZED") {
     return (
       typeof candidate.currentQuantity === "number" &&
-      Number.isFinite(candidate.currentQuantity) &&
+      parseExactFourDecimalScaled(candidate.currentQuantity) !== null &&
       isValidOpeningStockRecord(candidate.openingStock)
     );
   }
@@ -817,7 +831,7 @@ export function isValidSavedMovementItemPayload(value: unknown): value is Invent
     isValidInventoryItemPayload(value) &&
     value.status === "INITIALIZED" &&
     typeof value.currentQuantity === "number" &&
-    Number.isFinite(value.currentQuantity) &&
+    parseExactFourDecimalScaled(value.currentQuantity) !== null &&
     typeof value.id === "string" &&
     value.id.length > 0
   );
@@ -833,15 +847,9 @@ export function isValidStockMovementPayload(value: unknown): value is StockMovem
     candidate.itemId.length === 0 ||
     (candidate.movementType !== "STOCK_RECEIVED" && candidate.movementType !== "STOCK_USED") ||
     typeof candidate.quantity !== "number" ||
-    !Number.isFinite(candidate.quantity) ||
-    candidate.quantity <= 0 ||
     typeof candidate.quantityDelta !== "number" ||
-    !Number.isFinite(candidate.quantityDelta) ||
-    candidate.quantityDelta === 0 ||
     typeof candidate.balanceBefore !== "number" ||
-    !Number.isFinite(candidate.balanceBefore) ||
     typeof candidate.balanceAfter !== "number" ||
-    !Number.isFinite(candidate.balanceAfter) ||
     typeof candidate.unit !== "string" ||
     candidate.unit.length === 0 ||
     typeof candidate.effectiveDate !== "string" ||
@@ -854,14 +862,26 @@ export function isValidStockMovementPayload(value: unknown): value is StockMovem
   ) {
     return false;
   }
+  const scaledQty = parseExactFourDecimalScaled(candidate.quantity);
+  const scaledDelta = parseExactFourDecimalScaled(candidate.quantityDelta);
+  const scaledBefore = parseExactFourDecimalScaled(candidate.balanceBefore);
+  const scaledAfter = parseExactFourDecimalScaled(candidate.balanceAfter);
+  if (
+    scaledQty === null ||
+    scaledQty <= 0 ||
+    scaledDelta === null ||
+    scaledDelta === 0 ||
+    scaledBefore === null ||
+    scaledAfter === null
+  ) {
+    return false;
+  }
   const signMatches =
-    candidate.movementType === "STOCK_RECEIVED"
-      ? candidate.quantityDelta > 0
-      : candidate.quantityDelta < 0;
+    candidate.movementType === "STOCK_RECEIVED" ? scaledDelta > 0 : scaledDelta < 0;
   return (
     signMatches &&
-    Math.round(Math.abs(candidate.quantityDelta) * QUANTITY_SCALE) ===
-      Math.round(candidate.quantity * QUANTITY_SCALE)
+    Math.abs(scaledDelta) === scaledQty &&
+    scaledBefore + scaledDelta === scaledAfter
   );
 }
 
@@ -889,9 +909,15 @@ export function matchesPendingMovementAttempt(
   if (!parsedQty.ok) {
     return false;
   }
+  const scaledExpectedQty = parseExactFourDecimalScaled(parsedQty.quantity);
+  const scaledMovementQty = parseExactFourDecimalScaled(movement.quantity);
+  const scaledMovementDelta = parseExactFourDecimalScaled(movement.quantityDelta);
   if (
-    Math.round(movement.quantity * QUANTITY_SCALE) !==
-    Math.round(parsedQty.quantity * QUANTITY_SCALE)
+    scaledExpectedQty === null ||
+    scaledMovementQty === null ||
+    scaledMovementDelta === null ||
+    scaledMovementQty !== scaledExpectedQty ||
+    Math.abs(scaledMovementDelta) !== scaledExpectedQty
   ) {
     return false;
   }
