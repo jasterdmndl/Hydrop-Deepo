@@ -37,6 +37,7 @@ import {
   type InventoryItemsResponse,
   type InventoryItemView,
   type InventoryPermissions,
+  isUncertainSubmissionError,
   mergeRefreshedInventoryItems,
   parseLowStockLevelInput,
   parseMovementQuantityInput,
@@ -62,6 +63,15 @@ function generateClientKey(): string {
     return crypto.randomUUID();
   }
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+interface PendingStockMovementAttempt {
+  quantityInput: string;
+  noteOrPurposeInput: string;
+  effectiveDate: string;
+  requestKey: string;
+  expectedRevision: number;
+  expectedCurrentQuantity: number;
 }
 
 interface PosSectionPickerProps {
@@ -302,16 +312,26 @@ export function InventoryPage() {
   const [receiveItem, setReceiveItem] = useState<InventoryItemView | null>(null);
   const [receiveQtyInput, setReceiveQtyInput] = useState("");
   const [receiveNoteInput, setReceiveNoteInput] = useState("");
+  const [receiveEffectiveDate, setReceiveEffectiveDate] = useState("");
   const [receiveRequestKey, setReceiveRequestKey] = useState("");
   const [receiving, setReceiving] = useState(false);
   const [receiveError, setReceiveError] = useState<string | null>(null);
+  const [receiveStaleNotice, setReceiveStaleNotice] = useState<string | null>(null);
+  const [pendingReceiveAttempts, setPendingReceiveAttempts] = useState<
+    Record<string, PendingStockMovementAttempt | undefined>
+  >({});
 
   const [useItem, setUseItem] = useState<InventoryItemView | null>(null);
   const [useQtyInput, setUseQtyInput] = useState("");
   const [usePurposeInput, setUsePurposeInput] = useState("");
+  const [useEffectiveDate, setUseEffectiveDate] = useState("");
   const [useRequestKey, setUseRequestKey] = useState("");
   const [recordingUse, setRecordingUse] = useState(false);
   const [useError, setUseError] = useState<string | null>(null);
+  const [useStaleNotice, setUseStaleNotice] = useState<string | null>(null);
+  const [pendingUseAttempts, setPendingUseAttempts] = useState<
+    Record<string, PendingStockMovementAttempt | undefined>
+  >({});
 
   const [togglingItemKey, setTogglingItemKey] = useState<string | null>(null);
   const [sectionPickerItemId, setSectionPickerItemId] = useState<string | null>(null);
@@ -481,11 +501,15 @@ export function InventoryPage() {
 
   function openReceiveModal(item: InventoryItemView) {
     if (item.status !== "INITIALIZED" || item.currentQuantity === null) return;
+    const itemKey = getItemKey(item);
+    const pending = pendingReceiveAttempts[itemKey];
     setReceiveItem(item);
-    setReceiveQtyInput("");
-    setReceiveNoteInput("");
-    setReceiveRequestKey(generateClientKey());
+    setReceiveQtyInput(pending ? pending.quantityInput : "");
+    setReceiveNoteInput(pending ? pending.noteOrPurposeInput : "");
+    setReceiveEffectiveDate(pending ? pending.effectiveDate : getTodayManilaDateString());
+    setReceiveRequestKey(pending ? pending.requestKey : generateClientKey());
     setReceiveError(null);
+    setReceiveStaleNotice(null);
     setTimeout(() => receiveQtyInputRef.current?.focus(), 0);
   }
 
@@ -493,11 +517,15 @@ export function InventoryPage() {
     if (item.status !== "INITIALIZED" || item.currentQuantity === null || item.category !== "OPERATING_SUPPLY") {
       return;
     }
+    const itemKey = getItemKey(item);
+    const pending = pendingUseAttempts[itemKey];
     setUseItem(item);
-    setUseQtyInput("");
-    setUsePurposeInput("");
-    setUseRequestKey(generateClientKey());
+    setUseQtyInput(pending ? pending.quantityInput : "");
+    setUsePurposeInput(pending ? pending.noteOrPurposeInput : "");
+    setUseEffectiveDate(pending ? pending.effectiveDate : getTodayManilaDateString());
+    setUseRequestKey(pending ? pending.requestKey : generateClientKey());
     setUseError(null);
+    setUseStaleNotice(null);
     setTimeout(() => useQtyInputRef.current?.focus(), 0);
   }
 
@@ -1003,8 +1031,23 @@ export function InventoryPage() {
       return;
     }
 
+    const itemKey = getItemKey(receiveItem);
+    const pendingAttempt = pendingReceiveAttempts[itemKey];
+    const submittedQtyInput = pendingAttempt ? pendingAttempt.quantityInput : receiveQtyInput;
+    const submittedNoteInput = pendingAttempt ? pendingAttempt.noteOrPurposeInput : receiveNoteInput;
+    const submittedEffectiveDate = pendingAttempt
+      ? pendingAttempt.effectiveDate
+      : receiveEffectiveDate || getTodayManilaDateString();
+    const submittedRequestKey = pendingAttempt ? pendingAttempt.requestKey : receiveRequestKey;
+    const submittedRevision = pendingAttempt
+      ? pendingAttempt.expectedRevision
+      : (receiveItem.stockRevision ?? 0);
+    const submittedCurrentQuantity = pendingAttempt
+      ? pendingAttempt.expectedCurrentQuantity
+      : receiveItem.currentQuantity;
+
     const parsedQty = parseMovementQuantityInput(
-      receiveQtyInput,
+      submittedQtyInput,
       receiveItem.unit,
       Boolean(receiveItem.allowDecimalQuantity),
     );
@@ -1014,7 +1057,7 @@ export function InventoryPage() {
       return;
     }
 
-    const trimmedNote = receiveNoteInput.trim().replace(/\s+/g, " ");
+    const trimmedNote = submittedNoteInput.trim().replace(/\s+/g, " ");
     if (trimmedNote.length > 240) {
       setReceiveError("Delivery note must be 240 characters or fewer.");
       return;
@@ -1023,6 +1066,7 @@ export function InventoryPage() {
     const endpointKey = receiveItem.shape ?? receiveItem.id ?? receiveItem.code;
     setReceiving(true);
     setReceiveError(null);
+    setReceiveStaleNotice(null);
     setSaveNotice(null);
     loadTrackerRef.current.next();
 
@@ -1035,12 +1079,15 @@ export function InventoryPage() {
         method: "POST",
         body: {
           quantity: parsedQty.quantity,
-          effectiveDate: getTodayManilaDateString(),
+          effectiveDate: submittedEffectiveDate,
           note: trimmedNote || null,
-          requestKey: receiveRequestKey,
+          expectedRevision: submittedRevision,
+          expectedCurrentQuantity: submittedCurrentQuantity,
+          requestKey: submittedRequestKey,
         },
       });
       loadTrackerRef.current.next();
+      setPendingReceiveAttempts((prev) => ({ ...prev, [itemKey]: undefined }));
       setItems((prev) =>
         prev.map((entry) =>
           getItemKey(entry) === getItemKey(response.item) ? response.item : entry,
@@ -1050,15 +1097,45 @@ export function InventoryPage() {
       setSaveNotice({
         id: nextNoticeId(),
         duration: "detailed",
-        title: "Stock received recorded",
-        body: `Added ${formatQuantityLabel(response.movement.quantity, response.movement.unit)} to ${response.item.name}. Current balance: ${formatQuantityLabel(response.item.currentQuantity, response.item.unit)}.`,
+        title: response.replayed ? "Stock received already saved" : "Stock received recorded",
+        body: `${response.replayed ? "Recovered earlier submission: " : ""}Added ${formatQuantityLabel(response.movement.quantity, response.movement.unit)} to ${response.item.name}. Current balance: ${formatQuantityLabel(response.item.currentQuantity, response.item.unit)}.`,
       });
     } catch (err) {
-      setReceiveError(
-        err instanceof ApiError
-          ? err.message
-          : "Could not record Stock Received. Please try again.",
-      );
+      if (err instanceof ApiError && err.code === "STALE_STOCK_BALANCE") {
+        setPendingReceiveAttempts((prev) => ({ ...prev, [itemKey]: undefined }));
+        const latestItem = isInventoryItemView(err.details?.item) ? err.details.item : null;
+        if (latestItem) {
+          loadTrackerRef.current.next();
+          setItems((prev) =>
+            prev.map((entry) => (getItemKey(entry) === getItemKey(latestItem) ? latestItem : entry)),
+          );
+          setReceiveItem(latestItem);
+        }
+        setReceiveRequestKey(generateClientKey());
+        setReceiveStaleNotice(err.message);
+      } else if (isUncertainSubmissionError(err)) {
+        setPendingReceiveAttempts((prev) => ({
+          ...prev,
+          [itemKey]: {
+            quantityInput: submittedQtyInput,
+            noteOrPurposeInput: submittedNoteInput,
+            effectiveDate: submittedEffectiveDate,
+            requestKey: submittedRequestKey,
+            expectedRevision: submittedRevision,
+            expectedCurrentQuantity: submittedCurrentQuantity,
+          },
+        }));
+        setReceiveError(
+          `${err instanceof ApiError ? err.message : "Could not confirm whether Stock Received saved."} Retry this exact submission to avoid duplicate stock changes, or discard it after checking current stock.`,
+        );
+      } else {
+        setPendingReceiveAttempts((prev) => ({ ...prev, [itemKey]: undefined }));
+        setReceiveError(
+          err instanceof ApiError
+            ? err.message
+            : "Could not record Stock Received. Please try again.",
+        );
+      }
     } finally {
       setReceiving(false);
     }
@@ -1068,8 +1145,23 @@ export function InventoryPage() {
     event.preventDefault();
     if (!useItem || useItem.currentQuantity === null || recordingUse) return;
 
+    const itemKey = getItemKey(useItem);
+    const pendingAttempt = pendingUseAttempts[itemKey];
+    const submittedQtyInput = pendingAttempt ? pendingAttempt.quantityInput : useQtyInput;
+    const submittedPurposeInput = pendingAttempt ? pendingAttempt.noteOrPurposeInput : usePurposeInput;
+    const submittedEffectiveDate = pendingAttempt
+      ? pendingAttempt.effectiveDate
+      : useEffectiveDate || getTodayManilaDateString();
+    const submittedRequestKey = pendingAttempt ? pendingAttempt.requestKey : useRequestKey;
+    const submittedRevision = pendingAttempt
+      ? pendingAttempt.expectedRevision
+      : (useItem.stockRevision ?? 0);
+    const submittedCurrentQuantity = pendingAttempt
+      ? pendingAttempt.expectedCurrentQuantity
+      : useItem.currentQuantity;
+
     const parsedQty = parseMovementQuantityInput(
-      useQtyInput,
+      submittedQtyInput,
       useItem.unit,
       Boolean(useItem.allowDecimalQuantity),
     );
@@ -1079,7 +1171,7 @@ export function InventoryPage() {
       return;
     }
 
-    const trimmedPurpose = usePurposeInput.trim().replace(/\s+/g, " ");
+    const trimmedPurpose = submittedPurposeInput.trim().replace(/\s+/g, " ");
     if (!trimmedPurpose || trimmedPurpose.length > 240) {
       setUseError("Enter a short purpose note (1 to 240 characters).");
       return;
@@ -1088,6 +1180,7 @@ export function InventoryPage() {
     const endpointKey = useItem.shape ?? useItem.id ?? useItem.code;
     setRecordingUse(true);
     setUseError(null);
+    setUseStaleNotice(null);
     setSaveNotice(null);
     loadTrackerRef.current.next();
 
@@ -1100,12 +1193,15 @@ export function InventoryPage() {
         method: "POST",
         body: {
           quantity: parsedQty.quantity,
-          effectiveDate: getTodayManilaDateString(),
+          effectiveDate: submittedEffectiveDate,
           purpose: trimmedPurpose,
-          requestKey: useRequestKey,
+          expectedRevision: submittedRevision,
+          expectedCurrentQuantity: submittedCurrentQuantity,
+          requestKey: submittedRequestKey,
         },
       });
       loadTrackerRef.current.next();
+      setPendingUseAttempts((prev) => ({ ...prev, [itemKey]: undefined }));
       setItems((prev) =>
         prev.map((entry) =>
           getItemKey(entry) === getItemKey(response.item) ? response.item : entry,
@@ -1116,15 +1212,49 @@ export function InventoryPage() {
       setSaveNotice({
         id: nextNoticeId(),
         duration: "detailed",
-        title: flagged ? "Stock used recorded · Reconciliation needed" : "Stock used recorded",
+        title: response.replayed
+          ? "Stock used already saved"
+          : flagged
+            ? "Stock used recorded · Reconciliation needed"
+            : "Stock used recorded",
         body: flagged
-          ? `Recorded ${formatQuantityLabel(response.movement.quantity, response.movement.unit)} used for ${response.item.name}. Balance is now ${formatQuantityLabel(response.item.currentQuantity, response.item.unit)} and flagged for Owner physical-count reconciliation.`
-          : `Deducted ${formatQuantityLabel(response.movement.quantity, response.movement.unit)} from ${response.item.name}. Current balance: ${formatQuantityLabel(response.item.currentQuantity, response.item.unit)}.`,
+          ? `${response.replayed ? "Recovered earlier submission: " : ""}Recorded ${formatQuantityLabel(response.movement.quantity, response.movement.unit)} used for ${response.item.name}. Balance is now ${formatQuantityLabel(response.item.currentQuantity, response.item.unit)} and flagged for Owner physical-count reconciliation.`
+          : `${response.replayed ? "Recovered earlier submission: " : ""}Deducted ${formatQuantityLabel(response.movement.quantity, response.movement.unit)} from ${response.item.name}. Current balance: ${formatQuantityLabel(response.item.currentQuantity, response.item.unit)}.`,
       });
     } catch (err) {
-      setUseError(
-        err instanceof ApiError ? err.message : "Could not record Stock Used. Please try again.",
-      );
+      if (err instanceof ApiError && err.code === "STALE_STOCK_BALANCE") {
+        setPendingUseAttempts((prev) => ({ ...prev, [itemKey]: undefined }));
+        const latestItem = isInventoryItemView(err.details?.item) ? err.details.item : null;
+        if (latestItem) {
+          loadTrackerRef.current.next();
+          setItems((prev) =>
+            prev.map((entry) => (getItemKey(entry) === getItemKey(latestItem) ? latestItem : entry)),
+          );
+          setUseItem(latestItem);
+        }
+        setUseRequestKey(generateClientKey());
+        setUseStaleNotice(err.message);
+      } else if (isUncertainSubmissionError(err)) {
+        setPendingUseAttempts((prev) => ({
+          ...prev,
+          [itemKey]: {
+            quantityInput: submittedQtyInput,
+            noteOrPurposeInput: submittedPurposeInput,
+            effectiveDate: submittedEffectiveDate,
+            requestKey: submittedRequestKey,
+            expectedRevision: submittedRevision,
+            expectedCurrentQuantity: submittedCurrentQuantity,
+          },
+        }));
+        setUseError(
+          `${err instanceof ApiError ? err.message : "Could not confirm whether Stock Used saved."} Retry this exact submission to avoid deducting the same usage twice, or discard it after checking current stock.`,
+        );
+      } else {
+        setPendingUseAttempts((prev) => ({ ...prev, [itemKey]: undefined }));
+        setUseError(
+          err instanceof ApiError ? err.message : "Could not record Stock Used. Please try again.",
+        );
+      }
     } finally {
       setRecordingUse(false);
     }
@@ -2676,7 +2806,11 @@ export function InventoryPage() {
         </div>
       )}
 
-      {receiveItem && canRecordReceiving && receiveItem.currentQuantity !== null && (
+      {receiveItem && canRecordReceiving && receiveItem.currentQuantity !== null && (() => {
+        const receiveKey = getItemKey(receiveItem);
+        const pendingReceive = pendingReceiveAttempts[receiveKey];
+        const lockedByPending = Boolean(pendingReceive);
+        return (
         <div className="modal-backdrop" role="presentation">
           <div
             className="modal modal--wide"
@@ -2688,8 +2822,8 @@ export function InventoryPage() {
               <div>
                 <h2 id="receive-stock-title">Stock Received · {receiveItem.name}</h2>
                 <p className="muted-sm">
-                  Add delivered stock in {receiveItem.unit}. Delivery date is today (Asia/Manila); late-date
-                  coverage review is added in Task 2.
+                  Add delivered stock in {receiveItem.unit}. Delivery date is locked to this session&apos;s
+                  Asia/Manila date; late-date coverage review is added in Task 2.
                 </p>
               </div>
             </div>
@@ -2703,9 +2837,26 @@ export function InventoryPage() {
               </div>
               <div className="detail-list__row">
                 <dt>Delivery date (Asia/Manila)</dt>
-                <dd>{getTodayManilaDateString()}</dd>
+                <dd>{receiveEffectiveDate || getTodayManilaDateString()}</dd>
               </div>
             </dl>
+
+            {receiveStaleNotice && (
+              <div className="callout callout--warning" role="alert">
+                <p className="callout__title">Stock balance changed before saving</p>
+                <p className="callout__body">{receiveStaleNotice}</p>
+              </div>
+            )}
+
+            {lockedByPending && (
+              <div className="callout callout--warning" role="status">
+                <p className="callout__title">Uncertain submission preserved</p>
+                <p className="callout__body">
+                  Retrying keeps the exact quantity, note, date ({pendingReceive?.effectiveDate}), and
+                  request reference so a completed save will not add stock twice.
+                </p>
+              </div>
+            )}
 
             <form className="subview" onSubmit={(event) => void handleConfirmReceiving(event)} noValidate>
               <label className="field">
@@ -2717,11 +2868,12 @@ export function InventoryPage() {
                   pattern={receiveItem.allowDecimalQuantity ? undefined : "[0-9]*"}
                   autoComplete="off"
                   placeholder={receiveItem.allowDecimalQuantity ? "e.g. 2.5" : "e.g. 10"}
-                  disabled={receiving}
+                  disabled={receiving || lockedByPending}
                   value={receiveQtyInput}
                   onChange={(e) => {
                     setReceiveQtyInput(e.target.value);
                     setReceiveError(null);
+                    setReceiveStaleNotice(null);
                     setReceiveRequestKey(generateClientKey());
                   }}
                 />
@@ -2737,11 +2889,12 @@ export function InventoryPage() {
                   type="text"
                   maxLength={240}
                   placeholder="e.g. Supplier delivery invoice #104"
-                  disabled={receiving}
+                  disabled={receiving || lockedByPending}
                   value={receiveNoteInput}
                   onChange={(e) => {
                     setReceiveNoteInput(e.target.value);
                     setReceiveError(null);
+                    setReceiveStaleNotice(null);
                     setReceiveRequestKey(generateClientKey());
                   }}
                 />
@@ -2785,16 +2938,39 @@ export function InventoryPage() {
                 >
                   Cancel
                 </button>
+                {lockedByPending && (
+                  <button
+                    type="button"
+                    className="button button--ghost"
+                    disabled={receiving}
+                    onClick={() => {
+                      setPendingReceiveAttempts((prev) => ({ ...prev, [receiveKey]: undefined }));
+                      setReceiveRequestKey(generateClientKey());
+                      setReceiveError(null);
+                    }}
+                  >
+                    Discard &amp; enter fresh
+                  </button>
+                )}
                 <button type="submit" className="button button--primary" disabled={receiving}>
-                  {receiving ? "Saving…" : "Confirm Stock Received"}
+                  {receiving
+                    ? "Saving…"
+                    : lockedByPending
+                      ? "Retry Same Submission"
+                      : "Confirm Stock Received"}
                 </button>
               </div>
             </form>
           </div>
         </div>
-      )}
+        );
+      })()}
 
-      {useItem && canRecordUsage && useItem.currentQuantity !== null && (
+      {useItem && canRecordUsage && useItem.currentQuantity !== null && (() => {
+        const useKey = getItemKey(useItem);
+        const pendingUse = pendingUseAttempts[useKey];
+        const lockedByPending = Boolean(pendingUse);
+        return (
         <div className="modal-backdrop" role="presentation">
           <div
             className="modal modal--wide"
@@ -2821,9 +2997,26 @@ export function InventoryPage() {
               </div>
               <div className="detail-list__row">
                 <dt>Use date (Asia/Manila)</dt>
-                <dd>{getTodayManilaDateString()}</dd>
+                <dd>{useEffectiveDate || getTodayManilaDateString()}</dd>
               </div>
             </dl>
+
+            {useStaleNotice && (
+              <div className="callout callout--warning" role="alert">
+                <p className="callout__title">Stock balance changed before saving</p>
+                <p className="callout__body">{useStaleNotice}</p>
+              </div>
+            )}
+
+            {lockedByPending && (
+              <div className="callout callout--warning" role="status">
+                <p className="callout__title">Uncertain submission preserved</p>
+                <p className="callout__body">
+                  Retrying keeps the exact quantity, purpose, date ({pendingUse?.effectiveDate}), and
+                  request reference so a completed save will not deduct stock twice.
+                </p>
+              </div>
+            )}
 
             <form className="subview" onSubmit={(event) => void handleConfirmUsage(event)} noValidate>
               <label className="field">
@@ -2835,11 +3028,12 @@ export function InventoryPage() {
                   pattern={useItem.allowDecimalQuantity ? undefined : "[0-9]*"}
                   autoComplete="off"
                   placeholder={useItem.allowDecimalQuantity ? "e.g. 1.5" : "e.g. 1"}
-                  disabled={recordingUse}
+                  disabled={recordingUse || lockedByPending}
                   value={useQtyInput}
                   onChange={(e) => {
                     setUseQtyInput(e.target.value);
                     setUseError(null);
+                    setUseStaleNotice(null);
                     setUseRequestKey(generateClientKey());
                   }}
                 />
@@ -2855,11 +3049,12 @@ export function InventoryPage() {
                   type="text"
                   maxLength={240}
                   placeholder="e.g. Container washing and station sanitation"
-                  disabled={recordingUse}
+                  disabled={recordingUse || lockedByPending}
                   value={usePurposeInput}
                   onChange={(e) => {
                     setUsePurposeInput(e.target.value);
                     setUseError(null);
+                    setUseStaleNotice(null);
                     setUseRequestKey(generateClientKey());
                   }}
                 />
@@ -2913,14 +3108,33 @@ export function InventoryPage() {
                 >
                   Cancel
                 </button>
+                {lockedByPending && (
+                  <button
+                    type="button"
+                    className="button button--ghost"
+                    disabled={recordingUse}
+                    onClick={() => {
+                      setPendingUseAttempts((prev) => ({ ...prev, [useKey]: undefined }));
+                      setUseRequestKey(generateClientKey());
+                      setUseError(null);
+                    }}
+                  >
+                    Discard &amp; enter fresh
+                  </button>
+                )}
                 <button type="submit" className="button button--primary" disabled={recordingUse}>
-                  {recordingUse ? "Saving…" : "Confirm Stock Used"}
+                  {recordingUse
+                    ? "Saving…"
+                    : lockedByPending
+                      ? "Retry Same Submission"
+                      : "Confirm Stock Used"}
                 </button>
               </div>
             </form>
           </div>
         </div>
-      )}
+        );
+      })()}
     </AppShell>
   );
 }

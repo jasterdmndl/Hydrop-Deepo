@@ -13,6 +13,7 @@ import {
   parseOpeningQuantity,
   parsePhysicalCount,
   parseQuantity,
+  parseStoredBalanceBaseline,
   type PendingSaleActionStockReviewView,
   type PosSection,
   type PosSectionView,
@@ -95,6 +96,7 @@ interface StockMovementDbRow {
   effectiveDate: Date | string | null;
   note: string | null;
   requestKey: string | null;
+  actorUserId: string;
   actorUsername: string;
   recordedAt: Date | string;
 }
@@ -367,6 +369,7 @@ const STOCK_MOVEMENT_SELECT = `
          to_char(m.effective_date, 'YYYY-MM-DD') AS "effectiveDate",
          m.note,
          m.request_key AS "requestKey",
+         m.actor_user_id AS "actorUserId",
          u.username AS "actorUsername",
          m.recorded_at AS "recordedAt"
     FROM inventory_stock_movements m
@@ -433,11 +436,14 @@ export type RecordStockMovementResult =
   | { kind: "created"; item: InventoryItemView; movement: StockMovementView }
   | { kind: "replayed"; item: InventoryItemView; movement: StockMovementView }
   | { kind: "key-conflict" }
+  | { kind: "late-date-not-enabled" }
   | { kind: "not-found" }
   | { kind: "archived" }
   | { kind: "not-set" }
   | { kind: "not-operating-supply" }
-  | { kind: "invalid-quantity"; allowDecimalQuantity: boolean; unit: string };
+  | { kind: "invalid-quantity"; allowDecimalQuantity: boolean; unit: string }
+  | { kind: "invalid-baseline"; allowDecimalQuantity: boolean; unit: string }
+  | { kind: "stale"; item: InventoryItemView };
 
 async function loadActiveHoldsByItemIds(
   db: Queryable,
@@ -1154,9 +1160,8 @@ export const inventoryRepository = {
         };
       }
 
-      const validatedBaseline = parseQuantity(input.expectedCurrentQuantity, {
+      const validatedBaseline = parseStoredBalanceBaseline(input.expectedCurrentQuantity, {
         allowDecimal,
-        allowZero: true,
         allowNegative: locked.category === "OPERATING_SUPPLY",
       });
       if (validatedBaseline === null) {
@@ -1352,7 +1357,10 @@ export const inventoryRepository = {
       target: OpeningStockTarget;
       quantity: number;
       effectiveDate: string;
+      todayManila: string;
       note: string | null;
+      expectedRevision: number;
+      expectedCurrentQuantity: number;
       requestKey: string | null;
       actorUserId: string;
       recordedAt: Date;
@@ -1400,6 +1408,7 @@ export const inventoryRepository = {
         };
       }
 
+      // Resolve saved same-reference replays for the original actor before late-date or stale-revision checks.
       if (input.requestKey) {
         const { rows: existingRows } = await tx.query<StockMovementDbRow>(
           `${STOCK_MOVEMENT_SELECT} WHERE m.request_key = $1`,
@@ -1409,6 +1418,7 @@ export const inventoryRepository = {
         if (existing) {
           if (
             existing.itemId !== locked.id ||
+            existing.actorUserId !== input.actorUserId ||
             existing.movementType !== "STOCK_RECEIVED" ||
             !quantitiesEqual(Number(existing.quantityDelta), validatedQuantity) ||
             toOptionalDateString(existing.effectiveDate) !== input.effectiveDate ||
@@ -1425,6 +1435,10 @@ export const inventoryRepository = {
         }
       }
 
+      if (input.effectiveDate < input.todayManila) {
+        return { kind: "late-date-not-enabled" as const };
+      }
+
       if (locked.archivedAt !== null) {
         return { kind: "archived" as const };
       }
@@ -1437,7 +1451,28 @@ export const inventoryRepository = {
         return { kind: "not-set" as const };
       }
 
+      const validatedBaseline = parseStoredBalanceBaseline(input.expectedCurrentQuantity, {
+        allowDecimal,
+        allowNegative: locked.category === "OPERATING_SUPPLY",
+      });
+      if (validatedBaseline === null) {
+        return {
+          kind: "invalid-baseline" as const,
+          allowDecimalQuantity: allowDecimal,
+          unit: locked.unit,
+        };
+      }
+
       const currentQuantity = Number(locked.currentQuantity);
+      const stockRevision = Number(locked.stockRevision);
+      if (
+        stockRevision !== input.expectedRevision ||
+        !quantitiesEqual(currentQuantity, validatedBaseline)
+      ) {
+        const latestItem = await findItemById(tx, locked.id);
+        return { kind: "stale" as const, item: latestItem! };
+      }
+
       const balanceAfter = addQuantities(currentQuantity, validatedQuantity);
 
       const { rows: insertedRows } = await tx.query<{ id: string }>(
@@ -1490,7 +1525,10 @@ export const inventoryRepository = {
       target: OpeningStockTarget;
       quantity: number;
       effectiveDate: string;
+      todayManila: string;
       purpose: string;
+      expectedRevision: number;
+      expectedCurrentQuantity: number;
       requestKey: string | null;
       actorUserId: string;
       recordedAt: Date;
@@ -1544,6 +1582,7 @@ export const inventoryRepository = {
 
       const quantityDelta = subtractQuantities(0, validatedQuantity);
 
+      // Resolve saved same-reference replays for the original actor before late-date or stale-revision checks.
       if (input.requestKey) {
         const { rows: existingRows } = await tx.query<StockMovementDbRow>(
           `${STOCK_MOVEMENT_SELECT} WHERE m.request_key = $1`,
@@ -1553,6 +1592,7 @@ export const inventoryRepository = {
         if (existing) {
           if (
             existing.itemId !== locked.id ||
+            existing.actorUserId !== input.actorUserId ||
             existing.movementType !== "STOCK_USED" ||
             !quantitiesEqual(Number(existing.quantityDelta), quantityDelta) ||
             toOptionalDateString(existing.effectiveDate) !== input.effectiveDate ||
@@ -1569,6 +1609,10 @@ export const inventoryRepository = {
         }
       }
 
+      if (input.effectiveDate < input.todayManila) {
+        return { kind: "late-date-not-enabled" as const };
+      }
+
       if (locked.archivedAt !== null) {
         return { kind: "archived" as const };
       }
@@ -1581,7 +1625,28 @@ export const inventoryRepository = {
         return { kind: "not-set" as const };
       }
 
+      const validatedBaseline = parseStoredBalanceBaseline(input.expectedCurrentQuantity, {
+        allowDecimal,
+        allowNegative: true,
+      });
+      if (validatedBaseline === null) {
+        return {
+          kind: "invalid-baseline" as const,
+          allowDecimalQuantity: allowDecimal,
+          unit: locked.unit,
+        };
+      }
+
       const currentQuantity = Number(locked.currentQuantity);
+      const stockRevision = Number(locked.stockRevision);
+      if (
+        stockRevision !== input.expectedRevision ||
+        !quantitiesEqual(currentQuantity, validatedBaseline)
+      ) {
+        const latestItem = await findItemById(tx, locked.id);
+        return { kind: "stale" as const, item: latestItem! };
+      }
+
       const balanceAfter = subtractQuantities(currentQuantity, validatedQuantity);
       const nextNeedsReconciliation = Boolean(locked.needsReconciliation) || balanceAfter < 0;
 

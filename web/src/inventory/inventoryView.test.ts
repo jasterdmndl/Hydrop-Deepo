@@ -18,6 +18,7 @@ import {
   getStockStatusMeta,
   groupInventoryItems,
   type InventoryItemView,
+  isUncertainSubmissionError,
   MAX_OPENING_QUANTITY,
   mergeRefreshedInventoryItems,
   parseLowStockLevelInput,
@@ -506,5 +507,12 @@ describe("inventoryView helpers", () => {
       metaPrefix: "Station supplies",
     });
     expect(filterInventoryItems([flaggedSupply], "OPERATING_SUPPLY")).toEqual([flaggedSupply]);
+
+    // Finding 1 helper: network/5xx errors are uncertain (preserve requestKey & effectiveDate), 4xx are definitive.
+    expect(isUncertainSubmissionError({ status: 0, code: "NETWORK_ERROR" })).toBe(true);
+    expect(isUncertainSubmissionError({ status: 503, code: "HTTP_ERROR" })).toBe(true);
+    expect(isUncertainSubmissionError(new Error("timeout"))).toBe(true);
+    expect(isUncertainSubmissionError({ status: 400, code: "VALIDATION_FAILED" })).toBe(false);
+    expect(isUncertainSubmissionError({ status: 409, code: "STALE_STOCK_BALANCE" })).toBe(false);
   });
 });

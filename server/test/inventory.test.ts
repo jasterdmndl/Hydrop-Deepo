@@ -1392,6 +1392,8 @@ describe("Final Inventory Task 1 — operating supplies, receiving, usage, and D
 
       const badRecv = await postReceiving(localCtx, ownerAcct, merchId, {
         quantity: 1.5,
+        expectedRevision: merchAfter.stockRevision,
+        expectedCurrentQuantity: 4,
         requestKey: "upg-bad-recv",
       });
       expect(badRecv.status).toBe(400);
@@ -1485,6 +1487,8 @@ describe("Final Inventory Task 1 — operating supplies, receiving, usage, and D
     // Not Set blocks both Stock Received and Stock Used.
     const unsetRecv = await postReceiving(ctx, owner, liquidId, {
       quantity: 1,
+      expectedRevision: 0,
+      expectedCurrentQuantity: 0,
       requestKey: "unset-recv",
     });
     expect(unsetRecv.status).toBe(409);
@@ -1493,6 +1497,8 @@ describe("Final Inventory Task 1 — operating supplies, receiving, usage, and D
     const unsetUse = await postUsage(ctx, employee, liquidId, {
       quantity: 0.5,
       purpose: "Cleaning",
+      expectedRevision: 0,
+      expectedCurrentQuantity: 0,
       requestKey: "unset-use",
     });
     expect(unsetUse.status).toBe(409);
@@ -1502,13 +1508,14 @@ describe("Final Inventory Task 1 — operating supplies, receiving, usage, and D
     expect(
       (await postOpeningStock(ctx, owner, sealsId, { quantity: 10.5 })).status,
     ).toBe(400);
-    expect(
-      (await postOpeningStock(ctx, owner, sealsId, { quantity: 500 })).status,
-    ).toBe(201);
+    const sealsOpen = await postOpeningStock(ctx, owner, sealsId, { quantity: 500 });
+    expect(sealsOpen.status).toBe(201);
+    const sealsRev = sealsOpen.body.item.stockRevision as number;
 
     // Measurable supply initializes at 1.25 L.
     const liquidOpen = await postOpeningStock(ctx, owner, liquidId, { quantity: 1.25 });
     expect(liquidOpen.status).toBe(201);
+    const liquidRev = liquidOpen.body.item.stockRevision as number;
     expect(liquidOpen.body.item).toMatchObject({
       status: "INITIALIZED",
       currentQuantity: 1.25,
@@ -1522,6 +1529,8 @@ describe("Final Inventory Task 1 — operating supplies, receiving, usage, and D
           quantity: 0.25,
           purpose: "Yesterday wash",
           effectiveDate: "2026-11-26",
+          expectedRevision: liquidRev,
+          expectedCurrentQuantity: 1.25,
           requestKey: "late-use-guard",
         })
       ).status,
@@ -1531,6 +1540,8 @@ describe("Final Inventory Task 1 — operating supplies, receiving, usage, and D
         await postReceiving(ctx, owner, liquidId, {
           quantity: 1,
           effectiveDate: "2026-11-26",
+          expectedRevision: liquidRev,
+          expectedCurrentQuantity: 1.25,
           requestKey: "late-recv-guard",
         })
       ).status,
@@ -1541,6 +1552,8 @@ describe("Final Inventory Task 1 — operating supplies, receiving, usage, and D
       (
         await postReceiving(ctx, owner, sealsId, {
           quantity: 2.5,
+          expectedRevision: sealsRev,
+          expectedCurrentQuantity: 500,
           requestKey: "seals-bad-recv",
         })
       ).status,
@@ -1550,20 +1563,23 @@ describe("Final Inventory Task 1 — operating supplies, receiving, usage, and D
         await postUsage(ctx, employee, sealsId, {
           quantity: 1.2,
           purpose: "Sealing",
+          expectedRevision: sealsRev,
+          expectedCurrentQuantity: 500,
           requestKey: "seals-bad-use",
         })
       ).status,
     ).toBe(400);
 
     // Stock Used on non-operating-supply (ROUND) is rejected.
-    expect(
-      (await postOpeningStock(ctx, owner, "ROUND", { quantity: 5 })).status,
-    ).toBe(201);
+    const roundOpen = await postOpeningStock(ctx, owner, "ROUND", { quantity: 5 });
+    expect(roundOpen.status).toBe(201);
     expect(
       (
         await postUsage(ctx, employee, "ROUND", {
           quantity: 1,
           purpose: "Not a supply",
+          expectedRevision: roundOpen.body.item.stockRevision,
+          expectedCurrentQuantity: 5,
           requestKey: "round-use",
         })
       ).status,
@@ -1574,6 +1590,8 @@ describe("Final Inventory Task 1 — operating supplies, receiving, usage, and D
     const useRes = await postUsage(ctx, employee, liquidId, {
       quantity: 1.5,
       purpose: "Deep cleaning",
+      expectedRevision: liquidRev,
+      expectedCurrentQuantity: 1.25,
       requestKey: "use-liquid-1",
     });
     expect(useRes.status).toBe(201);
@@ -1598,6 +1616,8 @@ describe("Final Inventory Task 1 — operating supplies, receiving, usage, and D
     const useReplay = await postUsage(ctx, employee, liquidId, {
       quantity: 1.5,
       purpose: "Deep cleaning",
+      expectedRevision: liquidRev,
+      expectedCurrentQuantity: 1.25,
       requestKey: "use-liquid-1",
     });
     expect(useReplay.status).toBe(200);
@@ -1608,6 +1628,8 @@ describe("Final Inventory Task 1 — operating supplies, receiving, usage, and D
     const useConflict = await postUsage(ctx, employee, liquidId, {
       quantity: 0.5,
       purpose: "Deep cleaning",
+      expectedRevision: useRes.body.item.stockRevision,
+      expectedCurrentQuantity: -0.25,
       requestKey: "use-liquid-1",
     });
     expect(useConflict.status).toBe(409);
@@ -1618,6 +1640,8 @@ describe("Final Inventory Task 1 — operating supplies, receiving, usage, and D
       (
         await postReceiving(ctx, employee, liquidId, {
           quantity: 2,
+          expectedRevision: useRes.body.item.stockRevision,
+          expectedCurrentQuantity: -0.25,
           requestKey: "emp-recv-403",
         })
       ).status,
@@ -1639,6 +1663,8 @@ describe("Final Inventory Task 1 — operating supplies, receiving, usage, and D
     const recvRes = await postReceiving(ctx, owner, liquidId, {
       quantity: 2,
       note: "Supplier jug delivery",
+      expectedRevision: useRes.body.item.stockRevision,
+      expectedCurrentQuantity: -0.25,
       requestKey: "recv-liquid-1",
     });
     expect(recvRes.status).toBe(201);
@@ -1660,6 +1686,8 @@ describe("Final Inventory Task 1 — operating supplies, receiving, usage, and D
     const recvReplay = await postReceiving(ctx, owner, liquidId, {
       quantity: 2,
       note: "Supplier jug delivery",
+      expectedRevision: useRes.body.item.stockRevision,
+      expectedCurrentQuantity: -0.25,
       requestKey: "recv-liquid-1",
     });
     expect(recvReplay.status).toBe(200);
@@ -1722,17 +1750,17 @@ describe("Final Inventory Task 1 — operating supplies, receiving, usage, and D
     expect(oldSalt.status).toBe(201);
     const oldSaltId = oldSalt.body.item.id as string;
 
-    expect((await postOpeningStock(ctx, owner, oldSaltId, { quantity: 4 })).status).toBe(201);
+    const saltOpen = await postOpeningStock(ctx, owner, oldSaltId, { quantity: 4 });
+    expect(saltOpen.status).toBe(201);
     ctx.clock.advance(60_000);
-    expect(
-      (
-        await postUsage(ctx, employee, oldSaltId, {
-          quantity: 1,
-          purpose: "Brine tank",
-          requestKey: "salt-use-1",
-        })
-      ).status,
-    ).toBe(201);
+    const saltUse = await postUsage(ctx, employee, oldSaltId, {
+      quantity: 1,
+      purpose: "Brine tank",
+      expectedRevision: saltOpen.body.item.stockRevision,
+      expectedCurrentQuantity: 4,
+      requestKey: "salt-use-1",
+    });
+    expect(saltUse.status).toBe(201);
 
     const archived = await archiveProduct(ctx, owner, oldSaltId);
     expect(archived.status).toBe(200);
@@ -1743,6 +1771,8 @@ describe("Final Inventory Task 1 — operating supplies, receiving, usage, and D
       (
         await postReceiving(ctx, owner, oldSaltId, {
           quantity: 2,
+          expectedRevision: saltUse.body.item.stockRevision,
+          expectedCurrentQuantity: 3,
           requestKey: "archived-recv",
         })
       ).status,
@@ -1752,6 +1782,8 @@ describe("Final Inventory Task 1 — operating supplies, receiving, usage, and D
         await postUsage(ctx, employee, oldSaltId, {
           quantity: 1,
           purpose: "Blocked",
+          expectedRevision: saltUse.body.item.stockRevision,
+          expectedCurrentQuantity: 3,
           requestKey: "archived-use",
         })
       ).status,
@@ -1793,5 +1825,298 @@ describe("Final Inventory Task 1 — operating supplies, receiving, usage, and D
       currentQuantity: 25.5,
       archivedAt: null,
     });
+  });
+
+  it("Finding 1: replays same-reference receiving and usage across Manila midnight for the original actor while rejecting new backdated entries", async () => {
+    const supplyRes = await postProduct(ctx, owner, {
+      category: "OPERATING_SUPPLY",
+      name: "Sanitizer",
+      unit: "L",
+      allowDecimalQuantity: true,
+      unitConfirmed: true,
+    });
+    expect(supplyRes.status).toBe(201);
+    const supplyId = supplyRes.body.item.id as string;
+
+    const openRes = await postOpeningStock(ctx, owner, supplyId, { quantity: 10 });
+    expect(openRes.status).toBe(201);
+
+    // Move clock to 23:59:59 Manila on 2026-11-27 and sign in fresh sessions so they stay valid across midnight.
+    ctx.clock.set("2026-11-27T23:59:59+08:00");
+    const lateEmployee = await signIn(ctx.app, "emp_inv1", employee.password);
+    const lateOwner = await signIn(ctx.app, "owner_inv1", owner.password);
+
+    const initialUse = await postUsage(ctx, lateEmployee, supplyId, {
+      quantity: 1,
+      purpose: "Late shift wash",
+      effectiveDate: "2026-11-27",
+      expectedRevision: openRes.body.item.stockRevision,
+      expectedCurrentQuantity: 10,
+      requestKey: "midnight-use-1",
+    });
+    expect(initialUse.status).toBe(201);
+    expect(initialUse.body.item.currentQuantity).toBe(9);
+
+    const initialRecv = await postReceiving(ctx, lateOwner, supplyId, {
+      quantity: 2,
+      note: "Night delivery",
+      effectiveDate: "2026-11-27",
+      expectedRevision: initialUse.body.item.stockRevision,
+      expectedCurrentQuantity: 9,
+      requestKey: "midnight-recv-1",
+    });
+    expect(initialRecv.status).toBe(201);
+    expect(initialRecv.body.item.currentQuantity).toBe(11);
+
+    // Cross Manila midnight to 00:00:01 on 2026-11-28 (within the active session lifetime).
+    ctx.clock.set("2026-11-28T00:00:01+08:00");
+
+    // Identical retry of 2026-11-27 usage by original actor resolves as 200 replay with no duplicate deduction.
+    const replayUse = await postUsage(ctx, lateEmployee, supplyId, {
+      quantity: 1,
+      purpose: "Late shift wash",
+      effectiveDate: "2026-11-27",
+      expectedRevision: openRes.body.item.stockRevision,
+      expectedCurrentQuantity: 10,
+      requestKey: "midnight-use-1",
+    });
+    expect(replayUse.status).toBe(200);
+    expect(replayUse.body.replayed).toBe(true);
+    expect(replayUse.body.item.currentQuantity).toBe(11);
+    expect(replayUse.body.movement.effectiveDate).toBe("2026-11-27");
+
+    // Identical retry of 2026-11-27 receiving by Owner resolves as 200 replay with no duplicate addition.
+    const replayRecv = await postReceiving(ctx, lateOwner, supplyId, {
+      quantity: 2,
+      note: "Night delivery",
+      effectiveDate: "2026-11-27",
+      expectedRevision: initialUse.body.item.stockRevision,
+      expectedCurrentQuantity: 9,
+      requestKey: "midnight-recv-1",
+    });
+    expect(replayRecv.status).toBe(200);
+    expect(replayRecv.body.replayed).toBe(true);
+    expect(replayRecv.body.item.currentQuantity).toBe(11);
+
+    // A different actor retrying with the original actor's key gets 409 REQUEST_KEY_CONFLICT.
+    const crossActorReplay = await postUsage(ctx, lateOwner, supplyId, {
+      quantity: 1,
+      purpose: "Late shift wash",
+      effectiveDate: "2026-11-27",
+      expectedRevision: openRes.body.item.stockRevision,
+      expectedCurrentQuantity: 10,
+      requestKey: "midnight-use-1",
+    });
+    expect(crossActorReplay.status).toBe(409);
+    expect(crossActorReplay.body.error.code).toBe("REQUEST_KEY_CONFLICT");
+
+    // New backdated entries on 2026-11-28 with effectiveDate 2026-11-27 are still rejected (400).
+    const newBackdatedUse = await postUsage(ctx, lateEmployee, supplyId, {
+      quantity: 1,
+      purpose: "New backdated attempt",
+      effectiveDate: "2026-11-27",
+      expectedRevision: initialRecv.body.item.stockRevision,
+      expectedCurrentQuantity: 11,
+      requestKey: "fresh-backdated-use",
+    });
+    expect(newBackdatedUse.status).toBe(400);
+
+    const newBackdatedRecv = await postReceiving(ctx, lateOwner, supplyId, {
+      quantity: 1,
+      effectiveDate: "2026-11-27",
+      expectedRevision: initialRecv.body.item.stockRevision,
+      expectedCurrentQuantity: 11,
+      requestKey: "fresh-backdated-recv",
+    });
+    expect(newBackdatedRecv.status).toBe(400);
+  });
+
+  it("Finding 2: rejects stale receiving/usage previews with refreshed item and allows confirming against updated stock", async () => {
+    const supplyRes = await postProduct(ctx, owner, {
+      category: "OPERATING_SUPPLY",
+      name: "Chlorine Solution",
+      unit: "L",
+      allowDecimalQuantity: true,
+      unitConfirmed: true,
+    });
+    expect(supplyRes.status).toBe(201);
+    const supplyId = supplyRes.body.item.id as string;
+
+    const openRes = await postOpeningStock(ctx, owner, supplyId, { quantity: 9 });
+    expect(openRes.status).toBe(201);
+    const revAt9 = openRes.body.item.stockRevision as number;
+
+    // Owner concurrently records 3 L received -> balance moves from 9 L to 12 L.
+    const ownerRecv = await postReceiving(ctx, owner, supplyId, {
+      quantity: 3,
+      note: "Morning refill",
+      expectedRevision: revAt9,
+      expectedCurrentQuantity: 9,
+      requestKey: "f2-owner-recv",
+    });
+    expect(ownerRecv.status).toBe(201);
+    expect(ownerRecv.body.item.currentQuantity).toBe(12);
+    const revAt12 = ownerRecv.body.item.stockRevision as number;
+
+    // Employee submits 10 L used against stale baseline (revAt9, 9 L) -> rejected with 409 STALE_STOCK_BALANCE and refreshed item.
+    const staleUse = await postUsage(ctx, employee, supplyId, {
+      quantity: 10,
+      purpose: "Filter flush",
+      expectedRevision: revAt9,
+      expectedCurrentQuantity: 9,
+      requestKey: "f2-emp-stale-use",
+    });
+    expect(staleUse.status).toBe(409);
+    expect(staleUse.body.error.code).toBe("STALE_STOCK_BALANCE");
+    expect(staleUse.body.item).toMatchObject({
+      currentQuantity: 12,
+      stockRevision: revAt12,
+      needsReconciliation: false,
+    });
+
+    // Employee confirms 10 L against the refreshed baseline (revAt12, 12 L) -> succeeds to +2 L without shortage flag.
+    const freshUse = await postUsage(ctx, employee, supplyId, {
+      quantity: 10,
+      purpose: "Filter flush",
+      expectedRevision: revAt12,
+      expectedCurrentQuantity: 12,
+      requestKey: "f2-emp-fresh-use",
+    });
+    expect(freshUse.status).toBe(201);
+    expect(freshUse.body.item).toMatchObject({
+      currentQuantity: 2,
+      needsReconciliation: false,
+    });
+
+    // Stale Stock Received against revAt9 is also rejected with 409 STALE_STOCK_BALANCE.
+    const staleRecv = await postReceiving(ctx, owner, supplyId, {
+      quantity: 5,
+      expectedRevision: revAt9,
+      expectedCurrentQuantity: 9,
+      requestKey: "f2-owner-stale-recv",
+    });
+    expect(staleRecv.status).toBe(409);
+    expect(staleRecv.body.error.code).toBe("STALE_STOCK_BALANCE");
+    expect(staleRecv.body.item.currentQuantity).toBe(2);
+
+    // Ordinary shortage posting still works once confirmed against current revision (2 L - 3 L = -1 L).
+    const shortageUse = await postUsage(ctx, employee, supplyId, {
+      quantity: 3,
+      purpose: "Extra flush",
+      expectedRevision: freshUse.body.item.stockRevision,
+      expectedCurrentQuantity: 2,
+      requestKey: "f2-emp-shortage-use",
+    });
+    expect(shortageUse.status).toBe(201);
+    expect(shortageUse.body.item).toMatchObject({
+      currentQuantity: -1,
+      needsReconciliation: true,
+    });
+  });
+
+  it("Finding 3: accepts accumulated positive and negative stored baselines beyond 1,000,000 during reconciliation while keeping single-input caps", async () => {
+    const bulkRes = await postProduct(ctx, owner, {
+      category: "OPERATING_SUPPLY",
+      name: "Filter Granules",
+      unit: "g",
+      allowDecimalQuantity: true,
+      unitConfirmed: true,
+    });
+    expect(bulkRes.status).toBe(201);
+    const bulkId = bulkRes.body.item.id as string;
+
+    const openRes = await postOpeningStock(ctx, owner, bulkId, { quantity: 2 });
+    expect(openRes.status).toBe(201);
+
+    // Receive max single-entry 1,000,000 -> accumulated stored balance 1,000,002.
+    const recvRes = await postReceiving(ctx, owner, bulkId, {
+      quantity: 1_000_000,
+      expectedRevision: openRes.body.item.stockRevision,
+      expectedCurrentQuantity: 2,
+      requestKey: "f3-recv-max",
+    });
+    expect(recvRes.status).toBe(201);
+    expect(recvRes.body.item.currentQuantity).toBe(1_000_002);
+
+    // Reconcile down to 2 using stored baseline 1,000,002.
+    const recPositive = await postReconciliation(ctx, owner, bulkId, {
+      physicalCount: 2,
+      reason: "Correct bulk entry",
+      expectedRevision: recvRes.body.item.stockRevision,
+      expectedCurrentQuantity: 1_000_002,
+      requestKey: "f3-rec-pos",
+    });
+    expect(recPositive.status).toBe(201);
+    expect(recPositive.body.reconciliation).toMatchObject({
+      balanceBefore: 1_000_002,
+      physicalCount: 2,
+      quantityDelta: -1_000_000,
+      balanceAfter: 2,
+    });
+
+    // Now test negative accumulated balance beyond -1,000,000: 2 - 1,000,000 - 4 = -1,000,002.
+    const useLarge = await postUsage(ctx, employee, bulkId, {
+      quantity: 1_000_000,
+      purpose: "Bulk flush 1",
+      expectedRevision: recPositive.body.item.stockRevision,
+      expectedCurrentQuantity: 2,
+      requestKey: "f3-use-large-1",
+    });
+    expect(useLarge.status).toBe(201);
+    const useExtra = await postUsage(ctx, employee, bulkId, {
+      quantity: 4,
+      purpose: "Bulk flush 2",
+      expectedRevision: useLarge.body.item.stockRevision,
+      expectedCurrentQuantity: -999_998,
+      requestKey: "f3-use-large-2",
+    });
+    expect(useExtra.status).toBe(201);
+    expect(useExtra.body.item).toMatchObject({
+      currentQuantity: -1_000_002,
+      needsReconciliation: true,
+    });
+
+    // Reconcile back to 2 using negative stored baseline -1,000,002.
+    const recNegative = await postReconciliation(ctx, owner, bulkId, {
+      physicalCount: 2,
+      reason: "Reconcile negative accumulated balance",
+      expectedRevision: useExtra.body.item.stockRevision,
+      expectedCurrentQuantity: -1_000_002,
+      requestKey: "f3-rec-neg",
+    });
+    expect(recNegative.status).toBe(201);
+    expect(recNegative.body.item).toMatchObject({
+      currentQuantity: 2,
+      needsReconciliation: false,
+    });
+    expect(recNegative.body.reconciliation).toMatchObject({
+      balanceBefore: -1_000_002,
+      physicalCount: 2,
+      quantityDelta: 1_000_004,
+      balanceAfter: 2,
+    });
+
+    // Individual input quantities above 1,000,000 remain rejected (400).
+    expect(
+      (
+        await postReceiving(ctx, owner, bulkId, {
+          quantity: 1_000_001,
+          expectedRevision: recNegative.body.item.stockRevision,
+          expectedCurrentQuantity: 2,
+          requestKey: "f3-over-cap-recv",
+        })
+      ).status,
+    ).toBe(400);
+    expect(
+      (
+        await postReconciliation(ctx, owner, bulkId, {
+          physicalCount: 1_000_001,
+          reason: "Over cap count",
+          expectedRevision: recNegative.body.item.stockRevision,
+          expectedCurrentQuantity: 2,
+          requestKey: "f3-over-cap-rec",
+        })
+      ).status,
+    ).toBe(400);
   });
 });

@@ -24,6 +24,7 @@ import {
   parseReconciliationReason,
   parseRequestKey,
   parseStockUnit,
+  parseStoredBalanceBaseline,
   parseUnitPriceCentavos,
   type PosSection,
 } from "./inventory.js";
@@ -62,8 +63,22 @@ const RECONCILE_KEYS = new Set([
   "expectedCurrentQuantity",
   "requestKey",
 ]);
-const RECEIVING_KEYS = new Set(["quantity", "effectiveDate", "note", "requestKey"]);
-const USAGE_KEYS = new Set(["quantity", "purpose", "effectiveDate", "requestKey"]);
+const RECEIVING_KEYS = new Set([
+  "quantity",
+  "effectiveDate",
+  "note",
+  "expectedRevision",
+  "expectedCurrentQuantity",
+  "requestKey",
+]);
+const USAGE_KEYS = new Set([
+  "quantity",
+  "purpose",
+  "effectiveDate",
+  "expectedRevision",
+  "expectedCurrentQuantity",
+  "requestKey",
+]);
 
 function resolveItemTarget(rawKey: string): OpeningStockTarget | null {
   const shape = parseContainerShape(rawKey);
@@ -770,9 +785,8 @@ export function inventoryRoutes(db: Database): Router {
       return;
     }
 
-    const expectedCurrentQuantity = parseQuantity(body.expectedCurrentQuantity, {
+    const expectedCurrentQuantity = parseStoredBalanceBaseline(body.expectedCurrentQuantity, {
       allowDecimal: true,
-      allowZero: true,
       allowNegative: true,
     });
     if (expectedCurrentQuantity === null) {
@@ -936,21 +950,30 @@ export function inventoryRoutes(db: Database): Router {
         sendError(res, 400, "VALIDATION_FAILED", "Delivery date cannot be in the future.");
         return;
       }
-      if (parsedDate < todayManila) {
-        sendError(
-          res,
-          400,
-          "VALIDATION_FAILED",
-          "Late Stock Received entries require count-coverage review, which is not yet enabled.",
-        );
-        return;
-      }
       effectiveDate = parsedDate;
     }
 
     const noteResult = parseMovementNote(body.note, { required: false });
     if (!noteResult.ok) {
       sendError(res, 400, "VALIDATION_FAILED", "Delivery note must be 240 characters or fewer.");
+      return;
+    }
+
+    if (
+      typeof body.expectedRevision !== "number" ||
+      !Number.isInteger(body.expectedRevision) ||
+      body.expectedRevision < 0
+    ) {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid stock revision baseline.");
+      return;
+    }
+
+    const expectedCurrentQuantity = parseStoredBalanceBaseline(body.expectedCurrentQuantity, {
+      allowDecimal: true,
+      allowNegative: true,
+    });
+    if (expectedCurrentQuantity === null) {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid recorded stock baseline.");
       return;
     }
 
@@ -964,7 +987,10 @@ export function inventoryRoutes(db: Database): Router {
       target,
       quantity,
       effectiveDate,
+      todayManila,
       note: noteResult.value,
+      expectedRevision: body.expectedRevision,
+      expectedCurrentQuantity,
       requestKey: requestKeyResult.value,
       actorUserId: req.auth!.user.id,
       recordedAt: req.now,
@@ -980,6 +1006,19 @@ export function inventoryRoutes(db: Database): Router {
         400,
         "VALIDATION_FAILED",
         `Enter a positive whole number of ${outcome.unit}.`,
+      );
+      return;
+    }
+    if (outcome.kind === "invalid-baseline") {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid recorded stock baseline.");
+      return;
+    }
+    if (outcome.kind === "late-date-not-enabled") {
+      sendError(
+        res,
+        400,
+        "VALIDATION_FAILED",
+        "Late Stock Received entries require count-coverage review, which is not yet enabled.",
       );
       return;
     }
@@ -1012,6 +1051,16 @@ export function inventoryRoutes(db: Database): Router {
         "REQUEST_KEY_CONFLICT",
         "This Stock Received request key was already used for a different entry.",
       );
+      return;
+    }
+    if (outcome.kind === "stale") {
+      res.status(409).json({
+        error: {
+          code: "STALE_STOCK_BALANCE",
+          message: `Recorded stock for ${outcome.item.name} changed to ${outcome.item.currentQuantity} ${outcome.item.unit} before saving. Review the refreshed balance and confirm again.`,
+        },
+        item: outcome.item,
+      });
       return;
     }
 
@@ -1076,16 +1125,25 @@ export function inventoryRoutes(db: Database): Router {
         sendError(res, 400, "VALIDATION_FAILED", "Use date cannot be in the future.");
         return;
       }
-      if (parsedDate < todayManila) {
-        sendError(
-          res,
-          400,
-          "VALIDATION_FAILED",
-          "Late Stock Used entries require count-coverage review, which is not yet enabled.",
-        );
-        return;
-      }
       effectiveDate = parsedDate;
+    }
+
+    if (
+      typeof body.expectedRevision !== "number" ||
+      !Number.isInteger(body.expectedRevision) ||
+      body.expectedRevision < 0
+    ) {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid stock revision baseline.");
+      return;
+    }
+
+    const expectedCurrentQuantity = parseStoredBalanceBaseline(body.expectedCurrentQuantity, {
+      allowDecimal: true,
+      allowNegative: true,
+    });
+    if (expectedCurrentQuantity === null) {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid recorded stock baseline.");
+      return;
     }
 
     const requestKeyResult = parseRequestKey(body.requestKey);
@@ -1098,7 +1156,10 @@ export function inventoryRoutes(db: Database): Router {
       target,
       quantity,
       effectiveDate,
+      todayManila,
       purpose: purposeResult.value,
+      expectedRevision: body.expectedRevision,
+      expectedCurrentQuantity,
       requestKey: requestKeyResult.value,
       actorUserId: req.auth!.user.id,
       recordedAt: req.now,
@@ -1123,6 +1184,19 @@ export function inventoryRoutes(db: Database): Router {
         400,
         "VALIDATION_FAILED",
         `Enter a positive whole number of ${outcome.unit}.`,
+      );
+      return;
+    }
+    if (outcome.kind === "invalid-baseline") {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid recorded stock baseline.");
+      return;
+    }
+    if (outcome.kind === "late-date-not-enabled") {
+      sendError(
+        res,
+        400,
+        "VALIDATION_FAILED",
+        "Late Stock Used entries require count-coverage review, which is not yet enabled.",
       );
       return;
     }
@@ -1151,6 +1225,16 @@ export function inventoryRoutes(db: Database): Router {
         "REQUEST_KEY_CONFLICT",
         "This Stock Used request key was already used for a different entry.",
       );
+      return;
+    }
+    if (outcome.kind === "stale") {
+      res.status(409).json({
+        error: {
+          code: "STALE_STOCK_BALANCE",
+          message: `Recorded stock for ${outcome.item.name} changed to ${outcome.item.currentQuantity} ${outcome.item.unit} before saving. Review the refreshed balance and confirm again.`,
+        },
+        item: outcome.item,
+      });
       return;
     }
 

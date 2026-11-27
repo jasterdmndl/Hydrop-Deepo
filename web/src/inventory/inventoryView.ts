@@ -353,6 +353,21 @@ export function getTodayManilaDateString(now: Date = new Date()): string {
   return `${year}-${month}-${day}`;
 }
 
+export function isUncertainSubmissionError(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return true;
+  }
+  const maybeStatus = (error as { status?: unknown }).status;
+  const maybeCode = (error as { code?: unknown }).code;
+  if (maybeCode === "NETWORK_ERROR") {
+    return true;
+  }
+  if (typeof maybeStatus === "number") {
+    return maybeStatus === 0 || maybeStatus >= 500;
+  }
+  return true;
+}
+
 export function formatRecordedAtManila(iso: string): string {
   const ms = Date.parse(iso);
   if (Number.isNaN(ms)) {

@@ -20,6 +20,8 @@ export const BUILT_IN_POS_SECTIONS = {
 
 export const QUANTITY_SCALE = 10_000;
 export const MAX_OPENING_QUANTITY = 1_000_000;
+/** Stored balances use numeric(12, 4), so accumulated balances can exceed single-entry caps up to 99,999,999.9999. */
+export const MAX_STORED_BALANCE = 99_999_999.9999;
 export const MAX_UNIT_PRICE_CENTAVOS = 10_000_000;
 export const MAX_PRODUCT_NAME_LENGTH = 80;
 export const MAX_PRODUCT_DESCRIPTION_LENGTH = 160;
@@ -195,9 +197,10 @@ export function isUuid(raw: unknown): raw is string {
 
 export function parseQuantity(
   raw: unknown,
-  options: { allowDecimal: boolean; allowZero: boolean; allowNegative?: boolean },
+  options: { allowDecimal: boolean; allowZero: boolean; allowNegative?: boolean; max?: number },
 ): number | null {
   if (typeof raw !== "number" || !Number.isFinite(raw)) return null;
+  const max = options.max ?? MAX_OPENING_QUANTITY;
   const scaled = raw * QUANTITY_SCALE;
   if (Math.abs(scaled - Math.round(scaled)) > 1e-6) {
     return null;
@@ -210,7 +213,7 @@ export function parseQuantity(
   }
 
   if (options.allowNegative) {
-    if (normalized < -MAX_OPENING_QUANTITY || normalized > MAX_OPENING_QUANTITY) {
+    if (normalized < -max || normalized > max) {
       return null;
     }
     if (!options.allowZero && roundedScaled === 0) {
@@ -220,12 +223,24 @@ export function parseQuantity(
   }
 
   if (options.allowZero) {
-    if (roundedScaled < 0 || normalized > MAX_OPENING_QUANTITY) return null;
+    if (roundedScaled < 0 || normalized > max) return null;
   } else {
-    if (roundedScaled <= 0 || normalized > MAX_OPENING_QUANTITY) return null;
+    if (roundedScaled <= 0 || normalized > max) return null;
   }
 
   return normalized;
+}
+
+export function parseStoredBalanceBaseline(
+  raw: unknown,
+  options: { allowDecimal: boolean; allowNegative: boolean },
+): number | null {
+  return parseQuantity(raw, {
+    allowDecimal: options.allowDecimal,
+    allowZero: true,
+    allowNegative: options.allowNegative,
+    max: MAX_STORED_BALANCE,
+  });
 }
 
 export function parseOpeningQuantity(raw: unknown, allowDecimal = false): number | null {
