@@ -579,7 +579,7 @@ describe("inventoryView helpers", () => {
     expect(loadPendingMovementAttempts("owner1", memoryStorage)).toEqual([ownerAttempt]);
   });
 
-  it("Finding 1: preserves original reference when cancellation or status JSON response is truncated or unexpected", async () => {
+  it("Finding 1: preserves original reference unless SAVED response includes required fields and matches pending attempt", async () => {
     const store = new Map<string, string>();
     const memoryStorage: StorageLike = {
       getItem: (key) => store.get(key) ?? null,
@@ -602,6 +602,18 @@ describe("inventoryView helpers", () => {
       requestKey: "cancel-truncate-1",
       expectedRevision: 2,
       expectedCurrentQuantity: 10,
+    };
+    const otherAttempt: PendingStockMovementAttempt = {
+      movementType: "STOCK_USED",
+      itemKey: "supply-2",
+      itemName: "Sanitizer",
+      unit: "L",
+      quantityInput: "1",
+      noteOrPurposeInput: "Bottle rinse",
+      effectiveDate: "2026-11-27",
+      requestKey: "unsaved-other-key",
+      expectedRevision: 1,
+      expectedCurrentQuantity: 5,
     };
     savePendingMovementAttempts("emp1", upsertPendingMovementAttempt([], empAttempt), memoryStorage);
 
@@ -638,68 +650,156 @@ describe("inventoryView helpers", () => {
       recordedAt: "2026-11-27T09:05:00+08:00",
     };
 
-    // Strict parser only accepts explicit CANCELLED or validated SAVED payloads.
-    expect(parsePendingMovementCancelResponse({})).toEqual({ kind: "UNEXPECTED" });
-    expect(parsePendingMovementCancelResponse(null)).toEqual({ kind: "UNEXPECTED" });
-    expect(parsePendingMovementCancelResponse({ status: "NOT_FOUND" })).toEqual({
+    // Malformed minimal SAVED payload (like Sol's reproduction omitting item.id, currentQuantity, openingStock, movement.itemId).
+    const malformedMinimalSaved = {
+      status: "SAVED",
+      item: { code: "SUPPLY-1", name: "Dishwashing Liquid", unit: "L", status: "INITIALIZED" },
+      movement: { id: "mov-1", movementType: "STOCK_USED", quantity: 1, unit: "L" },
+    };
+    const missingMovementBalanceSaved = {
+      status: "SAVED",
+      item: savedItem,
+      movement: {
+        id: "mov-1",
+        itemId: "supply-1",
+        movementType: "STOCK_USED",
+        quantity: 1,
+        quantityDelta: -1,
+        unit: "L",
+        effectiveDate: "2026-11-27",
+        note: "Bottle rinse",
+        recordedBy: "emp1",
+        recordedAt: "2026-11-27T09:05:00+08:00",
+      },
+    };
+    const validCompleteSaved = {
+      status: "SAVED",
+      item: savedItem,
+      movement: savedMovement,
+    };
+
+    // Strict parser checks on both endpoints.
+    expect(parsePendingMovementCancelResponse({}, empAttempt)).toEqual({ kind: "UNEXPECTED" });
+    expect(parsePendingMovementCancelResponse(null, empAttempt)).toEqual({ kind: "UNEXPECTED" });
+    expect(parsePendingMovementCancelResponse({ status: "NOT_FOUND" }, empAttempt)).toEqual({
       kind: "UNEXPECTED",
     });
-    expect(parsePendingMovementCancelResponse({ status: "OTHER" })).toEqual({ kind: "UNEXPECTED" });
-    expect(parsePendingMovementCancelResponse({ status: "SAVED", item: savedItem })).toEqual({
+    expect(parsePendingMovementCancelResponse({ status: "OTHER" }, empAttempt)).toEqual({
       kind: "UNEXPECTED",
     });
-    expect(parsePendingMovementCancelResponse({ status: "CANCELLED" })).toEqual({
+    expect(parsePendingMovementCancelResponse(malformedMinimalSaved, empAttempt)).toEqual({
+      kind: "UNEXPECTED",
+    });
+    expect(parsePendingMovementCancelResponse(missingMovementBalanceSaved, empAttempt)).toEqual({
+      kind: "UNEXPECTED",
+    });
+    expect(parsePendingMovementCancelResponse({ status: "CANCELLED" }, empAttempt)).toEqual({
       kind: "CANCELLED",
     });
-    expect(parsePendingMovementStatusResponse({})).toEqual({ kind: "UNEXPECTED" });
-    expect(parsePendingMovementStatusResponse({ status: "NOT_FOUND" })).toEqual({
+    expect(parsePendingMovementStatusResponse({}, empAttempt)).toEqual({ kind: "UNEXPECTED" });
+    expect(parsePendingMovementStatusResponse(malformedMinimalSaved, empAttempt)).toEqual({
+      kind: "UNEXPECTED",
+    });
+    expect(parsePendingMovementStatusResponse(missingMovementBalanceSaved, empAttempt)).toEqual({
+      kind: "UNEXPECTED",
+    });
+    expect(parsePendingMovementStatusResponse({ status: "NOT_FOUND" }, empAttempt)).toEqual({
       kind: "NOT_FOUND",
+    });
+    // Cross-item complete SAVED payload must NOT match another item's pending attempt.
+    expect(parsePendingMovementStatusResponse(validCompleteSaved, otherAttempt)).toEqual({
+      kind: "UNEXPECTED",
+    });
+    expect(parsePendingMovementCancelResponse(validCompleteSaved, otherAttempt)).toEqual({
+      kind: "UNEXPECTED",
     });
 
     const originalFetch = globalThis.fetch;
-    let phase: "truncated-cancel" | "truncated-status" | "valid-recovery" = "truncated-cancel";
+    let mockPayload:
+      | { kind: "truncated" }
+      | { kind: "json"; body: unknown } = { kind: "truncated" };
     globalThis.fetch = (async () => {
-      if (phase === "truncated-cancel" || phase === "truncated-status") {
-        // Simulates an interrupted HTTP 200 SAVED JSON response (api() resolves {} when json() rejects).
+      if (mockPayload.kind === "truncated") {
         return new Response('{"status":"SAVED","item":{"id":"supply-1","currentQuantity":9', {
           status: 200,
           headers: { "Content-Type": "application/json" },
         });
       }
-      return new Response(
-        JSON.stringify({ status: "SAVED", item: savedItem, movement: savedMovement }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
-      );
+      return new Response(JSON.stringify(mockPayload.body), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
     }) as typeof fetch;
 
     try {
-      // 1. Truncated HTTP 200 SAVED cancellation response must return UNEXPECTED (never CANCELLED).
-      const truncatedCancel = await requestPendingMovementCancel("cancel-truncate-1", {
-        itemKey: "supply-1",
-        movementType: "STOCK_USED",
+      // 1. Truncated HTTP 200 SAVED on BOTH cancel and status endpoints returns UNEXPECTED.
+      mockPayload = { kind: "truncated" };
+      expect(await requestPendingMovementCancel(empAttempt, "supply-1")).toEqual({
+        kind: "UNEXPECTED",
       });
-      expect(truncatedCancel).toEqual({ kind: "UNEXPECTED" });
+      expect(await requestPendingMovementStatus(empAttempt)).toEqual({ kind: "UNEXPECTED" });
       expect(loadPendingMovementAttempts("emp1", memoryStorage)).toEqual([empAttempt]);
 
-      // 2. Truncated HTTP 200 SAVED status-check response also returns UNEXPECTED (never NOT_FOUND/CANCELLED).
-      phase = "truncated-status";
-      const truncatedStatus = await requestPendingMovementStatus("cancel-truncate-1");
-      expect(truncatedStatus).toEqual({ kind: "UNEXPECTED" });
+      // 2. Readable malformed/incomplete SAVED on BOTH cancel and status endpoints returns UNEXPECTED.
+      mockPayload = { kind: "json", body: malformedMinimalSaved };
+      expect(await requestPendingMovementCancel(empAttempt, "supply-1")).toEqual({
+        kind: "UNEXPECTED",
+      });
+      expect(await requestPendingMovementStatus(empAttempt)).toEqual({ kind: "UNEXPECTED" });
+      mockPayload = { kind: "json", body: missingMovementBalanceSaved };
+      expect(await requestPendingMovementCancel(empAttempt, "supply-1")).toEqual({
+        kind: "UNEXPECTED",
+      });
+      expect(await requestPendingMovementStatus(empAttempt)).toEqual({ kind: "UNEXPECTED" });
       expect(loadPendingMovementAttempts("emp1", memoryStorage)).toEqual([empAttempt]);
 
-      // 3. Subsequent readable status check or cancel retry recovers the saved movement with original requestKey.
-      phase = "valid-recovery";
-      const recoveredStatus = await requestPendingMovementStatus("cancel-truncate-1");
-      expect(recoveredStatus).toEqual({
+      // 3. Complete valid SAVED belonging to a different item, wrong quantity, or wrong note/date on BOTH endpoints returns UNEXPECTED.
+      mockPayload = { kind: "json", body: validCompleteSaved };
+      expect(await requestPendingMovementCancel(otherAttempt, "supply-2")).toEqual({
+        kind: "UNEXPECTED",
+      });
+      expect(await requestPendingMovementStatus(otherAttempt)).toEqual({ kind: "UNEXPECTED" });
+
+      const wrongQtyAttempt: PendingStockMovementAttempt = { ...empAttempt, quantityInput: "2" };
+      expect(await requestPendingMovementCancel(wrongQtyAttempt, "supply-1")).toEqual({
+        kind: "UNEXPECTED",
+      });
+      expect(await requestPendingMovementStatus(wrongQtyAttempt)).toEqual({ kind: "UNEXPECTED" });
+
+      const wrongTypeAttempt: PendingStockMovementAttempt = {
+        ...empAttempt,
+        movementType: "STOCK_RECEIVED",
+      };
+      expect(await requestPendingMovementCancel(wrongTypeAttempt, "supply-1")).toEqual({
+        kind: "UNEXPECTED",
+      });
+      expect(await requestPendingMovementStatus(wrongTypeAttempt)).toEqual({ kind: "UNEXPECTED" });
+
+      const wrongDateAttempt: PendingStockMovementAttempt = {
+        ...empAttempt,
+        effectiveDate: "2026-11-26",
+      };
+      expect(await requestPendingMovementCancel(wrongDateAttempt, "supply-1")).toEqual({
+        kind: "UNEXPECTED",
+      });
+      expect(await requestPendingMovementStatus(wrongDateAttempt)).toEqual({ kind: "UNEXPECTED" });
+
+      const wrongNoteAttempt: PendingStockMovementAttempt = {
+        ...empAttempt,
+        noteOrPurposeInput: "Different purpose",
+      };
+      expect(await requestPendingMovementCancel(wrongNoteAttempt, "supply-1")).toEqual({
+        kind: "UNEXPECTED",
+      });
+      expect(await requestPendingMovementStatus(wrongNoteAttempt)).toEqual({ kind: "UNEXPECTED" });
+
+      // 4. Readable, complete, matching SAVED response recovers on BOTH endpoints.
+      expect(await requestPendingMovementStatus(empAttempt)).toEqual({
         kind: "SAVED",
         item: savedItem,
         movement: savedMovement,
       });
-      const recoveredCancel = await requestPendingMovementCancel("cancel-truncate-1", {
-        itemKey: "supply-1",
-        movementType: "STOCK_USED",
-      });
-      expect(recoveredCancel).toEqual({
+      expect(await requestPendingMovementCancel(empAttempt, "supply-1")).toEqual({
         kind: "SAVED",
         item: savedItem,
         movement: savedMovement,

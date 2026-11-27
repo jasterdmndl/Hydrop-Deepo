@@ -27,6 +27,7 @@ import {
   getContainerPackageSummary,
   getContainerSubtitle,
   getInventoryItemGroup,
+  getInventoryItemKey,
   getInventoryLoadPhase,
   getInventorySummaryCounts,
   getOpeningSubmitLabel,
@@ -40,8 +41,10 @@ import {
   type InventoryPermissions,
   isUncertainSubmissionError,
   isValidInventoryItemPayload,
+  isValidSavedMovementItemPayload,
   isValidStockMovementPayload,
   loadPendingMovementAttempts,
+  matchesPendingMovementAttempt,
   mergeRefreshedInventoryItems,
   parseLowStockLevelInput,
   parseMovementQuantityInput,
@@ -65,7 +68,7 @@ function isInventoryItemView(value: unknown): value is InventoryItemView {
 }
 
 function getItemKey(item: InventoryItemView): string {
-  return item.id ?? item.shape ?? item.code;
+  return getInventoryItemKey(item);
 }
 
 function generateClientKey(): string {
@@ -1056,7 +1059,14 @@ export function InventoryPage() {
   function recoverSavedPendingMovement(
     attempt: PendingStockMovementAttempt,
     response: { item: InventoryItemView; movement: StockMovementView },
-  ) {
+  ): boolean {
+    if (
+      !isValidSavedMovementItemPayload(response.item) ||
+      !isValidStockMovementPayload(response.movement) ||
+      !matchesPendingMovementAttempt(attempt, response.item, response.movement)
+    ) {
+      return false;
+    }
     loadTrackerRef.current.next();
     updatePendingAttempts((prev) =>
       removePendingMovementAttempt(prev, attempt.movementType, attempt.itemKey),
@@ -1090,6 +1100,7 @@ export function InventoryPage() {
           : "Saved Stock Used recovered",
       body: `${attempt.itemName} (${formatQuantityLabel(response.movement.quantity, response.movement.unit)} on ${response.movement.effectiveDate ?? attempt.effectiveDate}) was already saved. Current balance: ${formatQuantityLabel(response.item.currentQuantity, response.item.unit)}.`,
     });
+    return true;
   }
 
   async function finalizeCancelledPendingMovement(attempt: PendingStockMovementAttempt) {
@@ -1137,10 +1148,10 @@ export function InventoryPage() {
     loadTrackerRef.current.next();
 
     try {
-      const result = await requestPendingMovementStatus(attempt.requestKey);
+      const result = await requestPendingMovementStatus(attempt);
 
-      if (result.kind === "SAVED") {
-        recoverSavedPendingMovement(attempt, result);
+      if (result.kind === "SAVED" && recoverSavedPendingMovement(attempt, result)) {
+        return;
       } else if (result.kind === "CANCELLED") {
         await finalizeCancelledPendingMovement(attempt);
       } else if (result.kind === "NOT_FOUND") {
@@ -1160,7 +1171,7 @@ export function InventoryPage() {
           setUseError(inconclusiveMsg);
         }
       } else {
-        const unexpectedMsg = `Could not read the server's status response for ${attempt.itemName}. The original submission reference was kept—run Check status again or Retry Same Submission.`;
+        const unexpectedMsg = `Could not verify the server's status response for ${attempt.itemName} because required fields were missing or did not match the preserved submission. The original submission reference was kept—run Check status again or Retry Same Submission.`;
         setPendingBannerFeedback({ tone: "error", message: unexpectedMsg });
         if (
           attempt.movementType === "STOCK_RECEIVED" &&
@@ -1206,17 +1217,14 @@ export function InventoryPage() {
     loadTrackerRef.current.next();
 
     try {
-      const result = await requestPendingMovementCancel(attempt.requestKey, {
-        itemKey: endpointItemKey,
-        movementType: attempt.movementType,
-      });
+      const result = await requestPendingMovementCancel(attempt, endpointItemKey);
 
-      if (result.kind === "SAVED") {
-        recoverSavedPendingMovement(attempt, result);
+      if (result.kind === "SAVED" && recoverSavedPendingMovement(attempt, result)) {
+        return;
       } else if (result.kind === "CANCELLED") {
         await finalizeCancelledPendingMovement(attempt);
       } else {
-        const unexpectedMsg = `Could not read the server's cancellation response for ${attempt.itemName}. The original submission reference was kept—run Check status or Retry Same Submission before entering a new one.`;
+        const unexpectedMsg = `Could not verify the server's cancellation response for ${attempt.itemName} because required fields were missing or did not match the preserved submission. The original submission reference was kept—run Check status or Retry Same Submission before entering a new one.`;
         setPendingBannerFeedback({ tone: "error", message: unexpectedMsg });
         if (
           attempt.movementType === "STOCK_RECEIVED" &&
@@ -1331,8 +1339,9 @@ export function InventoryPage() {
         },
       });
       if (
-        !isValidInventoryItemPayload(response?.item) ||
-        !isValidStockMovementPayload(response?.movement)
+        !isValidSavedMovementItemPayload(response?.item) ||
+        !isValidStockMovementPayload(response?.movement) ||
+        !matchesPendingMovementAttempt(attemptRecord, response.item, response.movement)
       ) {
         throw new Error("Could not read the server's Stock Received confirmation response.");
       }
@@ -1478,8 +1487,9 @@ export function InventoryPage() {
         },
       });
       if (
-        !isValidInventoryItemPayload(response?.item) ||
-        !isValidStockMovementPayload(response?.movement)
+        !isValidSavedMovementItemPayload(response?.item) ||
+        !isValidStockMovementPayload(response?.movement) ||
+        !matchesPendingMovementAttempt(attemptRecord, response.item, response.movement)
       ) {
         throw new Error("Could not read the server's Stock Used confirmation response.");
       }

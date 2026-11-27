@@ -728,7 +728,7 @@ export function getOpeningSubmitLabel(
   return "Save Opening Count";
 }
 
-function getItemMergeKey(item: InventoryItemView): string {
+export function getInventoryItemKey(item: InventoryItemView): string {
   return item.id ?? item.shape ?? item.code;
 }
 
@@ -737,11 +737,11 @@ export function mergeRefreshedInventoryItems(
   fetchedItems: InventoryItemView[],
 ): InventoryItemView[] {
   const currentByKey = new Map<string, InventoryItemView>(
-    currentItems.map((item) => [getItemMergeKey(item), item]),
+    currentItems.map((item) => [getInventoryItemKey(item), item]),
   );
 
   return fetchedItems.map((fetched) => {
-    const existing = currentByKey.get(getItemMergeKey(fetched));
+    const existing = currentByKey.get(getInventoryItemKey(fetched));
     if (
       existing &&
       existing.status === "INITIALIZED" &&
@@ -762,32 +762,141 @@ export function mergeRefreshedInventoryItems(
   });
 }
 
-export function isValidInventoryItemPayload(value: unknown): value is InventoryItemView {
+function isValidOpeningStockRecord(value: unknown): value is OpeningStockRecord {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const candidate = value as Record<string, unknown>;
   return (
-    typeof candidate.code === "string" &&
-    candidate.code.length > 0 &&
-    typeof candidate.name === "string" &&
-    candidate.name.length > 0 &&
+    typeof candidate.quantity === "number" &&
+    Number.isFinite(candidate.quantity) &&
+    candidate.quantity >= 0 &&
     typeof candidate.unit === "string" &&
     candidate.unit.length > 0 &&
-    (candidate.status === "NOT_SET" || candidate.status === "INITIALIZED")
+    typeof candidate.recordedBy === "string" &&
+    candidate.recordedBy.length > 0 &&
+    typeof candidate.recordedAt === "string" &&
+    candidate.recordedAt.length > 0
+  );
+}
+
+export function isValidInventoryItemPayload(value: unknown): value is InventoryItemView {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  if (
+    typeof candidate.id !== "string" ||
+    candidate.id.length === 0 ||
+    typeof candidate.code !== "string" ||
+    candidate.code.length === 0 ||
+    typeof candidate.name !== "string" ||
+    candidate.name.length === 0 ||
+    typeof candidate.unit !== "string" ||
+    candidate.unit.length === 0 ||
+    (candidate.category !== "CONTAINER" &&
+      candidate.category !== "MERCHANDISE" &&
+      candidate.category !== "OPERATING_SUPPLY") ||
+    typeof candidate.stockRevision !== "number" ||
+    !Number.isInteger(candidate.stockRevision) ||
+    candidate.stockRevision < 0
+  ) {
+    return false;
+  }
+  if (candidate.status === "NOT_SET") {
+    return candidate.currentQuantity === null && candidate.openingStock === null;
+  }
+  if (candidate.status === "INITIALIZED") {
+    return (
+      typeof candidate.currentQuantity === "number" &&
+      Number.isFinite(candidate.currentQuantity) &&
+      isValidOpeningStockRecord(candidate.openingStock)
+    );
+  }
+  return false;
+}
+
+export function isValidSavedMovementItemPayload(value: unknown): value is InventoryItemView {
+  return (
+    isValidInventoryItemPayload(value) &&
+    value.status === "INITIALIZED" &&
+    typeof value.currentQuantity === "number" &&
+    Number.isFinite(value.currentQuantity) &&
+    typeof value.id === "string" &&
+    value.id.length > 0
   );
 }
 
 export function isValidStockMovementPayload(value: unknown): value is StockMovementView {
   if (!value || typeof value !== "object" || Array.isArray(value)) return false;
   const candidate = value as Record<string, unknown>;
+  if (
+    typeof candidate.id !== "string" ||
+    candidate.id.length === 0 ||
+    typeof candidate.itemId !== "string" ||
+    candidate.itemId.length === 0 ||
+    (candidate.movementType !== "STOCK_RECEIVED" && candidate.movementType !== "STOCK_USED") ||
+    typeof candidate.quantity !== "number" ||
+    !Number.isFinite(candidate.quantity) ||
+    candidate.quantity <= 0 ||
+    typeof candidate.quantityDelta !== "number" ||
+    !Number.isFinite(candidate.quantityDelta) ||
+    candidate.quantityDelta === 0 ||
+    typeof candidate.balanceBefore !== "number" ||
+    !Number.isFinite(candidate.balanceBefore) ||
+    typeof candidate.balanceAfter !== "number" ||
+    !Number.isFinite(candidate.balanceAfter) ||
+    typeof candidate.unit !== "string" ||
+    candidate.unit.length === 0 ||
+    typeof candidate.effectiveDate !== "string" ||
+    !/^\d{4}-\d{2}-\d{2}$/.test(candidate.effectiveDate) ||
+    (candidate.note !== null && typeof candidate.note !== "string") ||
+    typeof candidate.recordedBy !== "string" ||
+    candidate.recordedBy.length === 0 ||
+    typeof candidate.recordedAt !== "string" ||
+    candidate.recordedAt.length === 0
+  ) {
+    return false;
+  }
+  const signMatches =
+    candidate.movementType === "STOCK_RECEIVED"
+      ? candidate.quantityDelta > 0
+      : candidate.quantityDelta < 0;
   return (
-    typeof candidate.id === "string" &&
-    candidate.id.length > 0 &&
-    (candidate.movementType === "STOCK_RECEIVED" || candidate.movementType === "STOCK_USED") &&
-    typeof candidate.quantity === "number" &&
-    Number.isFinite(candidate.quantity) &&
-    typeof candidate.unit === "string" &&
-    candidate.unit.length > 0
+    signMatches &&
+    Math.round(Math.abs(candidate.quantityDelta) * QUANTITY_SCALE) ===
+      Math.round(candidate.quantity * QUANTITY_SCALE)
   );
+}
+
+export function matchesPendingMovementAttempt(
+  attempt: PendingStockMovementAttempt,
+  item: InventoryItemView,
+  movement: StockMovementView,
+): boolean {
+  if (typeof item.id !== "string" || item.id !== movement.itemId) {
+    return false;
+  }
+  if (getInventoryItemKey(item) !== attempt.itemKey) {
+    return false;
+  }
+  if (movement.movementType !== attempt.movementType) {
+    return false;
+  }
+  if (item.unit !== attempt.unit || movement.unit !== attempt.unit) {
+    return false;
+  }
+  if (movement.effectiveDate !== attempt.effectiveDate) {
+    return false;
+  }
+  const parsedQty = parseMovementQuantityInput(attempt.quantityInput, attempt.unit, true);
+  if (!parsedQty.ok) {
+    return false;
+  }
+  if (
+    Math.round(movement.quantity * QUANTITY_SCALE) !==
+    Math.round(parsedQty.quantity * QUANTITY_SCALE)
+  ) {
+    return false;
+  }
+  const expectedNote = attempt.noteOrPurposeInput.trim().replace(/\s+/g, " ") || null;
+  return (movement.note ?? null) === expectedNote;
 }
 
 export type PendingMovementStatusResult =
@@ -801,15 +910,19 @@ export type PendingMovementCancelResult =
   | { kind: "CANCELLED" }
   | { kind: "UNEXPECTED" };
 
-export function parsePendingMovementStatusResponse(payload: unknown): PendingMovementStatusResult {
+export function parsePendingMovementStatusResponse(
+  payload: unknown,
+  attempt: PendingStockMovementAttempt,
+): PendingMovementStatusResult {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     return { kind: "UNEXPECTED" };
   }
   const candidate = payload as Record<string, unknown>;
   if (candidate.status === "SAVED") {
     if (
-      isValidInventoryItemPayload(candidate.item) &&
-      isValidStockMovementPayload(candidate.movement)
+      isValidSavedMovementItemPayload(candidate.item) &&
+      isValidStockMovementPayload(candidate.movement) &&
+      matchesPendingMovementAttempt(attempt, candidate.item, candidate.movement)
     ) {
       return {
         kind: "SAVED",
@@ -828,15 +941,19 @@ export function parsePendingMovementStatusResponse(payload: unknown): PendingMov
   return { kind: "UNEXPECTED" };
 }
 
-export function parsePendingMovementCancelResponse(payload: unknown): PendingMovementCancelResult {
+export function parsePendingMovementCancelResponse(
+  payload: unknown,
+  attempt: PendingStockMovementAttempt,
+): PendingMovementCancelResult {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
     return { kind: "UNEXPECTED" };
   }
   const candidate = payload as Record<string, unknown>;
   if (candidate.status === "SAVED") {
     if (
-      isValidInventoryItemPayload(candidate.item) &&
-      isValidStockMovementPayload(candidate.movement)
+      isValidSavedMovementItemPayload(candidate.item) &&
+      isValidStockMovementPayload(candidate.movement) &&
+      matchesPendingMovementAttempt(attempt, candidate.item, candidate.movement)
     ) {
       return {
         kind: "SAVED",
@@ -853,26 +970,29 @@ export function parsePendingMovementCancelResponse(payload: unknown): PendingMov
 }
 
 export async function requestPendingMovementStatus(
-  requestKey: string,
+  attempt: PendingStockMovementAttempt,
   fetcher: typeof api = api,
 ): Promise<PendingMovementStatusResult> {
   const payload = await fetcher<unknown>(
-    `/api/inventory/movements/by-request-key/${encodeURIComponent(requestKey)}`,
+    `/api/inventory/movements/by-request-key/${encodeURIComponent(attempt.requestKey)}`,
   );
-  return parsePendingMovementStatusResponse(payload);
+  return parsePendingMovementStatusResponse(payload, attempt);
 }
 
 export async function requestPendingMovementCancel(
-  requestKey: string,
-  body: { itemKey: string; movementType: "STOCK_RECEIVED" | "STOCK_USED" },
+  attempt: PendingStockMovementAttempt,
+  endpointItemKey: string,
   fetcher: typeof api = api,
 ): Promise<PendingMovementCancelResult> {
   const payload = await fetcher<unknown>(
-    `/api/inventory/movements/by-request-key/${encodeURIComponent(requestKey)}/cancel`,
+    `/api/inventory/movements/by-request-key/${encodeURIComponent(attempt.requestKey)}/cancel`,
     {
       method: "POST",
-      body,
+      body: {
+        itemKey: endpointItemKey,
+        movementType: attempt.movementType,
+      },
     },
   );
-  return parsePendingMovementCancelResponse(payload);
+  return parsePendingMovementCancelResponse(payload, attempt);
 }
