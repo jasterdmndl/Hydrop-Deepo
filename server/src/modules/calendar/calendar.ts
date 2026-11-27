@@ -14,8 +14,60 @@ export function calendarPermissions(role: Role): CalendarPermissions {
   return { canView: true, canManage: role === "OWNER" };
 }
 
-export type ActivityStatus = "SCHEDULED" | "OVERDUE" | "COMPLETED";
+export type ActivityStatus = "SCHEDULED" | "OVERDUE" | "COMPLETED" | "CANCELLED";
 export type ReminderStatus = "UPCOMING" | "OVERDUE";
+export type RecurrenceRule = "ONE_TIME" | "DAILY" | "WEEKLY" | "MONTHLY";
+export type ActivityEditScope = "THIS_OCCURRENCE" | "THIS_AND_FUTURE";
+
+export interface ActivitySeriesSummary {
+  reference: string;
+  recurrence: Exclude<RecurrenceRule, "ONE_TIME">;
+  startDate: string;
+  endDate: string;
+  scheduledTime: string;
+  occurrenceCount: number;
+  occurrenceReferences: string[];
+}
+
+export interface ActivityCancellationView {
+  reason: string;
+  cancelledBy: string;
+  cancelledAt: string;
+}
+
+export interface ActivityChangeView {
+  id: string;
+  changeType: "EDIT" | "CANCEL";
+  scope: ActivityEditScope;
+  previousName: string;
+  newName: string;
+  previousScheduledAt: string;
+  previousScheduledDate: string;
+  previousScheduledTime: string;
+  newScheduledAt: string;
+  newScheduledDate: string;
+  newScheduledTime: string;
+  previousScheduleNotes: string | null;
+  newScheduleNotes: string | null;
+  reason: string | null;
+  changedBy: string;
+  changedAt: string;
+}
+
+export interface ActivityCompletionCorrectionView {
+  id: string;
+  previousActualCompletedAt: string;
+  previousCompletedDate: string;
+  previousCompletedTime: string;
+  previousCompletionNotes: string;
+  newActualCompletedAt: string;
+  newCompletedDate: string;
+  newCompletedTime: string;
+  newCompletionNotes: string;
+  reason: string;
+  correctedBy: string;
+  correctedAt: string;
+}
 
 export interface ActivityCompletionView {
   actualCompletedAt: string;
@@ -25,16 +77,33 @@ export interface ActivityCompletionView {
   completionNotes: string;
   recordedBy: string;
   recordedAt: string;
+  originalActualCompletedAt: string;
+  originalCompletedDate: string;
+  originalCompletedTime: string;
+  originalCompletionNotes: string;
+  corrections: ActivityCompletionCorrectionView[];
 }
 
 export interface ActivityView {
   reference: string;
+  version: number;
   name: string;
   scheduledAt: string;
   scheduledDate: string;
   scheduledTime: string;
   scheduleNotes: string | null;
+  originalName: string;
+  originalScheduledAt: string;
+  originalScheduledDate: string;
+  originalScheduledTime: string;
+  originalScheduleNotes: string | null;
   status: ActivityStatus;
+  recurrence: RecurrenceRule;
+  seriesReference: string | null;
+  seriesIndex: number | null;
+  seriesEndDate: string | null;
+  cancellation: ActivityCancellationView | null;
+  scheduleHistory: ActivityChangeView[];
   createdBy: string;
   createdAt: string;
   actualCompletedAt: string | null;
@@ -63,7 +132,7 @@ function pad2(n: number): string {
   return String(n).padStart(2, "0");
 }
 
-function manilaParts(date: Date): {
+export function manilaParts(date: Date): {
   year: number;
   month: number;
   day: number;
@@ -82,7 +151,7 @@ function manilaParts(date: Date): {
   };
 }
 
-function fromManilaWallClock(
+export function fromManilaWallClock(
   year: number,
   month: number,
   day: number,
@@ -293,9 +362,62 @@ export function manilaMonthDayCode(date: Date): string {
   return `${pad2(p.month)}${pad2(p.day)}`;
 }
 
-export function deriveActivityStatus(scheduledAt: Date, completed: boolean, now: Date): ActivityStatus {
+export function deriveActivityStatus(
+  scheduledAt: Date,
+  completed: boolean,
+  now: Date,
+  cancelled = false,
+): ActivityStatus {
+  if (cancelled) return "CANCELLED";
   if (completed) return "COMPLETED";
   return scheduledAt.getTime() < now.getTime() ? "OVERDUE" : "SCHEDULED";
+}
+
+export function manilaDayDelta(from: Date, to: Date): number {
+  const f = manilaParts(from);
+  const t = manilaParts(to);
+  const fromUtcDay = Date.UTC(f.year, f.month - 1, f.day);
+  const toUtcDay = Date.UTC(t.year, t.month - 1, t.day);
+  return Math.round((toUtcDay - fromUtcDay) / 86_400_000);
+}
+
+export function shiftManilaDateKeepingTime(
+  baseDate: Date,
+  dayDelta: number,
+  hour: number,
+  minute: number,
+): Date | null {
+  const p = manilaParts(baseDate);
+  const shifted = new Date(Date.UTC(p.year, p.month - 1, p.day + dayDelta));
+  return fromManilaWallClock(
+    shifted.getUTCFullYear(),
+    shifted.getUTCMonth() + 1,
+    shifted.getUTCDate(),
+    hour,
+    minute,
+  );
+}
+
+export function manilaMonthDelta(from: Date, to: Date): number {
+  const f = manilaParts(from);
+  const t = manilaParts(to);
+  return t.year * 12 + (t.month - 1) - (f.year * 12 + (f.month - 1));
+}
+
+export function shiftManilaMonthlyKeepingPreferredDay(
+  baseDate: Date,
+  monthDelta: number,
+  preferredDay: number,
+  hour: number,
+  minute: number,
+): Date | null {
+  const p = manilaParts(baseDate);
+  const targetZeroBasedMonth = p.year * 12 + (p.month - 1) + monthDelta;
+  const targetYear = Math.floor(targetZeroBasedMonth / 12);
+  const targetMonth = (targetZeroBasedMonth % 12) + 1;
+  const daysInTargetMonth = new Date(Date.UTC(targetYear, targetMonth, 0)).getUTCDate();
+  const clampedDay = Math.min(preferredDay, daysInTargetMonth);
+  return fromManilaWallClock(targetYear, targetMonth, clampedDay, hour, minute);
 }
 
 export function conflictSetsEqual(acknowledged: string[], actual: string[]): boolean {

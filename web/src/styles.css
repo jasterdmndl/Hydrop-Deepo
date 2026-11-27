@@ -5745,3 +5745,125 @@ textarea:focus-visible {
     font-size: 0.78rem;
   }
 }
+
+/* Final Activity Calendar additions */
+.pill--cancelled {
+  background: #f1f5f9;
+  color: #475569;
+  border: 1px solid #cbd5e1;
+}
+
+.button--danger {
+  background: #b91c1c;
+  color: #ffffff;
+  border: 1px solid #991b1b;
+}
+
+.button--danger:hover:not(:disabled) {
+  background: #991b1b;
+}
+
+.detail-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.detail-actions__row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.detail-actions__row .button {
+  flex: 1 1 130px;
+}
+
+.scope-fieldset {
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 12px;
+  margin: 0;
+}
+
+.scope-fieldset legend {
+  font-size: 0.85rem;
+  font-weight: 600;
+  padding: 0 6px;
+}
+
+.scope-options {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.scope-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  cursor: pointer;
+}
+
+.scope-option > span {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.preview-dates {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.preview-dates li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  border-radius: 8px;
+  background: #f8fafc;
+  font-size: 0.85rem;
+}
+
+.preview-protected {
+  margin-top: 12px;
+}
+
+.preview-protected h3 {
+  font-size: 0.85rem;
+  margin: 0 0 6px;
+  color: var(--muted);
+}
+
+.history-timeline {
+  list-style: none;
+  margin: 6px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.history-timeline__item {
+  border-left: 2px solid #cbd5e1;
+  padding-left: 10px;
+}
+
+.history-timeline__item p {
+  margin: 2px 0 0;
+}
+
+.history-timeline__head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  gap: 8px;
+  font-size: 0.85rem;
+}

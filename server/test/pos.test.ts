@@ -3428,6 +3428,9 @@ describe("POS station day and refill sales", () => {
           "0015_pos_sale_actions.sql",
           "0016_pos_sale_action_stock_effects.sql",
           "0017_employee_role_rename.sql",
+          "0018_calendar_recurrence.sql",
+          "0019_calendar_history_and_cancellation.sql",
+          "0020_calendar_completion_corrections.sql",
         ]);
 
         const cashierAfter = await signIn(upgradeApp, "upcashier", upCashier.password);
@@ -3538,6 +3541,9 @@ describe("POS station day and refill sales", () => {
           "0015_pos_sale_actions.sql",
           "0016_pos_sale_action_stock_effects.sql",
           "0017_employee_role_rename.sql",
+          "0018_calendar_recurrence.sql",
+          "0019_calendar_history_and_cancellation.sql",
+          "0020_calendar_completion_corrections.sql",
         ]);
       } finally {
         await revisedDb.close();
@@ -3668,6 +3674,9 @@ describe("POS station day and refill sales", () => {
           "0015_pos_sale_actions.sql",
           "0016_pos_sale_action_stock_effects.sql",
           "0017_employee_role_rename.sql",
+          "0018_calendar_recurrence.sql",
+          "0019_calendar_history_and_cancellation.sql",
+          "0020_calendar_completion_corrections.sql",
         ]);
 
         const cashier = await signIn(upgradeApp, "f6cashier", upCashier.password);
@@ -3913,6 +3922,9 @@ describe("POS station day and refill sales", () => {
           "0015_pos_sale_actions.sql",
           "0016_pos_sale_action_stock_effects.sql",
           "0017_employee_role_rename.sql",
+          "0018_calendar_recurrence.sql",
+          "0019_calendar_history_and_cancellation.sql",
+          "0020_calendar_completion_corrections.sql",
         ]);
 
         const cashier = await signIn(upgradeApp, "f7cashier", upCashier.password);
@@ -4152,6 +4164,9 @@ describe("POS station day and refill sales", () => {
           "0015_pos_sale_actions.sql",
           "0016_pos_sale_action_stock_effects.sql",
           "0017_employee_role_rename.sql",
+          "0018_calendar_recurrence.sql",
+          "0019_calendar_history_and_cancellation.sql",
+          "0020_calendar_completion_corrections.sql",
         ]);
 
         // Cross Asia/Manila midnight with cash collection never started on draftRef
