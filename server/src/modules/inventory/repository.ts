@@ -1694,6 +1694,38 @@ export const inventoryRepository = {
     });
   },
 
+  async findStockMovementByRequestKey(
+    db: Queryable,
+    input: {
+      requestKey: string;
+      actorUserId: string;
+    },
+  ): Promise<
+    | { found: false }
+    | { found: true; item: InventoryItemView; movement: StockMovementView }
+  > {
+    const { rows } = await db.query<StockMovementDbRow>(
+      `${STOCK_MOVEMENT_SELECT}
+        WHERE m.request_key = $1
+          AND m.actor_user_id = $2
+          AND m.movement_type IN ('STOCK_RECEIVED', 'STOCK_USED')`,
+      [input.requestKey, input.actorUserId],
+    );
+    const row = rows[0];
+    if (!row) {
+      return { found: false };
+    }
+    const item = await findItemById(db, row.itemId);
+    if (!item) {
+      return { found: false };
+    }
+    return {
+      found: true,
+      item,
+      movement: toStockMovementView(row),
+    };
+  },
+
   async listReconciliations(
     db: Queryable,
     target: OpeningStockTarget,

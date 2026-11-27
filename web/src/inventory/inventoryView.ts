@@ -368,6 +368,117 @@ export function isUncertainSubmissionError(error: unknown): boolean {
   return true;
 }
 
+export interface PendingStockMovementAttempt {
+  movementType: "STOCK_RECEIVED" | "STOCK_USED";
+  itemKey: string;
+  itemName: string;
+  unit: string;
+  quantityInput: string;
+  noteOrPurposeInput: string;
+  effectiveDate: string;
+  requestKey: string;
+  expectedRevision: number;
+  expectedCurrentQuantity: number;
+}
+
+export interface StorageLike {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+  removeItem(key: string): void;
+}
+
+const PENDING_MOVEMENT_STORAGE_PREFIX = "hydrop_inventory_pending_movements_v1:";
+
+export function pendingMovementStorageKey(username: string): string {
+  return `${PENDING_MOVEMENT_STORAGE_PREFIX}${username.trim().toLowerCase()}`;
+}
+
+function browserLocalStorage(): StorageLike | null {
+  try {
+    if (typeof window === "undefined") return null;
+    return window.localStorage;
+  } catch {
+    return null;
+  }
+}
+
+function isValidPendingMovementAttempt(value: unknown): value is PendingStockMovementAttempt {
+  if (!value || typeof value !== "object") return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    (candidate.movementType === "STOCK_RECEIVED" || candidate.movementType === "STOCK_USED") &&
+    typeof candidate.itemKey === "string" &&
+    candidate.itemKey.length > 0 &&
+    typeof candidate.itemName === "string" &&
+    typeof candidate.unit === "string" &&
+    typeof candidate.quantityInput === "string" &&
+    typeof candidate.noteOrPurposeInput === "string" &&
+    typeof candidate.effectiveDate === "string" &&
+    typeof candidate.requestKey === "string" &&
+    candidate.requestKey.length > 0 &&
+    typeof candidate.expectedRevision === "number" &&
+    Number.isInteger(candidate.expectedRevision) &&
+    typeof candidate.expectedCurrentQuantity === "number" &&
+    Number.isFinite(candidate.expectedCurrentQuantity)
+  );
+}
+
+export function loadPendingMovementAttempts(
+  username: string,
+  storage: StorageLike | null = browserLocalStorage(),
+): PendingStockMovementAttempt[] {
+  const normalizedUser = username.trim().toLowerCase();
+  if (!normalizedUser || !storage) return [];
+  try {
+    const raw = storage.getItem(pendingMovementStorageKey(normalizedUser));
+    if (!raw) return [];
+    const parsed = JSON.parse(raw) as unknown;
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(isValidPendingMovementAttempt);
+  } catch {
+    return [];
+  }
+}
+
+export function savePendingMovementAttempts(
+  username: string,
+  attempts: PendingStockMovementAttempt[],
+  storage: StorageLike | null = browserLocalStorage(),
+): void {
+  const normalizedUser = username.trim().toLowerCase();
+  if (!normalizedUser || !storage) return;
+  try {
+    const key = pendingMovementStorageKey(normalizedUser);
+    if (attempts.length === 0) {
+      storage.removeItem(key);
+    } else {
+      storage.setItem(key, JSON.stringify(attempts));
+    }
+  } catch {
+    // Ignore quota/storage availability errors; in-memory state remains active.
+  }
+}
+
+export function upsertPendingMovementAttempt(
+  attempts: PendingStockMovementAttempt[],
+  next: PendingStockMovementAttempt,
+): PendingStockMovementAttempt[] {
+  const filtered = attempts.filter(
+    (entry) => !(entry.movementType === next.movementType && entry.itemKey === next.itemKey),
+  );
+  return [...filtered, next];
+}
+
+export function removePendingMovementAttempt(
+  attempts: PendingStockMovementAttempt[],
+  movementType: "STOCK_RECEIVED" | "STOCK_USED",
+  itemKey: string,
+): PendingStockMovementAttempt[] {
+  return attempts.filter(
+    (entry) => !(entry.movementType === movementType && entry.itemKey === itemKey),
+  );
+}
+
 export function formatRecordedAtManila(iso: string): string {
   const ms = Date.parse(iso);
   if (Number.isNaN(ms)) {

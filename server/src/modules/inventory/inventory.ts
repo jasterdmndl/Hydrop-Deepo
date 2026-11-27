@@ -161,8 +161,26 @@ export interface StockMovementView {
   recordedAt: string;
 }
 
+const CANONICAL_DECIMAL_REGEX = /^(-?)(\d+)(?:\.(\d{1,4}))?$/;
+
+function parseScaledDecimalNumber(value: number): number | null {
+  if (typeof value !== "number" || !Number.isFinite(value)) return null;
+  const match = CANONICAL_DECIMAL_REGEX.exec(String(value));
+  if (!match) return null;
+  const sign = match[1] === "-" ? -1 : 1;
+  const whole = Number(match[2]);
+  const frac = Number((match[3] ?? "").padEnd(4, "0"));
+  if (!Number.isSafeInteger(whole)) return null;
+  const scaled = sign * (whole * QUANTITY_SCALE + frac);
+  if (!Number.isSafeInteger(scaled)) return null;
+  return scaled === 0 ? 0 : scaled;
+}
+
 export function toScaledQuantity(value: number): number {
-  return Math.round(value * QUANTITY_SCALE);
+  const exact = parseScaledDecimalNumber(value);
+  if (exact !== null) return exact;
+  const rounded = Math.round(value * QUANTITY_SCALE);
+  return rounded === 0 ? 0 : rounded;
 }
 
 export function fromScaledQuantity(scaled: number): number {
@@ -199,36 +217,33 @@ export function parseQuantity(
   raw: unknown,
   options: { allowDecimal: boolean; allowZero: boolean; allowNegative?: boolean; max?: number },
 ): number | null {
-  if (typeof raw !== "number" || !Number.isFinite(raw)) return null;
-  const max = options.max ?? MAX_OPENING_QUANTITY;
-  const scaled = raw * QUANTITY_SCALE;
-  if (Math.abs(scaled - Math.round(scaled)) > 1e-6) {
-    return null;
-  }
-  const roundedScaled = Math.round(scaled);
-  const normalized = fromScaledQuantity(roundedScaled);
+  const scaled = typeof raw === "number" ? parseScaledDecimalNumber(raw) : null;
+  if (scaled === null) return null;
 
-  if (!options.allowDecimal && !Number.isInteger(normalized)) {
+  const maxScaled = parseScaledDecimalNumber(options.max ?? MAX_OPENING_QUANTITY);
+  if (maxScaled === null) return null;
+
+  if (!options.allowDecimal && scaled % QUANTITY_SCALE !== 0) {
     return null;
   }
 
   if (options.allowNegative) {
-    if (normalized < -max || normalized > max) {
+    if (scaled < -maxScaled || scaled > maxScaled) {
       return null;
     }
-    if (!options.allowZero && roundedScaled === 0) {
+    if (!options.allowZero && scaled === 0) {
       return null;
     }
-    return normalized;
+    return fromScaledQuantity(scaled);
   }
 
   if (options.allowZero) {
-    if (roundedScaled < 0 || normalized > max) return null;
+    if (scaled < 0 || scaled > maxScaled) return null;
   } else {
-    if (roundedScaled <= 0 || normalized > max) return null;
+    if (scaled <= 0 || scaled > maxScaled) return null;
   }
 
-  return normalized;
+  return fromScaledQuantity(scaled);
 }
 
 export function parseStoredBalanceBaseline(

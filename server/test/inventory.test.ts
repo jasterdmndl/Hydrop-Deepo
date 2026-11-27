@@ -1910,6 +1910,48 @@ describe("Final Inventory Task 1 — operating supplies, receiving, usage, and D
     expect(crossActorReplay.status).toBe(409);
     expect(crossActorReplay.body.error.code).toBe("REQUEST_KEY_CONFLICT");
 
+    // Status lookup endpoint lets the original actor recover a saved movement (e.g. after lost response or reload) without cross-actor leakage.
+    const empStatusCheck = await request(ctx.app)
+      .get(`/api/inventory/movements/by-request-key/${encodeURIComponent("midnight-use-1")}`)
+      .set("Cookie", lateEmployee.cookie);
+    expect(empStatusCheck.status).toBe(200);
+    expect(empStatusCheck.body).toMatchObject({
+      status: "SAVED",
+      item: { id: supplyId, currentQuantity: 11 },
+      movement: {
+        movementType: "STOCK_USED",
+        quantity: 1,
+        effectiveDate: "2026-11-27",
+      },
+    });
+
+    const ownerStatusCheck = await request(ctx.app)
+      .get(`/api/inventory/movements/by-request-key/${encodeURIComponent("midnight-recv-1")}`)
+      .set("Cookie", lateOwner.cookie);
+    expect(ownerStatusCheck.status).toBe(200);
+    expect(ownerStatusCheck.body).toMatchObject({
+      status: "SAVED",
+      item: { id: supplyId, currentQuantity: 11 },
+      movement: {
+        movementType: "STOCK_RECEIVED",
+        quantity: 2,
+        effectiveDate: "2026-11-27",
+      },
+    });
+
+    // Different actor checking another actor's requestKey receives NOT_FOUND; unsaved key also returns NOT_FOUND.
+    const crossActorStatus = await request(ctx.app)
+      .get(`/api/inventory/movements/by-request-key/${encodeURIComponent("midnight-use-1")}`)
+      .set("Cookie", lateOwner.cookie);
+    expect(crossActorStatus.status).toBe(200);
+    expect(crossActorStatus.body).toEqual({ status: "NOT_FOUND" });
+
+    const unsavedStatus = await request(ctx.app)
+      .get(`/api/inventory/movements/by-request-key/${encodeURIComponent("never-saved-key")}`)
+      .set("Cookie", lateEmployee.cookie);
+    expect(unsavedStatus.status).toBe(200);
+    expect(unsavedStatus.body).toEqual({ status: "NOT_FOUND" });
+
     // New backdated entries on 2026-11-28 with effectiveDate 2026-11-27 are still rejected (400).
     const newBackdatedUse = await postUsage(ctx, lateEmployee, supplyId, {
       quantity: 1,
@@ -2115,6 +2157,97 @@ describe("Final Inventory Task 1 — operating supplies, receiving, usage, and D
           expectedRevision: recNegative.body.item.stockRevision,
           expectedCurrentQuantity: 2,
           requestKey: "f3-over-cap-rec",
+        })
+      ).status,
+    ).toBe(400);
+
+    // Exact 4-decimal accumulated positive and negative balances (1,500,000.0002 and -1,500,000.0002) reconcile cleanly without float-scaling drift.
+    const exactSupplyRes = await postProduct(ctx, owner, {
+      category: "OPERATING_SUPPLY",
+      name: "Precision Liquid",
+      unit: "L",
+      allowDecimalQuantity: true,
+      unitConfirmed: true,
+    });
+    expect(exactSupplyRes.status).toBe(201);
+    const exactId = exactSupplyRes.body.item.id as string;
+
+    const exactOpen = await postOpeningStock(ctx, owner, exactId, { quantity: 1_000_000 });
+    expect(exactOpen.status).toBe(201);
+
+    const exactRecv = await postReceiving(ctx, owner, exactId, {
+      quantity: 500_000.0002,
+      expectedRevision: exactOpen.body.item.stockRevision,
+      expectedCurrentQuantity: 1_000_000,
+      requestKey: "f3-exact-pos-recv",
+    });
+    expect(exactRecv.status).toBe(201);
+    expect(exactRecv.body.item.currentQuantity).toBe(1_500_000.0002);
+
+    const exactRecPos = await postReconciliation(ctx, owner, exactId, {
+      physicalCount: 0,
+      reason: "Reconcile exact 4-decimal positive balance",
+      expectedRevision: exactRecv.body.item.stockRevision,
+      expectedCurrentQuantity: 1_500_000.0002,
+      requestKey: "f3-exact-pos-rec",
+    });
+    expect(exactRecPos.status).toBe(201);
+    expect(exactRecPos.body.reconciliation).toMatchObject({
+      balanceBefore: 1_500_000.0002,
+      physicalCount: 0,
+      quantityDelta: -1_500_000.0002,
+      balanceAfter: 0,
+    });
+
+    // Negative exact 4-decimal counterpart: 0 - 1,000,000 - 500,000.0002 = -1,500,000.0002.
+    const exactUse1 = await postUsage(ctx, employee, exactId, {
+      quantity: 1_000_000,
+      purpose: "Exact drain 1",
+      expectedRevision: exactRecPos.body.item.stockRevision,
+      expectedCurrentQuantity: 0,
+      requestKey: "f3-exact-neg-use-1",
+    });
+    expect(exactUse1.status).toBe(201);
+    const exactUse2 = await postUsage(ctx, employee, exactId, {
+      quantity: 500_000.0002,
+      purpose: "Exact drain 2",
+      expectedRevision: exactUse1.body.item.stockRevision,
+      expectedCurrentQuantity: -1_000_000,
+      requestKey: "f3-exact-neg-use-2",
+    });
+    expect(exactUse2.status).toBe(201);
+    expect(exactUse2.body.item).toMatchObject({
+      currentQuantity: -1_500_000.0002,
+      needsReconciliation: true,
+    });
+
+    const exactRecNeg = await postReconciliation(ctx, owner, exactId, {
+      physicalCount: 10,
+      reason: "Reconcile exact 4-decimal negative balance",
+      expectedRevision: exactUse2.body.item.stockRevision,
+      expectedCurrentQuantity: -1_500_000.0002,
+      requestKey: "f3-exact-neg-rec",
+    });
+    expect(exactRecNeg.status).toBe(201);
+    expect(exactRecNeg.body.item).toMatchObject({
+      currentQuantity: 10,
+      needsReconciliation: false,
+    });
+    expect(exactRecNeg.body.reconciliation).toMatchObject({
+      balanceBefore: -1_500_000.0002,
+      physicalCount: 10,
+      quantityDelta: 1_500_010.0002,
+      balanceAfter: 10,
+    });
+
+    // 5-decimal precision remains rejected (400).
+    expect(
+      (
+        await postReceiving(ctx, owner, exactId, {
+          quantity: 0.00001,
+          expectedRevision: exactRecNeg.body.item.stockRevision,
+          expectedCurrentQuantity: 10,
+          requestKey: "f3-5dec-reject",
         })
       ).status,
     ).toBe(400);

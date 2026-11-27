@@ -119,6 +119,30 @@ export function inventoryRoutes(db: Database): Router {
     });
   });
 
+  router.get("/movements/by-request-key/:requestKey", async (req, res) => {
+    const rawKey = typeof req.params.requestKey === "string" ? req.params.requestKey : "";
+    const parsedKey = parseRequestKey(rawKey);
+    if (!parsedKey.ok || !parsedKey.value) {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid movement request key.");
+      return;
+    }
+
+    const found = await repo.findStockMovementByRequestKey(db, {
+      requestKey: parsedKey.value,
+      actorUserId: req.auth!.user.id,
+    });
+    if (!found.found) {
+      res.json({ status: "NOT_FOUND" });
+      return;
+    }
+
+    res.json({
+      status: "SAVED",
+      item: found.item,
+      movement: found.movement,
+    });
+  });
+
   router.post("/pos-sections", requireRole("OWNER"), async (req, res) => {
     const body = req.body as Record<string, unknown> | null | undefined;
     if (!body || typeof body !== "object" || Array.isArray(body)) {

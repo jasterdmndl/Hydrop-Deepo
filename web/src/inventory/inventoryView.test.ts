@@ -19,6 +19,7 @@ import {
   groupInventoryItems,
   type InventoryItemView,
   isUncertainSubmissionError,
+  loadPendingMovementAttempts,
   MAX_OPENING_QUANTITY,
   mergeRefreshedInventoryItems,
   parseLowStockLevelInput,
@@ -26,7 +27,12 @@ import {
   parseOpeningQuantityInput,
   parsePesoPriceToCentavos,
   parsePhysicalCountInput,
+  type PendingStockMovementAttempt,
   type PosSectionView,
+  removePendingMovementAttempt,
+  savePendingMovementAttempts,
+  type StorageLike,
+  upsertPendingMovementAttempt,
 } from "./inventoryView";
 
 describe("inventoryView helpers", () => {
@@ -514,5 +520,57 @@ describe("inventoryView helpers", () => {
     expect(isUncertainSubmissionError(new Error("timeout"))).toBe(true);
     expect(isUncertainSubmissionError({ status: 400, code: "VALIDATION_FAILED" })).toBe(false);
     expect(isUncertainSubmissionError({ status: 409, code: "STALE_STOCK_BALANCE" })).toBe(false);
+  });
+
+  it("persists unresolved movement attempts per account across reloads and isolates accounts", () => {
+    const store = new Map<string, string>();
+    const memoryStorage: StorageLike = {
+      getItem: (key) => store.get(key) ?? null,
+      setItem: (key, value) => {
+        store.set(key, value);
+      },
+      removeItem: (key) => {
+        store.delete(key);
+      },
+    };
+
+    const empAttempt: PendingStockMovementAttempt = {
+      movementType: "STOCK_USED",
+      itemKey: "supply-1",
+      itemName: "Dishwashing Liquid",
+      unit: "L",
+      quantityInput: "1.5",
+      noteOrPurposeInput: "Evening wash",
+      effectiveDate: "2026-11-27",
+      requestKey: "req-emp-1",
+      expectedRevision: 3,
+      expectedCurrentQuantity: 10,
+    };
+    const ownerAttempt: PendingStockMovementAttempt = {
+      movementType: "STOCK_RECEIVED",
+      itemKey: "supply-1",
+      itemName: "Dishwashing Liquid",
+      unit: "L",
+      quantityInput: "5",
+      noteOrPurposeInput: "Delivery",
+      effectiveDate: "2026-11-27",
+      requestKey: "req-owner-1",
+      expectedRevision: 3,
+      expectedCurrentQuantity: 10,
+    };
+
+    const empList = upsertPendingMovementAttempt([], empAttempt);
+    savePendingMovementAttempts("emp1", empList, memoryStorage);
+    savePendingMovementAttempts("owner1", [ownerAttempt], memoryStorage);
+
+    // Reloading reads back the exact persisted attempt and requestKey for that account only.
+    expect(loadPendingMovementAttempts("emp1", memoryStorage)).toEqual([empAttempt]);
+    expect(loadPendingMovementAttempts("owner1", memoryStorage)).toEqual([ownerAttempt]);
+
+    // Clearing emp1's resolved attempt leaves owner1's attempt untouched.
+    const clearedEmp = removePendingMovementAttempt(empList, "STOCK_USED", "supply-1");
+    savePendingMovementAttempts("emp1", clearedEmp, memoryStorage);
+    expect(loadPendingMovementAttempts("emp1", memoryStorage)).toEqual([]);
+    expect(loadPendingMovementAttempts("owner1", memoryStorage)).toEqual([ownerAttempt]);
   });
 });
