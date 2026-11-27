@@ -1133,6 +1133,46 @@ describe("inventoryView helpers", () => {
       requiresCountBeforeNegative: true,
     });
 
+    // Finding 2 regression: cancelling a partially covered 5 L usage (2 L covered -> 3 L deducted)
+    // restores only the outstanding 3 L debit (7 -> 10 L), not 5 L.
+    expect(
+      computeCancelMovementPreview({
+        movementType: "STOCK_USED",
+        entryStatus: "APPLIED",
+        latestQuantity: 5,
+        appliedNetDelta: -3,
+        currentBalance: 7,
+        category: "OPERATING_SUPPLY",
+        coverageMode: "NONE",
+      }),
+    ).toEqual({
+      rawDelta: 3,
+      coveredQuantity: 0,
+      appliedDelta: 3,
+      projectedBalance: 10,
+      pendingReview: false,
+      requiresCountBeforeNegative: false,
+    });
+
+    expect(
+      computeCancelMovementPreview({
+        movementType: "STOCK_USED",
+        entryStatus: "APPLIED",
+        latestQuantity: 5,
+        appliedNetDelta: 0,
+        currentBalance: 10,
+        category: "OPERATING_SUPPLY",
+        coverageMode: "NONE",
+      }),
+    ).toEqual({
+      rawDelta: 0,
+      coveredQuantity: 5,
+      appliedDelta: 0,
+      projectedBalance: 10,
+      pendingReview: false,
+      requiresCountBeforeNegative: false,
+    });
+
     const roundItem: InventoryItemView = {
       code: "ROUND",
       name: "Round Container",

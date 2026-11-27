@@ -4747,10 +4747,18 @@ export function InventoryPage() {
                           mov.movementType === "STOCK_RECEIVED" ||
                           mov.movementType === "STOCK_USED";
                         const latestQty =
-                          mov.currentQuantityValue ?? mov.enteredQuantity ?? mov.quantity;
+                          mov.currentQuantityValue === null
+                            ? null
+                            : (mov.currentQuantityValue ?? mov.enteredQuantity ?? mov.quantity);
+                        const hasUnrecordedTargetUnitQty =
+                          mov.currentQuantityValue === null &&
+                          isStockEntry &&
+                          !mov.isCancelled &&
+                          Boolean(mov.currentItemId && mov.currentItemId !== mov.itemId);
                         const effectiveDateDisplay =
                           mov.currentEffectiveDate ?? mov.effectiveDate;
-                        const noteDisplay = mov.currentNote ?? mov.note;
+                        const noteDisplay =
+                          mov.currentNote !== undefined ? mov.currentNote : mov.note;
                         const pendingCorrectionForMov = (mov.corrections ?? []).find(
                           (c) => c.status === "PENDING_REVIEW",
                         );
@@ -4777,11 +4785,14 @@ export function InventoryPage() {
                                     : mov.coverageMode === "PARTIAL"
                                       ? `Status: Partial count coverage (${formatQuantityLabel(mov.coveredQuantity ?? 0, mov.unit)} covered)`
                                       : "Status: Applied"}
-                              {!mov.isCancelled &&
-                              isStockEntry &&
-                              latestQty !== mov.quantity
-                                ? ` · Latest qty: ${formatQuantityLabel(latestQty, mov.unit)} (original: ${formatQuantityLabel(mov.quantity, mov.unit)})`
-                                : ""}
+                              {hasUnrecordedTargetUnitQty
+                                ? ` · Reconciled across units — no ${mov.currentItemUnit ?? "target-unit"} quantity recorded (original: ${formatQuantityLabel(mov.quantity, mov.unit)})`
+                                : !mov.isCancelled &&
+                                  isStockEntry &&
+                                  latestQty !== null &&
+                                  latestQty !== mov.quantity
+                                  ? ` · Latest qty: ${formatQuantityLabel(latestQty, mov.unit)} (original: ${formatQuantityLabel(mov.quantity, mov.unit)})`
+                                  : ""}
                               {mov.currentItemId && mov.currentItemId !== mov.itemId && mov.currentItemName
                                 ? ` · Current item: ${mov.currentItemName}`
                                 : ""}
@@ -4875,20 +4886,22 @@ export function InventoryPage() {
                                         <>
                                           {!isPending && (
                                             <>
-                                              <button
-                                                type="button"
-                                                className="button button--ghost button--sm"
-                                                onClick={() => {
-                                                  setHistoryItem(null);
-                                                  setCorrectionModal({
-                                                    kind: "QUANTITY",
-                                                    item: historyData.item,
-                                                    movement: mov,
-                                                  });
-                                                }}
-                                              >
-                                                Correct qty
-                                              </button>
+                                              {!hasUnrecordedTargetUnitQty && (
+                                                <button
+                                                  type="button"
+                                                  className="button button--ghost button--sm"
+                                                  onClick={() => {
+                                                    setHistoryItem(null);
+                                                    setCorrectionModal({
+                                                      kind: "QUANTITY",
+                                                      item: historyData.item,
+                                                      movement: mov,
+                                                    });
+                                                  }}
+                                                >
+                                                  Correct qty
+                                                </button>
+                                              )}
                                               <button
                                                 type="button"
                                                 className="button button--ghost button--sm"
@@ -4903,7 +4916,8 @@ export function InventoryPage() {
                                               >
                                                 Edit date / note
                                               </button>
-                                              {mov.movementType === "STOCK_RECEIVED" && (
+                                              {mov.movementType === "STOCK_RECEIVED" &&
+                                                !hasUnrecordedTargetUnitQty && (
                                                 <button
                                                   type="button"
                                                   className="button button--ghost button--sm"
@@ -4921,20 +4935,22 @@ export function InventoryPage() {
                                               )}
                                             </>
                                           )}
-                                          <button
-                                            type="button"
-                                            className="button button--ghost button--sm"
-                                            onClick={() => {
-                                              setHistoryItem(null);
-                                              setCorrectionModal({
-                                                kind: "CANCEL",
-                                                item: historyData.item,
-                                                movement: mov,
-                                              });
-                                            }}
-                                          >
-                                            Cancel entry
-                                          </button>
+                                          {!hasUnrecordedTargetUnitQty && (
+                                            <button
+                                              type="button"
+                                              className="button button--ghost button--sm"
+                                              onClick={() => {
+                                                setHistoryItem(null);
+                                                setCorrectionModal({
+                                                  kind: "CANCEL",
+                                                  item: historyData.item,
+                                                  movement: mov,
+                                                });
+                                              }}
+                                            >
+                                              Cancel entry
+                                            </button>
+                                          )}
                                         </>
                                       )}
                                     </>

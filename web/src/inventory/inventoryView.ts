@@ -204,6 +204,7 @@ export interface StockMovementView {
   currentItemUnit?: string | null;
   currentEffectiveDate?: string | null;
   currentNote?: string | null;
+  appliedNetDelta?: number;
   correctionVersion?: number;
   sourceCorrectionId?: string | null;
   corrections?: MovementCorrectionView[];
@@ -1285,6 +1286,7 @@ export function computeCancelMovementPreview(params: {
   movementType: "STOCK_RECEIVED" | "STOCK_USED";
   entryStatus: MovementEntryStatus;
   latestQuantity: number;
+  appliedNetDelta?: number;
   currentBalance: number | null;
   category: InventoryCategory;
   coverageMode: MovementCoverageMode;
@@ -1302,8 +1304,31 @@ export function computeCancelMovementPreview(params: {
   }
   const latestScaled = parseExactFourDecimalScaled(params.latestQuantity);
   if (latestScaled === null || latestScaled <= 0) return null;
+
+  let outstandingScaled = latestScaled;
+  if (typeof params.appliedNetDelta === "number") {
+    const appliedNetScaled = parseExactFourDecimalScaled(params.appliedNetDelta);
+    if (appliedNetScaled !== null) {
+      const appliedMagnitudeScaled =
+        params.movementType === "STOCK_RECEIVED"
+          ? Math.max(0, appliedNetScaled)
+          : Math.max(0, -appliedNetScaled);
+      outstandingScaled = Math.min(latestScaled, appliedMagnitudeScaled);
+    }
+  }
+  if (outstandingScaled <= 0) {
+    return {
+      rawDelta: 0,
+      coveredQuantity: params.latestQuantity,
+      appliedDelta: 0,
+      projectedBalance: params.currentBalance,
+      pendingReview: false,
+      requiresCountBeforeNegative: false,
+    };
+  }
+
   const rawSignedScaled =
-    params.movementType === "STOCK_RECEIVED" ? -latestScaled : latestScaled;
+    params.movementType === "STOCK_RECEIVED" ? -outstandingScaled : outstandingScaled;
   return computeSignedCorrectionPreview({
     rawSignedDelta: rawSignedScaled / QUANTITY_SCALE,
     currentBalance: params.currentBalance,

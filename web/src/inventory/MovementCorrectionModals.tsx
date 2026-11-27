@@ -145,6 +145,8 @@ function CorrectionCoverageSelector({
   counts,
   value,
   allowUnclear,
+  requireNewCountFullOnly = false,
+  minRecordedAfterIso,
   disabled,
   onChange,
   onReconcileFirst,
@@ -154,11 +156,19 @@ function CorrectionCoverageSelector({
   counts: CountsState;
   value: CoverageInputState;
   allowUnclear: boolean;
+  requireNewCountFullOnly?: boolean;
+  minRecordedAfterIso?: string;
   disabled: boolean;
   onChange: (next: CoverageInputState) => void;
   onReconcileFirst?: (item: InventoryItemView) => void;
 }) {
-  const hasCounts = counts.reconciliations.length > 0 || counts.openingCountCoversDate;
+  const minCreatedMs = minRecordedAfterIso ? Date.parse(minRecordedAfterIso) : null;
+  const selectableReconciliations =
+    minCreatedMs !== null && Number.isFinite(minCreatedMs)
+      ? counts.reconciliations.filter((rec) => Date.parse(rec.recordedAt) > minCreatedMs)
+      : counts.reconciliations;
+  const allowOpeningCountSource = !requireNewCountFullOnly && counts.openingCountCoversDate;
+  const hasCounts = selectableReconciliations.length > 0 || allowOpeningCountSource;
 
   return (
     <fieldset className="scope-fieldset">
@@ -169,18 +179,53 @@ function CorrectionCoverageSelector({
         <div className="alert alert--error" role="alert">
           {counts.error}
         </div>
+      ) : requireNewCountFullOnly ? (
+        hasCounts ? (
+          <div className="callout callout--warning" role="status">
+            <p className="callout__title">Qualifying physical counts recorded after pending entry</p>
+            <ul className="conflict-list">
+              {selectableReconciliations.map((rec) => (
+                <li key={rec.id}>
+                  <strong>{formatQuantityLabel(rec.physicalCount, rec.unit)}</strong> (
+                  {formatSignedDelta(rec.quantityDelta, rec.unit)}) on{" "}
+                  {formatRecordedAtManila(rec.recordedAt)} by {rec.recordedBy} — {rec.reason}
+                </li>
+              ))}
+            </ul>
+          </div>
+        ) : (
+          <div className="callout callout--warning" role="status">
+            <p className="callout__title">Physical count required first (INV-009)</p>
+            <p className="callout__body">
+              Because coverage was unclear, record a new physical count for {item.name} first, then
+              resolve this entry with Full Coverage (0 further stock effect).
+            </p>
+            {onReconcileFirst && (
+              <div className="inventory-card-reconcile-row">
+                <button
+                  type="button"
+                  className="button button--ghost button--sm"
+                  disabled={disabled}
+                  onClick={() => onReconcileFirst(item)}
+                >
+                  Count / Reconcile {item.name} first (INV-009)
+                </button>
+              </div>
+            )}
+          </div>
+        )
       ) : hasCounts ? (
         <div className="callout callout--warning" role="status">
           <p className="callout__title">Applicable counts recorded on or after this date</p>
           <ul className="conflict-list">
-            {counts.reconciliations.map((rec) => (
+            {selectableReconciliations.map((rec) => (
               <li key={rec.id}>
                 <strong>{formatQuantityLabel(rec.physicalCount, rec.unit)}</strong> (
                 {formatSignedDelta(rec.quantityDelta, rec.unit)}) on{" "}
                 {formatRecordedAtManila(rec.recordedAt)} by {rec.recordedBy} — {rec.reason}
               </li>
             ))}
-            {counts.openingCountCoversDate && item.openingStock && (
+            {allowOpeningCountSource && item.openingStock && (
               <li>
                 <strong>
                   Opening count:{" "}
@@ -211,17 +256,19 @@ function CorrectionCoverageSelector({
       )}
 
       <div className="inventory-coverage-options">
-        <label className="checkbox-field">
-          <input
-            type="radio"
-            checked={value.mode === "NONE"}
-            disabled={disabled}
-            onChange={() =>
-              onChange({ ...value, mode: "NONE", coveredQtyInput: "", countSource: "" })
-            }
-          />
-          <span>No count covered this difference — apply full change now</span>
-        </label>
+        {!requireNewCountFullOnly && (
+          <label className="checkbox-field">
+            <input
+              type="radio"
+              checked={value.mode === "NONE"}
+              disabled={disabled}
+              onChange={() =>
+                onChange({ ...value, mode: "NONE", coveredQtyInput: "", countSource: "" })
+              }
+            />
+            <span>No count covered this difference — apply full change now</span>
+          </label>
+        )}
         <label className="checkbox-field">
           <input
             type="radio"
@@ -234,32 +281,38 @@ function CorrectionCoverageSelector({
                 coveredQtyInput: "",
                 countSource:
                   value.countSource ||
-                  counts.reconciliations[0]?.id ||
-                  (counts.openingCountCoversDate ? "OPENING" : ""),
+                  selectableReconciliations[0]?.id ||
+                  (allowOpeningCountSource ? "OPENING" : ""),
               })
             }
           />
-          <span>A count already covered the full difference — save history with 0 change</span>
+          <span>
+            {requireNewCountFullOnly
+              ? "Reconciled with new physical count — resolve with 0 further stock effect"
+              : "A count already covered the full difference — save history with 0 change"}
+          </span>
         </label>
-        <label className="checkbox-field">
-          <input
-            type="radio"
-            checked={value.mode === "PARTIAL"}
-            disabled={disabled || !hasCounts}
-            onChange={() =>
-              onChange({
-                ...value,
-                mode: "PARTIAL",
-                countSource:
-                  value.countSource ||
-                  counts.reconciliations[0]?.id ||
-                  (counts.openingCountCoversDate ? "OPENING" : ""),
-              })
-            }
-          />
-          <span>A count covered part of this difference — apply only the rest</span>
-        </label>
-        {allowUnclear && (
+        {!requireNewCountFullOnly && (
+          <label className="checkbox-field">
+            <input
+              type="radio"
+              checked={value.mode === "PARTIAL"}
+              disabled={disabled || !hasCounts}
+              onChange={() =>
+                onChange({
+                  ...value,
+                  mode: "PARTIAL",
+                  countSource:
+                    value.countSource ||
+                    selectableReconciliations[0]?.id ||
+                    (allowOpeningCountSource ? "OPENING" : ""),
+                })
+              }
+            />
+            <span>A count covered part of this difference — apply only the rest</span>
+          </label>
+        )}
+        {allowUnclear && !requireNewCountFullOnly && (
           <label className="checkbox-field">
             <input
               type="radio"
@@ -283,13 +336,13 @@ function CorrectionCoverageSelector({
             onChange={(e) => onChange({ ...value, countSource: e.target.value })}
           >
             <option value="">Choose count</option>
-            {counts.reconciliations.map((rec) => (
+            {selectableReconciliations.map((rec) => (
               <option key={rec.id} value={rec.id}>
                 Counted {formatQuantityLabel(rec.physicalCount, rec.unit)} (
                 {formatRecordedAtManila(rec.recordedAt)}) — {rec.reason}
               </option>
             ))}
-            {counts.openingCountCoversDate && item.openingStock && (
+            {allowOpeningCountSource && item.openingStock && (
               <option value="OPENING">
                 Opening count (
                 {formatQuantityLabel(item.openingStock.quantity, item.openingStock.unit)})
@@ -384,7 +437,9 @@ export function MovementCorrectionAuditList({
               : corr.correctionKind === "CANCEL"
                 ? `Entry cancelled (was ${formatQuantityLabel(corr.previousQuantity, corr.primaryItemUnit)})`
                 : corr.correctionKind === "RECEIPT_ITEM"
-                  ? `Receipt item corrected: ${corr.previousItemName ?? corr.primaryItemName} (${corr.previousUnit ?? corr.primaryItemUnit}) → ${corr.newItemName ?? corr.secondaryItemName ?? "New item"} (${corr.newUnit ?? corr.secondaryItemUnit ?? ""})`
+                  ? corr.primaryCoverageMode === "DIFFERENT_UNIT_RECONCILED"
+                    ? `Receipt item reconciled across units: ${corr.previousItemName ?? corr.primaryItemName} (${formatQuantityLabel(corr.previousQuantity, corr.previousUnit ?? corr.primaryItemUnit)}) → ${corr.newItemName ?? corr.secondaryItemName ?? "New item"} (${corr.newUnit ?? corr.secondaryItemUnit ?? ""} — no target-unit quantity recorded)`
+                    : `Receipt item corrected: ${corr.previousItemName ?? corr.primaryItemName} (${corr.previousUnit ?? corr.primaryItemUnit}) → ${corr.newItemName ?? corr.secondaryItemName ?? "New item"} (${corr.newUnit ?? corr.secondaryItemUnit ?? ""})`
                   : `Entry date/note updated`}
           </strong>{" "}
           · [{corr.status === "PENDING_REVIEW" ? "Pending Owner Review" : "Applied"}] · By{" "}
@@ -483,7 +538,14 @@ export function MovementCorrectionDialog({
     movementState.currentEffectiveDate ??
     movementState.effectiveDate ??
     todayManila;
-  const entryNote = movementState.currentNote ?? movementState.note ?? "";
+  const entryNote =
+    movementState.currentNote !== undefined
+      ? (movementState.currentNote ?? "")
+      : (movementState.note ?? "");
+  const requiresNewCountResolve =
+    modal.kind === "RESOLVE_CORRECTION" &&
+    (modal.review.correction.correctionKind === "QUANTITY" ||
+      modal.review.correction.correctionKind === "CANCEL");
 
   const [qtyInput, setQtyInput] = useState(String(currentQtyValue));
   const [reasonInput, setReasonInput] = useState("");
@@ -491,7 +553,9 @@ export function MovementCorrectionDialog({
   const [metaDateInput, setMetaDateInput] = useState(entryEffectiveDate);
   const [metaNoteInput, setMetaNoteInput] = useState(entryNote);
 
-  const [primaryCov, setPrimaryCov] = useState<CoverageInputState>(defaultCoverageInput);
+  const [primaryCov, setPrimaryCov] = useState<CoverageInputState>(() =>
+    requiresNewCountResolve ? { ...defaultCoverageInput(), mode: "FULL" } : defaultCoverageInput(),
+  );
   const [secondaryCov, setSecondaryCov] = useState<CoverageInputState>(defaultCoverageInput);
   const [diffUnitPrimaryRecId, setDiffUnitPrimaryRecId] = useState("");
   const [diffUnitSecondaryRecId, setDiffUnitSecondaryRecId] = useState("");
@@ -635,6 +699,7 @@ export function MovementCorrectionDialog({
           movementType: movementState.movementType,
           entryStatus: movementState.entryStatus ?? "APPLIED",
           latestQuantity: currentQtyValue,
+          appliedNetDelta: movementState.appliedNetDelta,
           currentBalance: primaryItemState.currentQuantity,
           category: primaryItemState.category,
           coverageMode: primaryCov.mode,
@@ -785,16 +850,30 @@ export function MovementCorrectionDialog({
           return;
         }
         if (movementState.entryStatus !== "PENDING_REVIEW") {
-          const covErr = validateCoverageInput(
-            primaryCov,
-            primaryCounts,
-            currentQtyValue,
-            primaryItemState.unit,
-            Boolean(primaryItemState.allowDecimalQuantity),
-          );
-          if (covErr) {
-            setError(covErr);
-            return;
+          const cancelOutstandingMag =
+            typeof movementState.appliedNetDelta === "number"
+              ? Math.min(
+                  currentQtyValue,
+                  Math.max(
+                    0,
+                    movementState.movementType === "STOCK_RECEIVED"
+                      ? movementState.appliedNetDelta
+                      : -movementState.appliedNetDelta,
+                  ),
+                )
+              : currentQtyValue;
+          if (cancelOutstandingMag > 0) {
+            const covErr = validateCoverageInput(
+              primaryCov,
+              primaryCounts,
+              cancelOutstandingMag,
+              primaryItemState.unit,
+              Boolean(primaryItemState.allowDecimalQuantity),
+            );
+            if (covErr) {
+              setError(covErr);
+              return;
+            }
           }
         }
         const res = await api<{
@@ -971,6 +1050,18 @@ export function MovementCorrectionDialog({
 
       if (modal.kind === "RESOLVE_CORRECTION") {
         const corr = modal.review.correction;
+        if (requiresNewCountResolve) {
+          const minMs = Date.parse(corr.createdAt);
+          const validNewRec = primaryCounts.reconciliations.some(
+            (r) => r.id === primaryCov.countSource && Date.parse(r.recordedAt) > minMs,
+          );
+          if (primaryCov.mode !== "FULL" || !validNewRec) {
+            setError(
+              `Record a new physical count for ${primaryItemState.name} first and select it to resolve with Full Coverage (0 further stock effect).`,
+            );
+            return;
+          }
+        }
         const pErr = validateCoverageInput(
           primaryCov,
           primaryCounts,
@@ -1189,6 +1280,12 @@ export function MovementCorrectionDialog({
               counts={primaryCounts}
               value={primaryCov}
               allowUnclear={modal.kind !== "RESOLVE_CORRECTION"}
+              requireNewCountFullOnly={requiresNewCountResolve}
+              minRecordedAfterIso={
+                requiresNewCountResolve && modal.kind === "RESOLVE_CORRECTION"
+                  ? modal.review.correction.createdAt
+                  : undefined
+              }
               disabled={submitting}
               onChange={(next) => {
                 setPrimaryCov(next);

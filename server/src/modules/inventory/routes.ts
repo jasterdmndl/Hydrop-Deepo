@@ -333,6 +333,26 @@ function sendCorrectionOutcome(
     });
     return;
   }
+  if (outcome.kind === "count-required-unclear") {
+    res.status(409).json({
+      error: {
+        code: "INTERVENING_COUNT_REVIEW_REQUIRED",
+        message: `Record a new physical-count reconciliation (INV-009) for ${outcome.item.name} after this pending correction was created before resolving it with 0 further stock effect.`,
+      },
+      item: outcome.item,
+    });
+    return;
+  }
+  if (outcome.kind === "different-unit-quantity-unrecorded") {
+    res.status(409).json({
+      error: {
+        code: "DIFFERENT_UNIT_RECONCILIATION_REQUIRED",
+        message: `This entry was reconciled across units (originally ${outcome.originalUnit}) without recording a quantity in ${outcome.item.unit}. Count and reconcile ${outcome.item.name} directly instead of adjusting stock from ${outcome.originalUnit}.`,
+      },
+      item: outcome.item,
+    });
+    return;
+  }
   if (outcome.kind === "different-unit-reconciliation-required") {
     res.status(409).json({
       error: {

@@ -262,7 +262,9 @@ function toStockMovementView(row: StockMovementDbRow): StockMovementView {
         : row.movementType === "STOCK_RECEIVED" || row.movementType === "STOCK_USED"
           ? Boolean(row.isCancelled)
             ? 0
-            : (enteredQuantity ?? appliedQuantity)
+            : row.currentItemId !== null && row.currentItemId !== row.itemId
+              ? null
+              : (enteredQuantity ?? appliedQuantity)
           : null,
     currentItemId: row.currentItemId ?? row.itemId,
     currentItemName: row.currentItemName ?? null,
@@ -3116,10 +3118,27 @@ export const inventoryRepository = {
       scope: "FULL",
       item,
       openingStock: item.openingStock,
-      movements: movRows.map((row) => ({
-        ...toStockMovementView(row),
-        corrections: correctionsByMovement.get(row.id) ?? [],
-      })),
+      movements: movRows.map((row) => {
+        const corrections = correctionsByMovement.get(row.id) ?? [];
+        const appliedNetDelta =
+          row.movementType === "STOCK_RECEIVED" || row.movementType === "STOCK_USED"
+            ? corrections
+                .filter(
+                  (c) =>
+                    c.status === "APPLIED" &&
+                    (c.correctionKind === "QUANTITY" || c.correctionKind === "METADATA"),
+                )
+                .reduce(
+                  (sum, c) => addQuantities(sum, c.primaryAppliedDelta),
+                  Number(row.quantityDelta),
+                )
+            : undefined;
+        return {
+          ...toStockMovementView(row),
+          appliedNetDelta,
+          corrections,
+        };
+      }),
       reconciliations: recRows.map(toReconciliationView),
     };
   },
@@ -3267,6 +3286,14 @@ export const inventoryRepository = {
         return {
           kind: "pending-conflict" as const,
           message: "Resolve the pending correction for this entry before making another change.",
+        };
+      }
+      if (hasUnrecordedTargetUnitQuantity(existing)) {
+        const latestItem = await findItemById(tx, locked.id);
+        return {
+          kind: "different-unit-quantity-unrecorded" as const,
+          item: latestItem!,
+          originalUnit: existing.unit,
         };
       }
 
@@ -3462,6 +3489,14 @@ export const inventoryRepository = {
           message: "Resolve the pending correction for this entry before cancelling it.",
         };
       }
+      if (hasUnrecordedTargetUnitQuantity(existing)) {
+        const latestItem = await findItemById(tx, locked.id);
+        return {
+          kind: "different-unit-quantity-unrecorded" as const,
+          item: latestItem!,
+          originalUnit: existing.unit,
+        };
+      }
 
       const existingCorrectionVersion = Number(existing.correctionVersion ?? 0);
       if (existingCorrectionVersion !== input.expectedCorrectionVersion) {
@@ -3535,13 +3570,64 @@ export const inventoryRepository = {
       }
 
       const counts = await loadApplicableCountsForDate(tx, locked.id, sinceDate);
+      const alreadyAppliedNetDelta = await computeAppliedNetDeltaForMovement(tx, existing);
+      const outstandingMagnitude =
+        existing.movementType === "STOCK_RECEIVED"
+          ? Math.min(prevQuantity, Math.max(0, alreadyAppliedNetDelta))
+          : Math.min(prevQuantity, Math.max(0, subtractQuantities(0, alreadyAppliedNetDelta)));
+
+      if (quantitiesEqual(outstandingMagnitude, 0)) {
+        const latestRecId = counts.applicableReconciliations[0]?.id ?? null;
+        if (
+          input.coverage.expectedLatestReconciliationId !== latestRecId ||
+          input.coverage.expectedOpeningCountCoversDate !== counts.openingCountCoversDate
+        ) {
+          return buildStaleReviewOutcome(tx, locked.id, existing.id, counts);
+        }
+
+        const correctionId = await insertMovementCorrectionRow(tx, {
+          movementId: existing.id,
+          correctionKind: "CANCEL",
+          status: "APPLIED",
+          reason: input.reason,
+          requestKey: input.requestKey,
+          previousQuantity: prevQuantity,
+          newQuantity: 0,
+          primaryItemId: locked.id,
+          primaryRawDelta: 0,
+          primaryCoverageMode: "FULL",
+          primaryCoveredQuantity: prevQuantity,
+          primaryAppliedDelta: 0,
+          primarySupportingReconciliationId: null,
+          primaryCoveredByOpeningCount: false,
+          createdByUserId: input.actorUserId,
+          createdAt: input.cancelledAt,
+          reviewedByUserId: input.actorUserId,
+          reviewedAt: input.cancelledAt,
+          reviewNote: "Full stock effect was already covered by physical count; cancelled with 0 further stock change.",
+        });
+
+        await tx.query(
+          `UPDATE inventory_stock_movements
+              SET is_cancelled = true,
+                  cancelled_at = $2,
+                  cancelled_by_user_id = $3,
+                  current_quantity_value = 0,
+                  correction_version = correction_version + 1
+            WHERE id = $1`,
+          [existing.id, input.cancelledAt, input.actorUserId],
+        );
+
+        return hydrateCorrectionOutcomeById(tx, "applied", correctionId);
+      }
+
       const rawDelta =
         existing.movementType === "STOCK_RECEIVED"
-          ? subtractQuantities(0, prevQuantity)
-          : prevQuantity;
+          ? subtractQuantities(0, outstandingMagnitude)
+          : outstandingMagnitude;
 
       const cov = evaluateOwnerCoverageSelection({
-        enteredQuantity: prevQuantity,
+        enteredQuantity: outstandingMagnitude,
         allowDecimal,
         applicableReconciliations: counts.applicableReconciliations,
         openingCountCoversDate: counts.openingCountCoversDate,
@@ -3714,6 +3800,14 @@ export const inventoryRepository = {
           message: "Resolve the pending correction for this entry before making another change.",
         };
       }
+      if (hasUnrecordedTargetUnitQuantity(existing)) {
+        const latestItem = await findItemById(tx, wrongLocked.id);
+        return {
+          kind: "different-unit-quantity-unrecorded" as const,
+          item: latestItem!,
+          originalUnit: existing.unit,
+        };
+      }
       if (correctLocked.archivedAt !== null) {
         return {
           kind: "archived" as const,
@@ -3815,7 +3909,7 @@ export const inventoryRepository = {
           reason: input.reason,
           requestKey: input.requestKey,
           previousQuantity: receiptQuantity,
-          newQuantity: receiptQuantity,
+          newQuantity: null,
           previousItemId: wrongLocked.id,
           newItemId: correctLocked.id,
           previousUnit: wrongLocked.unit,
@@ -3830,7 +3924,7 @@ export const inventoryRepository = {
           secondaryItemId: correctLocked.id,
           secondaryRawDelta: 0,
           secondaryCoverageMode: "DIFFERENT_UNIT_RECONCILED",
-          secondaryCoveredQuantity: receiptQuantity,
+          secondaryCoveredQuantity: 0,
           secondaryAppliedDelta: 0,
           secondarySupportingReconciliationId: secondaryRecId,
           secondaryCoveredByOpeningCount: false,
@@ -3844,6 +3938,7 @@ export const inventoryRepository = {
         await tx.query(
           `UPDATE inventory_stock_movements
               SET current_item_id = $2,
+                  current_quantity_value = NULL,
                   correction_version = correction_version + 1
             WHERE id = $1`,
           [existing.id, correctLocked.id],
@@ -4089,7 +4184,7 @@ export const inventoryRepository = {
       const nextDate = input.effectiveDateProvided && input.newEffectiveDate
         ? input.newEffectiveDate
         : oldDate;
-      const oldNote = existing.currentNote ?? existing.note ?? null;
+      const oldNote = existing.currentNote ?? null;
       const nextNote = input.noteProvided ? input.newNote : oldNote;
 
       if (existing.movementType === "STOCK_USED" && input.noteProvided && !nextNote) {
@@ -4113,12 +4208,15 @@ export const inventoryRepository = {
         countsChanged = !hasSameApplicableCountSet(oldCounts, newCounts);
       }
 
-      const latestQty = getLatestMovementQuantity(existing);
+      const unrecordedCrossUnitQty = hasUnrecordedTargetUnitQuantity(existing);
+      const latestQty = unrecordedCrossUnitQty ? null : getLatestMovementQuantity(existing);
       const alreadyAppliedNetDelta = await computeAppliedNetDeltaForMovement(tx, existing);
       const fullSignedEffect =
-        existing.movementType === "STOCK_RECEIVED"
-          ? latestQty
-          : subtractQuantities(0, latestQty);
+        latestQty === null
+          ? 0
+          : existing.movementType === "STOCK_RECEIVED"
+            ? latestQty
+            : subtractQuantities(0, latestQty);
 
       if (!countsChanged) {
         const correctionId = await insertMovementCorrectionRow(tx, {
@@ -4159,6 +4257,15 @@ export const inventoryRepository = {
         );
 
         return hydrateCorrectionOutcomeById(tx, "applied", correctionId);
+      }
+
+      if (unrecordedCrossUnitQty || latestQty === null) {
+        const latestItem = await findItemById(tx, locked.id);
+        return {
+          kind: "different-unit-quantity-unrecorded" as const,
+          item: latestItem!,
+          originalUnit: existing.unit,
+        };
       }
 
       // Date crossed one or more physical counts (INV-043): require Owner count review before applying any stock change.
@@ -4475,7 +4582,59 @@ export const inventoryRepository = {
       let secondaryByOpen = false;
       let effectiveRawDeltaForMetadata = Number(pendingCorr.primaryRawDelta);
 
-      if (pendingCorr.correctionKind === "METADATA") {
+      if (
+        pendingCorr.correctionKind === "QUANTITY" ||
+        pendingCorr.correctionKind === "CANCEL"
+      ) {
+        // Finding 1 / INV-019, INV-022: unclear quantity or cancellation corrections must be reconciled
+        // with a new physical count recorded after the pending correction and resolve with 0 further stock effect.
+        const latestRecId = primaryCounts.applicableReconciliations[0]?.id ?? null;
+        if (
+          input.primaryCoverage.expectedLatestReconciliationId !== latestRecId ||
+          input.primaryCoverage.expectedOpeningCountCoversDate !==
+            primaryCounts.openingCountCoversDate
+        ) {
+          return buildStaleReviewOutcome(tx, primaryLocked.id, existing.id, primaryCounts);
+        }
+
+        if (primaryMode !== "FULL") {
+          return {
+            kind: "invalid-coverage" as const,
+            message:
+              "Unclear quantity or cancellation corrections must be resolved with Full Coverage (0 further stock effect) after recording a new physical count.",
+          };
+        }
+
+        if (input.primaryCoverage.coveredByOpeningCount) {
+          const latestPrimary = await findItemById(tx, primaryLocked.id);
+          return {
+            kind: "count-required-unclear" as const,
+            item: latestPrimary!,
+          };
+        }
+
+        const pendingCreatedMs = toDate(pendingCorr.createdAt).getTime();
+        const selectedRecId = input.primaryCoverage.supportingReconciliationId ?? null;
+        const selectedRec = selectedRecId
+          ? primaryCounts.applicableReconciliations.find(
+              (rec) =>
+                rec.id === selectedRecId && toDate(rec.recordedAt).getTime() > pendingCreatedMs,
+            )
+          : undefined;
+        if (!selectedRec) {
+          const latestPrimary = await findItemById(tx, primaryLocked.id);
+          return {
+            kind: "count-required-unclear" as const,
+            item: latestPrimary!,
+          };
+        }
+
+        primaryCovMode = "FULL";
+        primaryCoveredQty = Math.abs(Number(pendingCorr.primaryRawDelta));
+        primaryRecId = selectedRec.id;
+        primaryByOpen = false;
+        primaryAppliedDelta = 0;
+      } else if (pendingCorr.correctionKind === "METADATA") {
         const latestQty = getLatestMovementQuantity(existing);
         const alreadyAppliedNetDelta = await computeAppliedNetDeltaForMovement(tx, existing);
         const cov = evaluateOwnerCoverageSelection({
@@ -4762,12 +4921,30 @@ export type MovementCorrectionActionResult =
       attemptedDelta: number;
     }
   | {
+      kind: "count-required-unclear";
+      item: InventoryItemView;
+    }
+  | {
+      kind: "different-unit-quantity-unrecorded";
+      item: InventoryItemView;
+      originalUnit: string;
+    }
+  | {
       kind: "different-unit-reconciliation-required";
       primaryItem: InventoryItemView;
       secondaryItem: InventoryItemView;
       primaryApplicableReconciliations: StockReconciliationView[];
       secondaryApplicableReconciliations: StockReconciliationView[];
     };
+
+function hasUnrecordedTargetUnitQuantity(row: StockMovementDbRow): boolean {
+  return (
+    row.currentQuantityValue === null &&
+    !row.isCancelled &&
+    row.currentItemId !== null &&
+    row.currentItemId !== row.itemId
+  );
+}
 
 function getLatestMovementQuantity(row: StockMovementDbRow): number {
   if (row.currentQuantityValue !== null && row.currentQuantityValue !== undefined) {

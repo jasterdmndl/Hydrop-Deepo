@@ -263,6 +263,7 @@ export interface StockMovementView {
   currentItemUnit?: string | null;
   currentEffectiveDate?: string | null;
   currentNote?: string | null;
+  appliedNetDelta?: number;
   correctionVersion?: number;
   sourceCorrectionId?: string | null;
   corrections?: MovementCorrectionView[];
