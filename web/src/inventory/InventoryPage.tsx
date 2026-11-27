@@ -20,6 +20,7 @@ import {
   formatFaucetReportingTypeLabel,
   formatPesoCentavos,
   formatQuantityLabel,
+  formatQuantityNumber,
   formatRecordedAtManila,
   formatSignedDelta,
   getContainerPackageSummary,
@@ -30,6 +31,7 @@ import {
   getOpeningSubmitLabel,
   getPosSectionLabel,
   getStockStatusMeta,
+  getTodayManilaDateString,
   groupInventoryItems,
   type InventoryCategoryFilter,
   type InventoryItemsResponse,
@@ -37,10 +39,13 @@ import {
   type InventoryPermissions,
   mergeRefreshedInventoryItems,
   parseLowStockLevelInput,
+  parseMovementQuantityInput,
   parseOpeningQuantityInput,
   parsePesoPriceToCentavos,
   parsePhysicalCountInput,
   type PosSectionView,
+  QUANTITY_SCALE,
+  type StockMovementView,
   type StockReconciliationView,
 } from "./inventoryView";
 
@@ -249,9 +254,13 @@ export function InventoryPage() {
   } | null>(null);
 
   const [addProductOpen, setAddProductOpen] = useState(false);
+  const [productCategory, setProductCategory] = useState<"MERCHANDISE" | "OPERATING_SUPPLY">(
+    "MERCHANDISE",
+  );
   const [productName, setProductName] = useState("");
   const [productDescription, setProductDescription] = useState("");
   const [productUnit, setProductUnit] = useState("pcs");
+  const [productAllowDecimal, setProductAllowDecimal] = useState(false);
   const [productUnitConfirmed, setProductUnitConfirmed] = useState(false);
   const [productPriceInput, setProductPriceInput] = useState("");
   const [productShowInPos, setProductShowInPos] = useState(false);
@@ -290,6 +299,20 @@ export function InventoryPage() {
   const [reconcileStaleNotice, setReconcileStaleNotice] = useState<string | null>(null);
   const [reconcileNeedsFreshCount, setReconcileNeedsFreshCount] = useState(false);
 
+  const [receiveItem, setReceiveItem] = useState<InventoryItemView | null>(null);
+  const [receiveQtyInput, setReceiveQtyInput] = useState("");
+  const [receiveNoteInput, setReceiveNoteInput] = useState("");
+  const [receiveRequestKey, setReceiveRequestKey] = useState("");
+  const [receiving, setReceiving] = useState(false);
+  const [receiveError, setReceiveError] = useState<string | null>(null);
+
+  const [useItem, setUseItem] = useState<InventoryItemView | null>(null);
+  const [useQtyInput, setUseQtyInput] = useState("");
+  const [usePurposeInput, setUsePurposeInput] = useState("");
+  const [useRequestKey, setUseRequestKey] = useState("");
+  const [recordingUse, setRecordingUse] = useState(false);
+  const [useError, setUseError] = useState<string | null>(null);
+
   const [togglingItemKey, setTogglingItemKey] = useState<string | null>(null);
   const [sectionPickerItemId, setSectionPickerItemId] = useState<string | null>(null);
   const [sectionPickerValue, setSectionPickerValue] = useState<string>("CHANGE_OF_GRIPO");
@@ -305,6 +328,8 @@ export function InventoryPage() {
   const editNameInputRef = useRef<HTMLInputElement | null>(null);
   const containerAlertInputRef = useRef<HTMLInputElement | null>(null);
   const reconcileCountInputRef = useRef<HTMLInputElement | null>(null);
+  const receiveQtyInputRef = useRef<HTMLInputElement | null>(null);
+  const useQtyInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     const previousTitle = document.title;
@@ -355,7 +380,17 @@ export function InventoryPage() {
   }, [loadItems]);
 
   useEffect(() => {
-    if (!addProductOpen && !editProductItem && !editContainerAlertItem && !archiveItem && !reconcileItem) return;
+    if (
+      !addProductOpen &&
+      !editProductItem &&
+      !editContainerAlertItem &&
+      !archiveItem &&
+      !reconcileItem &&
+      !receiveItem &&
+      !useItem
+    ) {
+      return;
+    }
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.defaultPrevented || event.key !== "Escape") return;
       if (addProductOpen && !creatingProduct) setAddProductOpen(false);
@@ -363,6 +398,8 @@ export function InventoryPage() {
       if (editContainerAlertItem && !savingContainerAlert) setEditContainerAlertItem(null);
       if (archiveItem && !archiving) setArchiveItem(null);
       if (reconcileItem && !reconciling) setReconcileItem(null);
+      if (receiveItem && !receiving) setReceiveItem(null);
+      if (useItem && !recordingUse) setUseItem(null);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
@@ -377,12 +414,18 @@ export function InventoryPage() {
     archiving,
     reconcileItem,
     reconciling,
+    receiveItem,
+    receiving,
+    useItem,
+    recordingUse,
   ]);
 
   function openAddProductModal() {
+    setProductCategory("MERCHANDISE");
     setProductName("");
     setProductDescription("");
     setProductUnit("pcs");
+    setProductAllowDecimal(false);
     setProductUnitConfirmed(false);
     setProductPriceInput("");
     setProductShowInPos(false);
@@ -395,7 +438,7 @@ export function InventoryPage() {
   }
 
   function openEditProductModal(item: InventoryItemView) {
-    if (!item.id || item.category !== "MERCHANDISE") return;
+    if (!item.id || (item.category !== "MERCHANDISE" && item.category !== "OPERATING_SUPPLY")) return;
     setEditProductItem(item);
     setEditName(item.name);
     setEditDescription(item.description ?? "");
@@ -419,7 +462,7 @@ export function InventoryPage() {
   }
 
   function openArchiveModal(item: InventoryItemView) {
-    if (!item.id || item.category !== "MERCHANDISE") return;
+    if (!item.id || (item.category !== "MERCHANDISE" && item.category !== "OPERATING_SUPPLY")) return;
     setArchiveItem(item);
     setArchiveError(null);
   }
@@ -427,7 +470,7 @@ export function InventoryPage() {
   function openReconcileModal(item: InventoryItemView) {
     if (item.status !== "INITIALIZED" || item.currentQuantity === null) return;
     setReconcileItem(item);
-    setReconcileCountInput(String(item.currentQuantity));
+    setReconcileCountInput(item.currentQuantity >= 0 ? String(item.currentQuantity) : "0");
     setReconcileReasonInput("");
     setReconcileRequestKey(generateClientKey());
     setReconcileError(null);
@@ -436,15 +479,43 @@ export function InventoryPage() {
     setTimeout(() => reconcileCountInputRef.current?.focus(), 0);
   }
 
+  function openReceiveModal(item: InventoryItemView) {
+    if (item.status !== "INITIALIZED" || item.currentQuantity === null) return;
+    setReceiveItem(item);
+    setReceiveQtyInput("");
+    setReceiveNoteInput("");
+    setReceiveRequestKey(generateClientKey());
+    setReceiveError(null);
+    setTimeout(() => receiveQtyInputRef.current?.focus(), 0);
+  }
+
+  function openUseModal(item: InventoryItemView) {
+    if (item.status !== "INITIALIZED" || item.currentQuantity === null || item.category !== "OPERATING_SUPPLY") {
+      return;
+    }
+    setUseItem(item);
+    setUseQtyInput("");
+    setUsePurposeInput("");
+    setUseRequestKey(generateClientKey());
+    setUseError(null);
+    setTimeout(() => useQtyInputRef.current?.focus(), 0);
+  }
+
   async function handleCreateProduct(event: FormEvent) {
     event.preventDefault();
     if (creatingProduct || !permissions?.canCreateProduct) return;
 
+    const isSupply = productCategory === "OPERATING_SUPPLY";
+    const allowDecimal = isSupply ? productAllowDecimal : false;
     const trimmedName = productName.trim().replace(/\s+/g, " ");
     const trimmedDesc = productDescription.trim().replace(/\s+/g, " ");
     const trimmedUnit = productUnit.trim().replace(/\s+/g, " ");
-    const parsedPriceCentavos = parsePesoPriceToCentavos(productPriceInput);
-    const parsedLowStock = parseLowStockLevelInput(productLowStockInput, trimmedUnit || "units");
+    const parsedPriceCentavos = isSupply ? null : parsePesoPriceToCentavos(productPriceInput);
+    const parsedLowStock = parseLowStockLevelInput(
+      productLowStockInput,
+      trimmedUnit || "units",
+      allowDecimal,
+    );
 
     if (!trimmedName || trimmedName.length > 80) {
       setAddProductError("Enter a product name (1 to 80 characters).");
@@ -462,7 +533,7 @@ export function InventoryPage() {
       setAddProductError("Confirm the stock recording unit before saving.");
       return;
     }
-    if (parsedPriceCentavos === null) {
+    if (!isSupply && parsedPriceCentavos === null) {
       setAddProductError("Enter a valid positive selling price in pesos (e.g. 40.00).");
       return;
     }
@@ -470,7 +541,7 @@ export function InventoryPage() {
       setAddProductError(parsedLowStock.message);
       return;
     }
-    if (productShowInPos && !productPosSection) {
+    if (!isSupply && productShowInPos && !productPosSection) {
       setAddProductError("Choose a POS section when Show in POS is checked.");
       return;
     }
@@ -481,19 +552,33 @@ export function InventoryPage() {
     loadTrackerRef.current.next();
 
     try {
+      const payload = isSupply
+        ? {
+            category: "OPERATING_SUPPLY",
+            name: trimmedName,
+            description: trimmedDesc || null,
+            unit: trimmedUnit,
+            allowDecimalQuantity: allowDecimal,
+            unitConfirmed: true,
+            lowStockLevel: parsedLowStock.value,
+          }
+        : {
+            category: "MERCHANDISE",
+            name: trimmedName,
+            description: trimmedDesc || null,
+            unit: trimmedUnit,
+            allowDecimalQuantity: false,
+            unitConfirmed: true,
+            unitPriceCentavos: parsedPriceCentavos,
+            showInPos: productShowInPos,
+            posSection: productPosSection || null,
+            lowStockLevel: parsedLowStock.value,
+            faucetReportingType: productFaucetType || null,
+          };
+
       const response = await api<{ item: InventoryItemView }>("/api/inventory/products", {
         method: "POST",
-        body: {
-          name: trimmedName,
-          description: trimmedDesc || null,
-          unit: trimmedUnit,
-          unitConfirmed: true,
-          unitPriceCentavos: parsedPriceCentavos,
-          showInPos: productShowInPos,
-          posSection: productPosSection || null,
-          lowStockLevel: parsedLowStock.value,
-          faucetReportingType: productFaucetType || null,
-        },
+        body: payload,
       });
       loadTrackerRef.current.next();
       setItems((prev) => [...prev, response.item]);
@@ -501,8 +586,10 @@ export function InventoryPage() {
       setSaveNotice({
         id: nextNoticeId(),
         duration: "detailed",
-        title: "Product saved",
-        body: `${response.item.name} (${formatPesoCentavos(response.item.unitPriceCentavos ?? parsedPriceCentavos)}) was added as ${response.item.showInPos ? "Shown in POS" : "Hidden from POS"} with opening stock Not Set.`,
+        title: isSupply ? "Operating supply saved" : "Product saved",
+        body: isSupply
+          ? `${response.item.name} (${response.item.unit}) was added as an operating supply with opening stock Not Set.`
+          : `${response.item.name} (${formatPesoCentavos(response.item.unitPriceCentavos ?? parsedPriceCentavos ?? 0)}) was added as ${response.item.showInPos ? "Shown in POS" : "Hidden from POS"} with opening stock Not Set.`,
       });
     } catch (err) {
       setAddProductError(
@@ -517,10 +604,16 @@ export function InventoryPage() {
     event.preventDefault();
     if (!editProductItem?.id || savingEdit || !permissions?.canCreateProduct) return;
 
+    const isSupply = editProductItem.category === "OPERATING_SUPPLY";
+    const allowDecimal = Boolean(editProductItem.allowDecimalQuantity);
     const trimmedName = editName.trim().replace(/\s+/g, " ");
     const trimmedDesc = editDescription.trim().replace(/\s+/g, " ");
-    const parsedPriceCentavos = parsePesoPriceToCentavos(editPriceInput);
-    const parsedLowStock = parseLowStockLevelInput(editLowStockInput, editProductItem.unit);
+    const parsedPriceCentavos = isSupply ? null : parsePesoPriceToCentavos(editPriceInput);
+    const parsedLowStock = parseLowStockLevelInput(
+      editLowStockInput,
+      editProductItem.unit,
+      allowDecimal,
+    );
 
     if (!trimmedName || trimmedName.length > 80) {
       setEditError("Enter a product name (1 to 80 characters).");
@@ -530,7 +623,7 @@ export function InventoryPage() {
       setEditError("Short description must be 160 characters or fewer.");
       return;
     }
-    if (parsedPriceCentavos === null) {
+    if (!isSupply && parsedPriceCentavos === null) {
       setEditError("Enter a valid positive selling price in pesos (e.g. 40.00).");
       return;
     }
@@ -538,7 +631,7 @@ export function InventoryPage() {
       setEditError(parsedLowStock.message);
       return;
     }
-    if (editShowInPos && !editPosSection) {
+    if (!isSupply && editShowInPos && !editPosSection) {
       setEditError("Choose a POS section when Show in POS is checked.");
       return;
     }
@@ -549,11 +642,13 @@ export function InventoryPage() {
     loadTrackerRef.current.next();
 
     try {
-      const response = await api<{ item: InventoryItemView }>(
-        `/api/inventory/products/${encodeURIComponent(editProductItem.id)}`,
-        {
-          method: "PATCH",
-          body: {
+      const payload = isSupply
+        ? {
+            name: trimmedName,
+            description: trimmedDesc || null,
+            lowStockLevel: parsedLowStock.value,
+          }
+        : {
             name: trimmedName,
             description: trimmedDesc || null,
             unitPriceCentavos: parsedPriceCentavos,
@@ -561,7 +656,13 @@ export function InventoryPage() {
             posSection: editPosSection || null,
             lowStockLevel: parsedLowStock.value,
             faucetReportingType: editFaucetType || null,
-          },
+          };
+
+      const response = await api<{ item: InventoryItemView }>(
+        `/api/inventory/products/${encodeURIComponent(editProductItem.id)}`,
+        {
+          method: "PATCH",
+          body: payload,
         },
       );
       loadTrackerRef.current.next();
@@ -574,8 +675,10 @@ export function InventoryPage() {
       setSaveNotice({
         id: nextNoticeId(),
         duration: "detailed",
-        title: "Product details updated",
-        body: `${response.item.name} (${formatPesoCentavos(response.item.unitPriceCentavos ?? parsedPriceCentavos)}) was saved. Future POS checkouts will use these details while existing sales keep their original snapshots.`,
+        title: isSupply ? "Operating supply updated" : "Product details updated",
+        body: isSupply
+          ? `${response.item.name} (${response.item.unit}) details were saved.`
+          : `${response.item.name} (${formatPesoCentavos(response.item.unitPriceCentavos ?? parsedPriceCentavos ?? 0)}) was saved. Future POS checkouts will use these details while existing sales keep their original snapshots.`,
       });
     } catch (err) {
       setEditError(
@@ -794,7 +897,11 @@ export function InventoryPage() {
       return;
     }
 
-    const parsedCount = parsePhysicalCountInput(reconcileCountInput, reconcileItem.unit);
+    const parsedCount = parsePhysicalCountInput(
+      reconcileCountInput,
+      reconcileItem.unit,
+      Boolean(reconcileItem.allowDecimalQuantity),
+    );
     if (!parsedCount.ok) {
       setReconcileError(parsedCount.message);
       reconcileCountInputRef.current?.focus();
@@ -885,6 +992,144 @@ export function InventoryPage() {
     }
   }
 
+  async function handleConfirmReceiving(event: FormEvent) {
+    event.preventDefault();
+    if (
+      !receiveItem ||
+      receiveItem.currentQuantity === null ||
+      receiving ||
+      !(permissions?.canRecordReceiving ?? permissions?.canInitializeOpeningStock)
+    ) {
+      return;
+    }
+
+    const parsedQty = parseMovementQuantityInput(
+      receiveQtyInput,
+      receiveItem.unit,
+      Boolean(receiveItem.allowDecimalQuantity),
+    );
+    if (!parsedQty.ok) {
+      setReceiveError(parsedQty.message);
+      receiveQtyInputRef.current?.focus();
+      return;
+    }
+
+    const trimmedNote = receiveNoteInput.trim().replace(/\s+/g, " ");
+    if (trimmedNote.length > 240) {
+      setReceiveError("Delivery note must be 240 characters or fewer.");
+      return;
+    }
+
+    const endpointKey = receiveItem.shape ?? receiveItem.id ?? receiveItem.code;
+    setReceiving(true);
+    setReceiveError(null);
+    setSaveNotice(null);
+    loadTrackerRef.current.next();
+
+    try {
+      const response = await api<{
+        item: InventoryItemView;
+        movement: StockMovementView;
+        replayed?: boolean;
+      }>(`/api/inventory/items/${encodeURIComponent(endpointKey)}/receiving`, {
+        method: "POST",
+        body: {
+          quantity: parsedQty.quantity,
+          effectiveDate: getTodayManilaDateString(),
+          note: trimmedNote || null,
+          requestKey: receiveRequestKey,
+        },
+      });
+      loadTrackerRef.current.next();
+      setItems((prev) =>
+        prev.map((entry) =>
+          getItemKey(entry) === getItemKey(response.item) ? response.item : entry,
+        ),
+      );
+      setReceiveItem(null);
+      setSaveNotice({
+        id: nextNoticeId(),
+        duration: "detailed",
+        title: "Stock received recorded",
+        body: `Added ${formatQuantityLabel(response.movement.quantity, response.movement.unit)} to ${response.item.name}. Current balance: ${formatQuantityLabel(response.item.currentQuantity, response.item.unit)}.`,
+      });
+    } catch (err) {
+      setReceiveError(
+        err instanceof ApiError
+          ? err.message
+          : "Could not record Stock Received. Please try again.",
+      );
+    } finally {
+      setReceiving(false);
+    }
+  }
+
+  async function handleConfirmUsage(event: FormEvent) {
+    event.preventDefault();
+    if (!useItem || useItem.currentQuantity === null || recordingUse) return;
+
+    const parsedQty = parseMovementQuantityInput(
+      useQtyInput,
+      useItem.unit,
+      Boolean(useItem.allowDecimalQuantity),
+    );
+    if (!parsedQty.ok) {
+      setUseError(parsedQty.message);
+      useQtyInputRef.current?.focus();
+      return;
+    }
+
+    const trimmedPurpose = usePurposeInput.trim().replace(/\s+/g, " ");
+    if (!trimmedPurpose || trimmedPurpose.length > 240) {
+      setUseError("Enter a short purpose note (1 to 240 characters).");
+      return;
+    }
+
+    const endpointKey = useItem.shape ?? useItem.id ?? useItem.code;
+    setRecordingUse(true);
+    setUseError(null);
+    setSaveNotice(null);
+    loadTrackerRef.current.next();
+
+    try {
+      const response = await api<{
+        item: InventoryItemView;
+        movement: StockMovementView;
+        replayed?: boolean;
+      }>(`/api/inventory/items/${encodeURIComponent(endpointKey)}/usage`, {
+        method: "POST",
+        body: {
+          quantity: parsedQty.quantity,
+          effectiveDate: getTodayManilaDateString(),
+          purpose: trimmedPurpose,
+          requestKey: useRequestKey,
+        },
+      });
+      loadTrackerRef.current.next();
+      setItems((prev) =>
+        prev.map((entry) =>
+          getItemKey(entry) === getItemKey(response.item) ? response.item : entry,
+        ),
+      );
+      setUseItem(null);
+      const flagged = Boolean(response.item.needsReconciliation);
+      setSaveNotice({
+        id: nextNoticeId(),
+        duration: "detailed",
+        title: flagged ? "Stock used recorded · Reconciliation needed" : "Stock used recorded",
+        body: flagged
+          ? `Recorded ${formatQuantityLabel(response.movement.quantity, response.movement.unit)} used for ${response.item.name}. Balance is now ${formatQuantityLabel(response.item.currentQuantity, response.item.unit)} and flagged for Owner physical-count reconciliation.`
+          : `Deducted ${formatQuantityLabel(response.movement.quantity, response.movement.unit)} from ${response.item.name}. Current balance: ${formatQuantityLabel(response.item.currentQuantity, response.item.unit)}.`,
+      });
+    } catch (err) {
+      setUseError(
+        err instanceof ApiError ? err.message : "Could not record Stock Used. Please try again.",
+      );
+    } finally {
+      setRecordingUse(false);
+    }
+  }
+
   async function handleOpeningSubmit(event: FormEvent, item: InventoryItemView) {
     event.preventDefault();
     if (
@@ -898,7 +1143,11 @@ export function InventoryPage() {
     }
 
     const itemKey = getItemKey(item);
-    const parsed = parseOpeningQuantityInput(inputs[itemKey] ?? "", item.unit);
+    const parsed = parseOpeningQuantityInput(
+      inputs[itemKey] ?? "",
+      item.unit,
+      Boolean(item.allowDecimalQuantity),
+    );
     if (!parsed.ok) {
       setFieldErrors((prev) => ({ ...prev, [itemKey]: parsed.message }));
       inputRefs.current[itemKey]?.focus();
@@ -970,9 +1219,15 @@ export function InventoryPage() {
   const isRefreshError = loadPhase === "refresh-error";
   const canInitialize = permissions?.canInitializeOpeningStock ?? false;
   const canCreateProduct = permissions?.canCreateProduct ?? false;
+  const canRecordReceiving = permissions?.canRecordReceiving ?? canInitialize;
+  const canRecordUsage = permissions?.canRecordUsage ?? true;
   const hasUninitialized = items.some((item) => item.status === "NOT_SET");
   const hasOtherItems = items.some((item) => getInventoryItemGroup(item, posSections) === "OTHER");
+  const hasOperatingSupplies = items.some((item) => item.category === "OPERATING_SUPPLY");
   const summary = getInventorySummaryCounts(items);
+  const discrepancyCount = items.filter(
+    (item) => item.needsReconciliation || (item.currentQuantity !== null && item.currentQuantity < 0),
+  ).length;
   const filteredItems = filterInventoryItems(items, activeFilter, posSections);
   const groupedSections = groupInventoryItems(items, activeFilter, posSections);
 
@@ -988,13 +1243,45 @@ export function InventoryPage() {
   );
 
   const reconcileParsedCount = reconcileItem
-    ? parsePhysicalCountInput(reconcileCountInput, reconcileItem.unit)
+    ? parsePhysicalCountInput(
+        reconcileCountInput,
+        reconcileItem.unit,
+        Boolean(reconcileItem.allowDecimalQuantity),
+      )
     : null;
   const reconcilePreview =
     reconcileItem &&
     reconcileItem.currentQuantity !== null &&
     reconcileParsedCount?.ok
       ? computeReconciliationPreview(reconcileItem.currentQuantity, reconcileParsedCount.quantity)
+      : null;
+
+  const receiveParsedQty = receiveItem
+    ? parseMovementQuantityInput(
+        receiveQtyInput,
+        receiveItem.unit,
+        Boolean(receiveItem.allowDecimalQuantity),
+      )
+    : null;
+  const receivePreviewAfter =
+    receiveItem && receiveItem.currentQuantity !== null && receiveParsedQty?.ok
+      ? (Math.round(receiveItem.currentQuantity * QUANTITY_SCALE) +
+          Math.round(receiveParsedQty.quantity * QUANTITY_SCALE)) /
+        QUANTITY_SCALE
+      : null;
+
+  const useParsedQty = useItem
+    ? parseMovementQuantityInput(
+        useQtyInput,
+        useItem.unit,
+        Boolean(useItem.allowDecimalQuantity),
+      )
+    : null;
+  const usePreviewAfter =
+    useItem && useItem.currentQuantity !== null && useParsedQty?.ok
+      ? (Math.round(useItem.currentQuantity * QUANTITY_SCALE) -
+          Math.round(useParsedQty.quantity * QUANTITY_SCALE)) /
+        QUANTITY_SCALE
       : null;
 
   const refreshLabel =
@@ -1070,6 +1357,16 @@ export function InventoryPage() {
                   Other Products
                 </button>
               )}
+              {hasOperatingSupplies && (
+                <button
+                  type="button"
+                  className={`inventory-filter-pill${activeFilter === "OPERATING_SUPPLY" ? " inventory-filter-pill--active" : ""}`}
+                  aria-pressed={activeFilter === "OPERATING_SUPPLY"}
+                  onClick={() => setActiveFilter("OPERATING_SUPPLY")}
+                >
+                  Operating Supplies
+                </button>
+              )}
             </div>
 
             <div
@@ -1079,6 +1376,11 @@ export function InventoryPage() {
               <span className="inventory-status-pill inventory-status-pill--unset">{summary.notSet} Not Set</span>
               <span className="inventory-status-pill inventory-status-pill--out">{summary.noStock} No Stock</span>
               <span className="inventory-status-pill inventory-status-pill--in">{summary.inStock} In Stock</span>
+              {discrepancyCount > 0 && (
+                <span className="inventory-status-pill inventory-status-pill--discrepancy">
+                  {discrepancyCount} Needs Reconciliation
+                </span>
+              )}
             </div>
           </div>
         )}
@@ -1179,6 +1481,8 @@ export function InventoryPage() {
                     const isZero = statusMeta.tone === "out";
                     const isContainer = item.category === "CONTAINER";
                     const isMerchandise = item.category === "MERCHANDISE";
+                    const isSupply = item.category === "OPERATING_SUPPLY";
+                    const isNegativeBalance = item.currentQuantity !== null && item.currentQuantity < 0;
                     const formError = fieldErrors[itemKey];
                     const conflictNotice = conflictNotices[itemKey];
                     const actionError = cardActionError[itemKey];
@@ -1189,7 +1493,10 @@ export function InventoryPage() {
                     const hintId = `${inputId}-hint`;
                     const subtitle = item.shape
                       ? getContainerSubtitle(item.shape)
-                      : item.description ?? `Standalone merchandise (${item.unit})`;
+                      : item.description ??
+                        (isSupply
+                          ? `Operating supply (${item.unit}${item.allowDecimalQuantity ? ", measured decimals" : ", whole units"})`
+                          : `Standalone merchandise (${item.unit})`);
 
                     return (
                       <article key={itemKey} className="inventory-item-card" aria-labelledby={`heading-${itemKey}`}>
@@ -1234,10 +1541,18 @@ export function InventoryPage() {
                         <div className="inventory-item-card__pos-row">
                           <span
                             className={`inventory-pos-badge ${
-                              item.showInPos ? "inventory-pos-badge--shown" : "inventory-pos-badge--hidden"
+                              isSupply
+                                ? "inventory-pos-badge--hidden"
+                                : item.showInPos
+                                  ? "inventory-pos-badge--shown"
+                                  : "inventory-pos-badge--hidden"
                             }`}
                           >
-                            {item.showInPos ? "Shown in POS" : "Hidden from POS"}
+                            {isSupply
+                              ? "Station Operating Supply"
+                              : item.showInPos
+                                ? "Shown in POS"
+                                : "Hidden from POS"}
                           </span>
 
                           {canCreateProduct && (
@@ -1283,6 +1598,27 @@ export function InventoryPage() {
                                         ? "Hide from POS"
                                         : "Show in POS"}
                                   </button>
+                                  <button
+                                    type="button"
+                                    className="button button--ghost button--sm"
+                                    disabled={isToggling || submittingKey !== null}
+                                    onClick={() => openEditProductModal(item)}
+                                  >
+                                    Edit
+                                  </button>
+                                  <button
+                                    type="button"
+                                    className="button button--ghost button--sm"
+                                    disabled={isToggling || submittingKey !== null}
+                                    onClick={() => openArchiveModal(item)}
+                                  >
+                                    Archive
+                                  </button>
+                                </>
+                              )}
+
+                              {isSupply && item.id && (
+                                <>
                                   <button
                                     type="button"
                                     className="button button--ghost button--sm"
@@ -1354,7 +1690,13 @@ export function InventoryPage() {
 
                         <div className="inventory-item-card__metric-row">
                           <strong
-                            className={`inventory-item-card__qty${isNotSet ? " inventory-item-card__qty--unset" : ""}`}
+                            className={`inventory-item-card__qty${
+                              isNotSet
+                                ? " inventory-item-card__qty--unset"
+                                : isNegativeBalance
+                                  ? " inventory-item-card__qty--negative"
+                                  : ""
+                            }`}
                           >
                             {isNotSet ? "Not Set" : formatQuantityLabel(item.currentQuantity, item.unit)}
                           </strong>
@@ -1476,6 +1818,15 @@ export function InventoryPage() {
                                   </ul>
                                 </div>
                               )}
+                              {item.needsReconciliation && (
+                                <div className="callout callout--warning" role="status">
+                                  <p className="callout__title">Discrepancy flagged for Owner count</p>
+                                  <p className="callout__body">
+                                    Recorded usage exceeded system stock. Receiving stock does not clear this flag;
+                                    run Correct stock with an actual physical count (INV-009) to reconcile.
+                                  </p>
+                                </div>
+                              )}
                               {item.latestReconciliation && (
                                 <p className="inventory-card-footnote">
                                   Last count reason: {item.latestReconciliation.reason} (
@@ -1487,16 +1838,38 @@ export function InventoryPage() {
                                   ? "Explicit zero confirmed · Opening count is preserved."
                                   : "Opening count is preserved and cannot be overwritten."}
                               </p>
-                              {canInitialize && (
+                              {(canRecordReceiving || (isSupply && canRecordUsage) || canInitialize) && (
                                 <div className="inventory-card-reconcile-row">
-                                  <button
-                                    type="button"
-                                    className="button button--ghost button--sm"
-                                    disabled={loading || submittingKey !== null}
-                                    onClick={() => openReconcileModal(item)}
-                                  >
-                                    Correct stock
-                                  </button>
+                                  {canRecordReceiving && (
+                                    <button
+                                      type="button"
+                                      className="button button--ghost button--sm"
+                                      disabled={loading || submittingKey !== null}
+                                      onClick={() => openReceiveModal(item)}
+                                    >
+                                      Stock Received
+                                    </button>
+                                  )}
+                                  {isSupply && canRecordUsage && (
+                                    <button
+                                      type="button"
+                                      className="button button--ghost button--sm"
+                                      disabled={loading || submittingKey !== null}
+                                      onClick={() => openUseModal(item)}
+                                    >
+                                      Stock Used
+                                    </button>
+                                  )}
+                                  {canInitialize && (
+                                    <button
+                                      type="button"
+                                      className="button button--ghost button--sm"
+                                      disabled={loading || submittingKey !== null}
+                                      onClick={() => openReconcileModal(item)}
+                                    >
+                                      Correct stock
+                                    </button>
+                                  )}
                                 </div>
                               )}
                             </>
@@ -1521,8 +1894,8 @@ export function InventoryPage() {
                                   }}
                                   name={`openingQuantity-${itemKey}`}
                                   type="text"
-                                  inputMode="numeric"
-                                  pattern="[0-9]*"
+                                  inputMode={item.allowDecimalQuantity ? "decimal" : "numeric"}
+                                  pattern={item.allowDecimalQuantity ? undefined : "[0-9]*"}
                                   autoComplete="off"
                                   placeholder="0"
                                   value={inputs[itemKey] ?? ""}
@@ -1534,7 +1907,10 @@ export function InventoryPage() {
                                     setFieldErrors((prev) => ({ ...prev, [itemKey]: undefined }));
                                   }}
                                 />
-                                <small id={hintId}>Enter actual physical count (0 if none).</small>
+                                <small id={hintId}>
+                                  Enter actual physical count (0 if none
+                                  {item.allowDecimalQuantity ? ", up to 4 decimals" : ""}).
+                                </small>
                               </label>
 
                               <button
@@ -1559,11 +1935,11 @@ export function InventoryPage() {
 
           {permissions && !canInitialize && (
             <div className="inventory-board-note" role="status">
-              <span className="inventory-board-note__title">View-only access</span>
+              <span className="inventory-board-note__title">Employee Inventory access</span>
               <span>
-                Both Owner and Employee can view stock counts and POS catalog status. Only the Owner can add or edit
-                merchandise products, manage POS visibility, archive products, record initial opening counts, or
-                reconcile physical stock counts.
+                Employee can view stock counts and record Stock Used for initialized operating supplies. Only the
+                Owner can add or edit products, manage POS visibility, record Stock Received, archive items,
+                record initial opening counts, or reconcile physical stock counts.
               </span>
             </div>
           )}
@@ -1592,19 +1968,45 @@ export function InventoryPage() {
               <div>
                 <h2 id="add-product-title">Add Product</h2>
                 <p className="muted-sm">
-                  Create standalone merchandise in Inventory and choose whether to show it in POS.
+                  {productCategory === "OPERATING_SUPPLY"
+                    ? "Create an operating supply in its single confirmed stock unit."
+                    : "Create standalone merchandise in Inventory and choose whether to show it in POS."}
                 </p>
               </div>
             </div>
 
             <form className="subview" onSubmit={(event) => void handleCreateProduct(event)} noValidate>
               <label className="field">
-                <span>Product name *</span>
+                <span>Item type *</span>
+                <select
+                  aria-label="Item type"
+                  disabled={creatingProduct}
+                  value={productCategory}
+                  onChange={(e) => {
+                    const nextCategory = e.target.value as "MERCHANDISE" | "OPERATING_SUPPLY";
+                    setProductCategory(nextCategory);
+                    if (nextCategory === "MERCHANDISE") {
+                      setProductAllowDecimal(false);
+                    }
+                    setAddProductError(null);
+                  }}
+                >
+                  <option value="MERCHANDISE">Merchandise (sold in POS)</option>
+                  <option value="OPERATING_SUPPLY">Operating Supply (station use only)</option>
+                </select>
+              </label>
+
+              <label className="field">
+                <span>{productCategory === "OPERATING_SUPPLY" ? "Supply name *" : "Product name *"}</span>
                 <input
                   ref={addNameInputRef}
                   type="text"
                   maxLength={80}
-                  placeholder="e.g. Push-Type Faucet"
+                  placeholder={
+                    productCategory === "OPERATING_SUPPLY"
+                      ? "e.g. Dishwashing Liquid"
+                      : "e.g. Push-Type Faucet"
+                  }
                   disabled={creatingProduct}
                   value={productName}
                   onChange={(e) => {
@@ -1619,7 +2021,11 @@ export function InventoryPage() {
                 <input
                   type="text"
                   maxLength={160}
-                  placeholder="e.g. Press to dispense water"
+                  placeholder={
+                    productCategory === "OPERATING_SUPPLY"
+                      ? "e.g. Used for sanitizing containers"
+                      : "e.g. Press to dispense water"
+                  }
                   disabled={creatingProduct}
                   value={productDescription}
                   onChange={(e) => {
@@ -1627,7 +2033,9 @@ export function InventoryPage() {
                     setAddProductError(null);
                   }}
                 />
-                <small>Shown on the POS product card when entered.</small>
+                {productCategory === "MERCHANDISE" && (
+                  <small>Shown on the POS product card when entered.</small>
+                )}
               </label>
 
               <div className="field-row">
@@ -1636,7 +2044,7 @@ export function InventoryPage() {
                   <input
                     type="text"
                     maxLength={30}
-                    placeholder="e.g. pcs"
+                    placeholder={productCategory === "OPERATING_SUPPLY" ? "e.g. L, kg, pcs" : "e.g. pcs"}
                     disabled={creatingProduct}
                     value={productUnit}
                     onChange={(e) => {
@@ -1644,23 +2052,58 @@ export function InventoryPage() {
                       setAddProductError(null);
                     }}
                   />
+                  <small>Enter deliveries and counts in this same unit (no pack conversion).</small>
                 </label>
 
-                <label className="field">
-                  <span>Selling price (₱) *</span>
+                {productCategory === "MERCHANDISE" ? (
+                  <label className="field">
+                    <span>Selling price (₱) *</span>
+                    <input
+                      type="text"
+                      inputMode="decimal"
+                      placeholder="e.g. 40.00"
+                      disabled={creatingProduct}
+                      value={productPriceInput}
+                      onChange={(e) => {
+                        setProductPriceInput(e.target.value);
+                        setAddProductError(null);
+                      }}
+                    />
+                  </label>
+                ) : (
+                  <label className="field">
+                    <span>Low stock alert level (optional)</span>
+                    <input
+                      type="text"
+                      inputMode={productAllowDecimal ? "decimal" : "numeric"}
+                      pattern={productAllowDecimal ? undefined : "[0-9]*"}
+                      placeholder="Leave blank for no alert"
+                      disabled={creatingProduct}
+                      value={productLowStockInput}
+                      onChange={(e) => {
+                        setProductLowStockInput(e.target.value);
+                        setAddProductError(null);
+                      }}
+                    />
+                    <small>Alerts in Dashboard when positive stock is at or below this level.</small>
+                  </label>
+                )}
+              </div>
+
+              {productCategory === "OPERATING_SUPPLY" && (
+                <label className="checkbox-field">
                   <input
-                    type="text"
-                    inputMode="decimal"
-                    placeholder="e.g. 40.00"
+                    type="checkbox"
+                    checked={productAllowDecimal}
                     disabled={creatingProduct}
-                    value={productPriceInput}
                     onChange={(e) => {
-                      setProductPriceInput(e.target.value);
+                      setProductAllowDecimal(e.target.checked);
                       setAddProductError(null);
                     }}
                   />
+                  <span>Allow decimal quantities (e.g. 1.25 L or 0.5 kg)</span>
                 </label>
-              </div>
+              )}
 
               <label className="checkbox-field">
                 <input
@@ -1675,72 +2118,76 @@ export function InventoryPage() {
                 <span>Confirm stock recording unit ({productUnit.trim() || "unit"}) *</span>
               </label>
 
-              <div className="inventory-pos-visibility-box">
-                <label className="checkbox-field">
-                  <input
-                    type="checkbox"
-                    checked={productShowInPos}
-                    disabled={creatingProduct}
-                    onChange={(e) => {
-                      setProductShowInPos(e.target.checked);
-                      setAddProductError(null);
-                    }}
-                  />
-                  <span>Show in POS</span>
-                </label>
+              {productCategory === "MERCHANDISE" && (
+                <>
+                  <div className="inventory-pos-visibility-box">
+                    <label className="checkbox-field">
+                      <input
+                        type="checkbox"
+                        checked={productShowInPos}
+                        disabled={creatingProduct}
+                        onChange={(e) => {
+                          setProductShowInPos(e.target.checked);
+                          setAddProductError(null);
+                        }}
+                      />
+                      <span>Show in POS</span>
+                    </label>
 
-                <PosSectionPicker
-                  label={`POS section ${productShowInPos ? "*" : "(optional while hidden)"}`}
-                  ariaLabel="POS section"
-                  value={productPosSection}
-                  onChange={(nextCode) => {
-                    setProductPosSection(nextCode);
-                    setAddProductError(null);
-                  }}
-                  sections={posSections}
-                  allowBlank
-                  disabled={creatingProduct}
-                  helperText="Controls which POS group displays this card when Show in POS is enabled. Opening physical stock is recorded separately after saving."
-                  onSectionCreated={handleSectionCreated}
-                />
-              </div>
+                    <PosSectionPicker
+                      label={`POS section ${productShowInPos ? "*" : "(optional while hidden)"}`}
+                      ariaLabel="POS section"
+                      value={productPosSection}
+                      onChange={(nextCode) => {
+                        setProductPosSection(nextCode);
+                        setAddProductError(null);
+                      }}
+                      sections={posSections}
+                      allowBlank
+                      disabled={creatingProduct}
+                      helperText="Controls which POS group displays this card when Show in POS is enabled. Opening physical stock is recorded separately after saving."
+                      onSectionCreated={handleSectionCreated}
+                    />
+                  </div>
 
-              <div className="field-row">
-                <label className="field">
-                  <span>Low stock alert level (optional)</span>
-                  <input
-                    type="text"
-                    inputMode="numeric"
-                    pattern="[0-9]*"
-                    placeholder="Leave blank for no alert"
-                    disabled={creatingProduct}
-                    value={productLowStockInput}
-                    onChange={(e) => {
-                      setProductLowStockInput(e.target.value);
-                      setAddProductError(null);
-                    }}
-                  />
-                  <small>Alerts in Dashboard when positive stock is at or below this count.</small>
-                </label>
+                  <div className="field-row">
+                    <label className="field">
+                      <span>Low stock alert level (optional)</span>
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        pattern="[0-9]*"
+                        placeholder="Leave blank for no alert"
+                        disabled={creatingProduct}
+                        value={productLowStockInput}
+                        onChange={(e) => {
+                          setProductLowStockInput(e.target.value);
+                          setAddProductError(null);
+                        }}
+                      />
+                      <small>Alerts in Dashboard when positive stock is at or below this count.</small>
+                    </label>
 
-                <label className="field">
-                  <span>Faucet reporting type (optional)</span>
-                  <select
-                    aria-label="Faucet reporting type"
-                    disabled={creatingProduct}
-                    value={productFaucetType}
-                    onChange={(e) => {
-                      setProductFaucetType(e.target.value as "" | FaucetReportingType);
-                      setAddProductError(null);
-                    }}
-                  >
-                    <option value="">Not classified</option>
-                    <option value="PUSH_TYPE">Push-Type Faucet</option>
-                    <option value="TWIST_TYPE">Twist-Type Faucet</option>
-                  </select>
-                  <small>Set only for standalone Push-Type or Twist-Type faucets.</small>
-                </label>
-              </div>
+                    <label className="field">
+                      <span>Faucet reporting type (optional)</span>
+                      <select
+                        aria-label="Faucet reporting type"
+                        disabled={creatingProduct}
+                        value={productFaucetType}
+                        onChange={(e) => {
+                          setProductFaucetType(e.target.value as "" | FaucetReportingType);
+                          setAddProductError(null);
+                        }}
+                      >
+                        <option value="">Not classified</option>
+                        <option value="PUSH_TYPE">Push-Type Faucet</option>
+                        <option value="TWIST_TYPE">Twist-Type Faucet</option>
+                      </select>
+                      <small>Set only for standalone Push-Type or Twist-Type faucets.</small>
+                    </label>
+                  </div>
+                </>
+              )}
 
               {addProductError && (
                 <div className="alert alert--error" role="alert">
@@ -1758,7 +2205,11 @@ export function InventoryPage() {
                   Cancel
                 </button>
                 <button type="submit" className="button button--primary" disabled={creatingProduct}>
-                  {creatingProduct ? "Saving product…" : "Save Product"}
+                  {creatingProduct
+                    ? "Saving…"
+                    : productCategory === "OPERATING_SUPPLY"
+                      ? "Save Operating Supply"
+                      : "Save Product"}
                 </button>
               </div>
             </form>
@@ -1776,17 +2227,26 @@ export function InventoryPage() {
           >
             <div className="detail-card__header">
               <div>
-                <h2 id="edit-product-title">Edit Product</h2>
+                <h2 id="edit-product-title">
+                  {editProductItem.category === "OPERATING_SUPPLY"
+                    ? "Edit Operating Supply"
+                    : "Edit Product"}
+                </h2>
                 <p className="muted-sm">
-                  Update details for <strong>{editProductItem.name}</strong>. Future POS sales use the updated details
-                  while saved sales keep their original snapshots.
+                  {editProductItem.category === "OPERATING_SUPPLY"
+                    ? `Update details for ${editProductItem.name}. To change its stock unit, archive this item and add a replacement with a new physical count.`
+                    : `Update details for ${editProductItem.name}. Future POS sales use the updated details while saved sales keep their original snapshots.`}
                 </p>
               </div>
             </div>
 
             <form className="subview" onSubmit={(event) => void handleSaveProductEdit(event)} noValidate>
               <label className="field">
-                <span>Product name *</span>
+                <span>
+                  {editProductItem.category === "OPERATING_SUPPLY"
+                    ? "Supply name *"
+                    : "Product name *"}
+                </span>
                 <input
                   ref={editNameInputRef}
                   type="text"
@@ -1818,90 +2278,115 @@ export function InventoryPage() {
                 <div className="field">
                   <span>Confirmed stock unit</span>
                   <div className="inventory-readonly-note">
-                    <strong>{editProductItem.unit}</strong> (unit cannot be changed after setup)
+                    <strong>{editProductItem.unit}</strong>{" "}
+                    {editProductItem.allowDecimalQuantity ? "(decimals allowed)" : "(whole units)"} — archive and
+                    add a replacement to change unit
                   </div>
                 </div>
 
-                <label className="field">
-                  <span>Selling price (₱) *</span>
-                  <input
-                    type="text"
-                    inputMode="decimal"
-                    disabled={savingEdit}
-                    value={editPriceInput}
-                    onChange={(e) => {
-                      setEditPriceInput(e.target.value);
-                      setEditError(null);
-                    }}
-                  />
-                </label>
+                {editProductItem.category === "MERCHANDISE" ? (
+                  <label className="field">
+                    <span>Selling price (₱) *</span>
+                    <input
+                      type="text"
+                      inputMode="decimal"
+                      disabled={savingEdit}
+                      value={editPriceInput}
+                      onChange={(e) => {
+                        setEditPriceInput(e.target.value);
+                        setEditError(null);
+                      }}
+                    />
+                  </label>
+                ) : (
+                  <label className="field">
+                    <span>Low stock alert level (optional)</span>
+                    <input
+                      type="text"
+                      inputMode={editProductItem.allowDecimalQuantity ? "decimal" : "numeric"}
+                      pattern={editProductItem.allowDecimalQuantity ? undefined : "[0-9]*"}
+                      placeholder="Leave blank to clear"
+                      disabled={savingEdit}
+                      value={editLowStockInput}
+                      onChange={(e) => {
+                        setEditLowStockInput(e.target.value);
+                        setEditError(null);
+                      }}
+                    />
+                    <small>Positive quantity in {editProductItem.unit}. Leave blank to remove alert.</small>
+                  </label>
+                )}
               </div>
 
-              <div className="inventory-pos-visibility-box">
-                <label className="checkbox-field">
-                  <input
-                    type="checkbox"
-                    checked={editShowInPos}
-                    disabled={savingEdit}
-                    onChange={(e) => {
-                      setEditShowInPos(e.target.checked);
-                      setEditError(null);
-                    }}
-                  />
-                  <span>Show in POS</span>
-                </label>
+              {editProductItem.category === "MERCHANDISE" && (
+                <>
+                  <div className="inventory-pos-visibility-box">
+                    <label className="checkbox-field">
+                      <input
+                        type="checkbox"
+                        checked={editShowInPos}
+                        disabled={savingEdit}
+                        onChange={(e) => {
+                          setEditShowInPos(e.target.checked);
+                          setEditError(null);
+                        }}
+                      />
+                      <span>Show in POS</span>
+                    </label>
 
-                <PosSectionPicker
-                  label={`POS section ${editShowInPos ? "*" : "(optional while hidden)"}`}
-                  ariaLabel="Edit POS section"
-                  value={editPosSection}
-                  onChange={(nextCode) => {
-                    setEditPosSection(nextCode);
-                    setEditError(null);
-                  }}
-                  sections={posSections}
-                  allowBlank
-                  disabled={savingEdit}
-                  onSectionCreated={handleSectionCreated}
-                />
-              </div>
+                    <PosSectionPicker
+                      label={`POS section ${editShowInPos ? "*" : "(optional while hidden)"}`}
+                      ariaLabel="Edit POS section"
+                      value={editPosSection}
+                      onChange={(nextCode) => {
+                        setEditPosSection(nextCode);
+                        setEditError(null);
+                      }}
+                      sections={posSections}
+                      allowBlank
+                      disabled={savingEdit}
+                      onSectionCreated={handleSectionCreated}
+                    />
+                  </div>
 
-              <div className="field-row">
-                <label className="field">
-                  <span>Low stock alert level (optional)</span>
-                  <input
-                    type="text"
-                    inputMode="numeric"
-                    pattern="[0-9]*"
-                    placeholder="Leave blank to clear"
-                    disabled={savingEdit}
-                    value={editLowStockInput}
-                    onChange={(e) => {
-                      setEditLowStockInput(e.target.value);
-                      setEditError(null);
-                    }}
-                  />
-                  <small>Positive count in {editProductItem.unit}. Leave blank to remove alert.</small>
-                </label>
+                  <div className="field-row">
+                    <label className="field">
+                      <span>Low stock alert level (optional)</span>
+                      <input
+                        type="text"
+                        inputMode="numeric"
+                        pattern="[0-9]*"
+                        placeholder="Leave blank to clear"
+                        disabled={savingEdit}
+                        value={editLowStockInput}
+                        onChange={(e) => {
+                          setEditLowStockInput(e.target.value);
+                          setEditError(null);
+                        }}
+                      />
+                      <small>Positive count in {editProductItem.unit}. Leave blank to remove alert.</small>
+                    </label>
 
-                <label className="field">
-                  <span>Faucet reporting type (optional)</span>
-                  <select
-                    aria-label="Edit faucet reporting type"
-                    disabled={savingEdit}
-                    value={editFaucetType}
-                    onChange={(e) => {
-                      setEditFaucetType(e.target.value as "" | FaucetReportingType);
-                      setEditError(null);
-                    }}
-                  >
-                    <option value="">Not classified</option>
-                    <option value="PUSH_TYPE">Push-Type Faucet</option>
-                    <option value="TWIST_TYPE">Twist-Type Faucet</option>
-                  </select>
-                  <small>Future POS sales snapshot this setting; saved sales stay unchanged.</small>
-                </label>
-              </div>
+                    <label className="field">
+                      <span>Faucet reporting type (optional)</span>
+                      <select
+                        aria-label="Edit faucet reporting type"
+                        disabled={savingEdit}
+                        value={editFaucetType}
+                        onChange={(e) => {
+                          setEditFaucetType(e.target.value as "" | FaucetReportingType);
+                          setEditError(null);
+                        }}
+                      >
+                        <option value="">Not classified</option>
+                        <option value="PUSH_TYPE">Push-Type Faucet</option>
+                        <option value="TWIST_TYPE">Twist-Type Faucet</option>
+                      </select>
+                      <small>Future POS sales snapshot this setting; saved sales stay unchanged.</small>
+                    </label>
+                  </div>
+                </>
+              )}
 
               {editError && (
                 <div className="alert alert--error" role="alert">
@@ -1995,9 +2480,11 @@ export function InventoryPage() {
           >
             <h2 id="archive-product-title">Archive {archiveItem.name}?</h2>
             <p className="muted-sm">
-              Archiving removes <strong>{archiveItem.name}</strong> from active Inventory and blocks new POS sales.
-              Its current balance ({formatQuantityLabel(archiveItem.currentQuantity, archiveItem.unit)}), opening
-              count, stock movements, past sales, and any already-started checkout recovery stay intact.
+              Archiving removes <strong>{archiveItem.name}</strong> from active Inventory
+              {archiveItem.category === "MERCHANDISE" ? " and blocks new POS sales" : ""}. Its current balance (
+              {formatQuantityLabel(archiveItem.currentQuantity, archiveItem.unit)}), opening count, stock
+              movements, and history stay intact in its original unit so you can set up a replacement item if
+              needed.
             </p>
 
             {archiveError && (
@@ -2088,8 +2575,8 @@ export function InventoryPage() {
                 <input
                   ref={reconcileCountInputRef}
                   type="text"
-                  inputMode="numeric"
-                  pattern="[0-9]*"
+                  inputMode={reconcileItem.allowDecimalQuantity ? "decimal" : "numeric"}
+                  pattern={reconcileItem.allowDecimalQuantity ? undefined : "[0-9]*"}
                   autoComplete="off"
                   placeholder="0"
                   disabled={reconciling}
@@ -2105,7 +2592,13 @@ export function InventoryPage() {
                     }
                   }}
                 />
-                <small>Count usable station-owned stock (0 or more).</small>
+                <small>
+                  Count usable station-owned stock (0 or more
+                  {reconcileItem.allowDecimalQuantity ? ", up to 4 decimals" : ""}).
+                  {reconcileItem.needsReconciliation
+                    ? " Confirming clears this item's discrepancy flag."
+                    : ""}
+                </small>
               </label>
 
               <label className="field">
@@ -2176,6 +2669,252 @@ export function InventoryPage() {
                     : reconcilePreview?.delta === 0
                       ? "Confirm Verification"
                       : "Confirm Stock Correction"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {receiveItem && canRecordReceiving && receiveItem.currentQuantity !== null && (
+        <div className="modal-backdrop" role="presentation">
+          <div
+            className="modal modal--wide"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="receive-stock-title"
+          >
+            <div className="detail-card__header">
+              <div>
+                <h2 id="receive-stock-title">Stock Received · {receiveItem.name}</h2>
+                <p className="muted-sm">
+                  Add delivered stock in {receiveItem.unit}. Delivery date is today (Asia/Manila); late-date
+                  coverage review is added in Task 2.
+                </p>
+              </div>
+            </div>
+
+            <dl className="detail-list">
+              <div className="detail-list__row">
+                <dt>Current balance</dt>
+                <dd>
+                  <strong>{formatQuantityLabel(receiveItem.currentQuantity, receiveItem.unit)}</strong>
+                </dd>
+              </div>
+              <div className="detail-list__row">
+                <dt>Delivery date (Asia/Manila)</dt>
+                <dd>{getTodayManilaDateString()}</dd>
+              </div>
+            </dl>
+
+            <form className="subview" onSubmit={(event) => void handleConfirmReceiving(event)} noValidate>
+              <label className="field">
+                <span>Quantity received ({receiveItem.unit}) *</span>
+                <input
+                  ref={receiveQtyInputRef}
+                  type="text"
+                  inputMode={receiveItem.allowDecimalQuantity ? "decimal" : "numeric"}
+                  pattern={receiveItem.allowDecimalQuantity ? undefined : "[0-9]*"}
+                  autoComplete="off"
+                  placeholder={receiveItem.allowDecimalQuantity ? "e.g. 2.5" : "e.g. 10"}
+                  disabled={receiving}
+                  value={receiveQtyInput}
+                  onChange={(e) => {
+                    setReceiveQtyInput(e.target.value);
+                    setReceiveError(null);
+                    setReceiveRequestKey(generateClientKey());
+                  }}
+                />
+                <small>
+                  Enter the delivered quantity in {receiveItem.unit}
+                  {receiveItem.allowDecimalQuantity ? " (up to 4 decimals)" : " (whole number)"}.
+                </small>
+              </label>
+
+              <label className="field">
+                <span>Note (optional)</span>
+                <input
+                  type="text"
+                  maxLength={240}
+                  placeholder="e.g. Supplier delivery invoice #104"
+                  disabled={receiving}
+                  value={receiveNoteInput}
+                  onChange={(e) => {
+                    setReceiveNoteInput(e.target.value);
+                    setReceiveError(null);
+                    setReceiveRequestKey(generateClientKey());
+                  }}
+                />
+              </label>
+
+              {receivePreviewAfter !== null && receiveParsedQty?.ok && (
+                <div className="inventory-reconcile-preview" role="status">
+                  <dl className="detail-list inventory-detail-list">
+                    <div className="detail-list__row">
+                      <dt>Current balance</dt>
+                      <dd>{formatQuantityLabel(receiveItem.currentQuantity, receiveItem.unit)}</dd>
+                    </div>
+                    <div className="detail-list__row">
+                      <dt>Adding</dt>
+                      <dd>
+                        <strong>{formatSignedDelta(receiveParsedQty.quantity, receiveItem.unit)}</strong>
+                      </dd>
+                    </div>
+                    <div className="detail-list__row">
+                      <dt>New balance</dt>
+                      <dd>
+                        <strong>{formatQuantityLabel(receivePreviewAfter, receiveItem.unit)}</strong>
+                      </dd>
+                    </div>
+                  </dl>
+                </div>
+              )}
+
+              {receiveError && (
+                <div className="alert alert--error" role="alert">
+                  {receiveError}
+                </div>
+              )}
+
+              <div className="modal__actions">
+                <button
+                  type="button"
+                  className="button button--ghost"
+                  disabled={receiving}
+                  onClick={() => setReceiveItem(null)}
+                >
+                  Cancel
+                </button>
+                <button type="submit" className="button button--primary" disabled={receiving}>
+                  {receiving ? "Saving…" : "Confirm Stock Received"}
+                </button>
+              </div>
+            </form>
+          </div>
+        </div>
+      )}
+
+      {useItem && canRecordUsage && useItem.currentQuantity !== null && (
+        <div className="modal-backdrop" role="presentation">
+          <div
+            className="modal modal--wide"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="use-stock-title"
+          >
+            <div className="detail-card__header">
+              <div>
+                <h2 id="use-stock-title">Stock Used · {useItem.name}</h2>
+                <p className="muted-sm">
+                  Record operating supply used today (Asia/Manila). Completing a Calendar activity does not
+                  deduct stock automatically.
+                </p>
+              </div>
+            </div>
+
+            <dl className="detail-list">
+              <div className="detail-list__row">
+                <dt>Current balance</dt>
+                <dd>
+                  <strong>{formatQuantityLabel(useItem.currentQuantity, useItem.unit)}</strong>
+                </dd>
+              </div>
+              <div className="detail-list__row">
+                <dt>Use date (Asia/Manila)</dt>
+                <dd>{getTodayManilaDateString()}</dd>
+              </div>
+            </dl>
+
+            <form className="subview" onSubmit={(event) => void handleConfirmUsage(event)} noValidate>
+              <label className="field">
+                <span>Quantity used ({useItem.unit}) *</span>
+                <input
+                  ref={useQtyInputRef}
+                  type="text"
+                  inputMode={useItem.allowDecimalQuantity ? "decimal" : "numeric"}
+                  pattern={useItem.allowDecimalQuantity ? undefined : "[0-9]*"}
+                  autoComplete="off"
+                  placeholder={useItem.allowDecimalQuantity ? "e.g. 1.5" : "e.g. 1"}
+                  disabled={recordingUse}
+                  value={useQtyInput}
+                  onChange={(e) => {
+                    setUseQtyInput(e.target.value);
+                    setUseError(null);
+                    setUseRequestKey(generateClientKey());
+                  }}
+                />
+                <small>
+                  Enter the actual amount used in {useItem.unit}
+                  {useItem.allowDecimalQuantity ? " (up to 4 decimals)" : " (whole number)"}.
+                </small>
+              </label>
+
+              <label className="field">
+                <span>Purpose *</span>
+                <input
+                  type="text"
+                  maxLength={240}
+                  placeholder="e.g. Container washing and station sanitation"
+                  disabled={recordingUse}
+                  value={usePurposeInput}
+                  onChange={(e) => {
+                    setUsePurposeInput(e.target.value);
+                    setUseError(null);
+                    setUseRequestKey(generateClientKey());
+                  }}
+                />
+              </label>
+
+              {usePreviewAfter !== null && useParsedQty?.ok && (
+                <div className="inventory-reconcile-preview" role="status">
+                  <dl className="detail-list inventory-detail-list">
+                    <div className="detail-list__row">
+                      <dt>Current balance</dt>
+                      <dd>{formatQuantityLabel(useItem.currentQuantity, useItem.unit)}</dd>
+                    </div>
+                    <div className="detail-list__row">
+                      <dt>Deducting</dt>
+                      <dd>
+                        <strong>{formatSignedDelta(-useParsedQty.quantity, useItem.unit)}</strong>
+                      </dd>
+                    </div>
+                    <div className="detail-list__row">
+                      <dt>New balance</dt>
+                      <dd>
+                        <strong>{formatQuantityLabel(usePreviewAfter, useItem.unit)}</strong>
+                      </dd>
+                    </div>
+                  </dl>
+                </div>
+              )}
+
+              {usePreviewAfter !== null && usePreviewAfter < 0 && (
+                <div className="callout callout--warning" role="status">
+                  <p className="callout__title">Balance will go below zero</p>
+                  <p className="callout__body">
+                    Actual usage will still be saved and {useItem.name} will be flagged for Owner
+                    physical-count reconciliation (INV-008/009).
+                  </p>
+                </div>
+              )}
+
+              {useError && (
+                <div className="alert alert--error" role="alert">
+                  {useError}
+                </div>
+              )}
+
+              <div className="modal__actions">
+                <button
+                  type="button"
+                  className="button button--ghost"
+                  disabled={recordingUse}
+                  onClick={() => setUseItem(null)}
+                >
+                  Cancel
+                </button>
+                <button type="submit" className="button button--primary" disabled={recordingUse}>
+                  {recordingUse ? "Saving…" : "Confirm Stock Used"}
                 </button>
               </div>
             </form>

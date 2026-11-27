@@ -2546,7 +2546,14 @@ describe("POS station day and refill sales", () => {
           WHERE item_id = $1`,
         [faucetId],
       );
-      expect(moveRows1).toEqual([
+      expect(
+        moveRows1.map((row) => ({
+          quantity_delta: Number(row.quantity_delta),
+          balance_before: Number(row.balance_before),
+          balance_after: Number(row.balance_after),
+          pos_reference: row.pos_reference,
+        })),
+      ).toEqual([
         {
           quantity_delta: -2,
           balance_before: 5,
@@ -3431,6 +3438,7 @@ describe("POS station day and refill sales", () => {
           "0018_calendar_recurrence.sql",
           "0019_calendar_history_and_cancellation.sql",
           "0020_calendar_completion_corrections.sql",
+          "0021_inventory_supplies_and_movements.sql",
         ]);
 
         const cashierAfter = await signIn(upgradeApp, "upcashier", upCashier.password);
@@ -3544,6 +3552,7 @@ describe("POS station day and refill sales", () => {
           "0018_calendar_recurrence.sql",
           "0019_calendar_history_and_cancellation.sql",
           "0020_calendar_completion_corrections.sql",
+          "0021_inventory_supplies_and_movements.sql",
         ]);
       } finally {
         await revisedDb.close();
@@ -3677,6 +3686,7 @@ describe("POS station day and refill sales", () => {
           "0018_calendar_recurrence.sql",
           "0019_calendar_history_and_cancellation.sql",
           "0020_calendar_completion_corrections.sql",
+          "0021_inventory_supplies_and_movements.sql",
         ]);
 
         const cashier = await signIn(upgradeApp, "f6cashier", upCashier.password);
@@ -3925,6 +3935,7 @@ describe("POS station day and refill sales", () => {
           "0018_calendar_recurrence.sql",
           "0019_calendar_history_and_cancellation.sql",
           "0020_calendar_completion_corrections.sql",
+          "0021_inventory_supplies_and_movements.sql",
         ]);
 
         const cashier = await signIn(upgradeApp, "f7cashier", upCashier.password);
@@ -4167,6 +4178,7 @@ describe("POS station day and refill sales", () => {
           "0018_calendar_recurrence.sql",
           "0019_calendar_history_and_cancellation.sql",
           "0020_calendar_completion_corrections.sql",
+          "0021_inventory_supplies_and_movements.sql",
         ]);
 
         // Cross Asia/Manila midnight with cash collection never started on draftRef
@@ -4554,7 +4566,13 @@ describe("POS station day and refill sales", () => {
           ORDER BY recorded_at ASC`,
         [faucetId],
       );
-      expect(faucetMovements).toEqual([
+      expect(
+        faucetMovements.map((row) => ({
+          movement_type: row.movement_type,
+          quantity_delta: Number(row.quantity_delta),
+          pos_reference: row.pos_reference,
+        })),
+      ).toEqual([
         { movement_type: "POS_SALE", quantity_delta: -1, pos_reference: savedRef },
         { movement_type: "PRIOR_DAY_SETTLEMENT", quantity_delta: -1, pos_reference: merchRef },
       ]);

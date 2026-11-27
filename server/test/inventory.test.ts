@@ -1,8 +1,11 @@
-import { mkdtemp, rm } from "node:fs/promises";
+import { copyFile, mkdtemp, readdir, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import request from "supertest";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { createApp } from "../src/app.js";
+import { createPgliteDatabase } from "../src/db/database.js";
+import { MIGRATIONS_DIR, runMigrations } from "../src/db/migrate.js";
 import { ManualClock } from "../src/shared/clock.js";
 import {
   activatedAccount,
@@ -105,6 +108,32 @@ async function postReconciliation(
     .send(payload as Record<string, unknown>);
 }
 
+async function postReceiving(
+  ctx: TestContext,
+  actor: SignedIn,
+  itemKey: string,
+  payload: unknown,
+) {
+  return request(ctx.app)
+    .post(`/api/inventory/items/${encodeURIComponent(itemKey)}/receiving`)
+    .set("Cookie", actor.cookie)
+    .set("X-CSRF-Token", actor.csrfToken)
+    .send(payload as Record<string, unknown>);
+}
+
+async function postUsage(
+  ctx: TestContext,
+  actor: SignedIn,
+  itemKey: string,
+  payload: unknown,
+) {
+  return request(ctx.app)
+    .post(`/api/inventory/items/${encodeURIComponent(itemKey)}/usage`)
+    .set("Cookie", actor.cookie)
+    .set("X-CSRF-Token", actor.csrfToken)
+    .send(payload as Record<string, unknown>);
+}
+
 describe("Inventory Round/Slim opening stock and merchandise products (DEC-065, DEC-068, DEC-069)", () => {
   let ctx: TestContext;
   let owner: Activated;
@@ -181,6 +210,9 @@ describe("Inventory Round/Slim opening stock and merchandise products (DEC-065, 
       canView: true,
       canInitializeOpeningStock: true,
       canCreateProduct: true,
+      canRecordReceiving: true,
+      canRecordUsage: true,
+      canReconcile: true,
     });
     expect(ownerRes.body.items).toHaveLength(2);
     expect(ownerRes.body.items[0]).toMatchObject({
@@ -212,6 +244,9 @@ describe("Inventory Round/Slim opening stock and merchandise products (DEC-065, 
       canView: true,
       canInitializeOpeningStock: false,
       canCreateProduct: false,
+      canRecordReceiving: false,
+      canRecordUsage: true,
+      canReconcile: false,
     });
     expect(cashierRes.body.items).toEqual(ownerRes.body.items);
 
@@ -1198,6 +1233,565 @@ describe("Inventory Round/Slim opening stock and merchandise products (DEC-065, 
       currentQuantity: 3,
       heldQuantity: 2,
       availableQuantity: 1,
+    });
+  });
+});
+
+describe("Final Inventory Task 1 — operating supplies, receiving, usage, and Dashboard Trend", () => {
+  let ctx: TestContext;
+  let owner: Activated;
+  let employee: Activated;
+
+  beforeEach(async () => {
+    ctx = await createTestContext({ clock: new ManualClock("2026-11-27T09:00:00+08:00") });
+    owner = await activatedAccount(ctx, "owner_inv1", "OWNER");
+    employee = await activatedAccount(ctx, "emp_inv1", "EMPLOYEE");
+  });
+
+  afterEach(async () => {
+    await ctx.close();
+  });
+
+  it("upgrades an existing pre-0021 database fixture preserving package, merchandise, and opening-count records", async () => {
+    const preDir = await mkdtemp(path.join(os.tmpdir(), "hydrop-pre0021-"));
+    const db = await createPgliteDatabase();
+    try {
+      const files = (await readdir(MIGRATIONS_DIR))
+        .filter((f) => /^\d{4}_.+\.sql$/.test(f) && !f.startsWith("0021_"))
+        .sort();
+      for (const file of files) {
+        await copyFile(path.join(MIGRATIONS_DIR, file), path.join(preDir, file));
+      }
+      await runMigrations(db, preDir);
+
+      const clock = new ManualClock("2026-11-27T09:30:00+08:00");
+      const app = createApp({ db, clock, secureCookies: false });
+      const localCtx: TestContext = { db, clock, app, close: () => db.close() };
+
+      const ownerAcct = await activatedAccount(localCtx, "upg_owner", "OWNER");
+      const empAcct = await activatedAccount(localCtx, "upg_emp", "EMPLOYEE");
+      const { rows: userRows } = await db.query<{ id: string; username: string }>(
+        `SELECT id, username FROM app_users WHERE username IN ('upg_owner', 'upg_emp')`,
+      );
+      const ownerId = userRows.find((u) => u.username === "upg_owner")!.id;
+      const empId = userRows.find((u) => u.username === "upg_emp")!.id;
+
+      // Seed pre-0021 Round opening count, standalone merchandise + opening count, and POS sale movement directly in SQL.
+      const { rows: roundRows } = await db.query<{ id: string }>(
+        `UPDATE inventory_items
+            SET show_in_pos = true,
+                pos_section = 'CONTAINERS',
+                current_quantity = 9,
+                stock_revision = 2
+          WHERE category = 'CONTAINER' AND container_shape = 'ROUND'
+          RETURNING id`,
+      );
+      const roundId = roundRows[0]!.id;
+      await db.query(
+        `INSERT INTO inventory_opening_counts (item_id, quantity, unit, recorded_by_user_id, recorded_at)
+         VALUES ($1, 10, 'containers', $2, '2026-11-26T08:00:00+08:00')`,
+        [roundId, ownerId],
+      );
+
+      const { rows: merchRows } = await db.query<{ id: string }>(
+        `INSERT INTO inventory_items (
+           code, name, category, unit, unit_price_centavos, show_in_pos, pos_section,
+           current_quantity, stock_revision, created_by_user_id, created_at
+         )
+         VALUES ('MERCH-UPG01', 'Push-Type Faucet', 'MERCHANDISE', 'pcs', 4000, true, 'CHANGE_OF_GRIPO', 4, 2, $1, '2026-11-26T08:00:00+08:00')
+         RETURNING id`,
+        [ownerId],
+      );
+      const merchId = merchRows[0]!.id;
+      await db.query(
+        `INSERT INTO inventory_opening_counts (item_id, quantity, unit, recorded_by_user_id, recorded_at)
+         VALUES ($1, 6, 'pcs', $2, '2026-11-26T08:00:00+08:00')`,
+        [merchId, ownerId],
+      );
+
+      const { rows: dayRows } = await db.query<{ id: string }>(
+        `INSERT INTO pos_business_days (business_date, started_by_user_id, started_at)
+         VALUES ('2026-11-26', $1, '2026-11-26T08:00:00+08:00')
+         RETURNING id`,
+        [ownerId],
+      );
+      const dayId = dayRows[0]!.id;
+
+      const { rows: checkoutRows } = await db.query<{ id: string }>(
+        `INSERT INTO pos_checkouts (
+           reference, business_day_id, business_date, created_by_user_id, status,
+           quote_snapshot, quote_hash, total_centavos, total_containers, total_volume_ml,
+           cash_received_centavos, change_centavos, created_at, updated_at
+         )
+         VALUES (
+           'POS-20261126-0001', $1, '2026-11-26', $2, 'SAVED',
+           '[]'::jsonb, 'hash-upg-1', 28000, 1, 25000,
+           30000, 2000, '2026-11-26T09:00:00+08:00', '2026-11-26T09:01:00+08:00'
+         )
+         RETURNING id`,
+        [dayId, empId],
+      );
+      const checkoutId = checkoutRows[0]!.id;
+
+      const { rows: saleRows } = await db.query<{ id: string }>(
+        `INSERT INTO pos_sales (
+           reference, checkout_id, business_day_id, business_date,
+           total_centavos, cash_received_centavos, change_centavos,
+           total_containers, total_volume_ml, created_by_user_id, created_at
+         )
+         VALUES (
+           'SALE-20261126-0001', $1, $2, '2026-11-26',
+           28000, 30000, 2000, 1, 25000, $3, '2026-11-26T09:01:00+08:00'
+         )
+         RETURNING id`,
+        [checkoutId, dayId, empId],
+      );
+      const saleId = saleRows[0]!.id;
+
+      await db.query(
+        `INSERT INTO inventory_stock_movements (
+           item_id, movement_type, quantity_delta, balance_before, balance_after,
+           unit, pos_sale_id, pos_reference, actor_user_id, recorded_at
+         )
+         VALUES
+           ($1, 'POS_SALE', -1, 10, 9, 'containers', $3, 'SALE-20261126-0001', $4, '2026-11-26T09:01:00+08:00'),
+           ($2, 'POS_SALE', -2, 6, 4, 'pcs', $3, 'SALE-20261126-0001', $4, '2026-11-26T09:01:00+08:00')`,
+        [roundId, merchId, saleId, empId],
+      );
+
+      // Apply migration 0021 onto the populated database.
+      const newlyApplied = await runMigrations(db, MIGRATIONS_DIR);
+      expect(newlyApplied).toEqual(["0021_inventory_supplies_and_movements.sql"]);
+
+      const afterItems = await request(app).get("/api/inventory/items").set("Cookie", empAcct.cookie);
+      expect(afterItems.status).toBe(200);
+      const roundAfter = afterItems.body.items.find((i: any) => i.shape === "ROUND");
+      const merchAfter = afterItems.body.items.find((i: any) => i.id === merchId);
+      expect(roundAfter).toMatchObject({
+        currentQuantity: 9,
+        allowDecimalQuantity: false,
+        needsReconciliation: false,
+        openingStock: { quantity: 10, unit: "containers" },
+      });
+      expect(merchAfter).toMatchObject({
+        currentQuantity: 4,
+        allowDecimalQuantity: false,
+        needsReconciliation: false,
+        openingStock: { quantity: 6, unit: "pcs" },
+      });
+
+      // Whole-piece items still reject fractional quantities after upgrade.
+      const badRec = await postReconciliation(localCtx, ownerAcct, "ROUND", {
+        physicalCount: 8.5,
+        reason: "Fractional test",
+        expectedRevision: roundAfter.stockRevision,
+        expectedCurrentQuantity: 9,
+        requestKey: "upg-bad-frac",
+      });
+      expect(badRec.status).toBe(400);
+
+      const badRecv = await postReceiving(localCtx, ownerAcct, merchId, {
+        quantity: 1.5,
+        requestKey: "upg-bad-recv",
+      });
+      expect(badRecv.status).toBe(400);
+
+      // Existing Dashboard Trend still verifies pre-0021 opening + POS_SALE movements cleanly after 0021.
+      const roundTrend = await request(app)
+        .get("/api/dashboard/stocks/ROUND/trend")
+        .set("Cookie", ownerAcct.cookie);
+      expect(roundTrend.status).toBe(200);
+      expect(roundTrend.body.historyState).toBe("COMPLETE");
+      expect(roundTrend.body.points.map((p: any) => p.balanceAfter)).toEqual([10, 9]);
+    } finally {
+      await db.close();
+      await rm(preDir, { recursive: true, force: true });
+    }
+  });
+
+  it("supports measurable operating supplies, decimal usage to negative with discrepancy flag, idempotency, permissions, and Dashboard Trend", async () => {
+    // 1. Create measurable operating supply (Dishwashing Liquid in L) and whole-piece operating supply (Container Seals in pcs).
+    const liquidRes = await postProduct(ctx, owner, {
+      category: "OPERATING_SUPPLY",
+      name: "Dishwashing Liquid",
+      description: "Sanitizing wash",
+      unit: "L",
+      allowDecimalQuantity: true,
+      unitConfirmed: true,
+      lowStockLevel: 0.5,
+    });
+    expect(liquidRes.status).toBe(201);
+    const liquidId = liquidRes.body.item.id as string;
+    expect(liquidRes.body.item).toMatchObject({
+      category: "OPERATING_SUPPLY",
+      unit: "L",
+      allowDecimalQuantity: true,
+      needsReconciliation: false,
+      showInPos: false,
+      unitPriceCentavos: null,
+      posSection: null,
+      lowStockLevel: 0.5,
+      status: "NOT_SET",
+      currentQuantity: null,
+    });
+
+    const sealsRes = await postProduct(ctx, owner, {
+      category: "OPERATING_SUPPLY",
+      name: "Container Seals",
+      unit: "pcs",
+      allowDecimalQuantity: false,
+      unitConfirmed: true,
+    });
+    expect(sealsRes.status).toBe(201);
+    const sealsId = sealsRes.body.item.id as string;
+
+    // Operating supplies reject POS fields; Merchandise rejects allowDecimalQuantity.
+    expect(
+      (
+        await postProduct(ctx, owner, {
+          category: "OPERATING_SUPPLY",
+          name: "Bad Supply",
+          unit: "kg",
+          unitConfirmed: true,
+          showInPos: true,
+        })
+      ).status,
+    ).toBe(400);
+    expect(
+      (
+        await postProduct(ctx, owner, {
+          category: "MERCHANDISE",
+          name: "Bad Merch",
+          unit: "pcs",
+          allowDecimalQuantity: true,
+          unitConfirmed: true,
+          unitPriceCentavos: 1000,
+        })
+      ).status,
+    ).toBe(400);
+
+    // Employee cannot create products, receive stock, or reconcile.
+    expect(
+      (
+        await postProduct(ctx, employee, {
+          category: "OPERATING_SUPPLY",
+          name: "Emp Supply",
+          unit: "pcs",
+          unitConfirmed: true,
+        })
+      ).status,
+    ).toBe(403);
+
+    // Not Set blocks both Stock Received and Stock Used.
+    const unsetRecv = await postReceiving(ctx, owner, liquidId, {
+      quantity: 1,
+      requestKey: "unset-recv",
+    });
+    expect(unsetRecv.status).toBe(409);
+    expect(unsetRecv.body.error.code).toBe("OPENING_STOCK_NOT_SET");
+
+    const unsetUse = await postUsage(ctx, employee, liquidId, {
+      quantity: 0.5,
+      purpose: "Cleaning",
+      requestKey: "unset-use",
+    });
+    expect(unsetUse.status).toBe(409);
+    expect(unsetUse.body.error.code).toBe("OPENING_STOCK_NOT_SET");
+
+    // Whole-piece supply rejects fractional opening count.
+    expect(
+      (await postOpeningStock(ctx, owner, sealsId, { quantity: 10.5 })).status,
+    ).toBe(400);
+    expect(
+      (await postOpeningStock(ctx, owner, sealsId, { quantity: 500 })).status,
+    ).toBe(201);
+
+    // Measurable supply initializes at 1.25 L.
+    const liquidOpen = await postOpeningStock(ctx, owner, liquidId, { quantity: 1.25 });
+    expect(liquidOpen.status).toBe(201);
+    expect(liquidOpen.body.item).toMatchObject({
+      status: "INITIALIZED",
+      currentQuantity: 1.25,
+      openingStock: { quantity: 1.25, unit: "L" },
+    });
+
+    // Late/future effectiveDate is blocked in Task 1 until Task 2 adds count-coverage review.
+    expect(
+      (
+        await postUsage(ctx, employee, liquidId, {
+          quantity: 0.25,
+          purpose: "Yesterday wash",
+          effectiveDate: "2026-11-26",
+          requestKey: "late-use-guard",
+        })
+      ).status,
+    ).toBe(400);
+    expect(
+      (
+        await postReceiving(ctx, owner, liquidId, {
+          quantity: 1,
+          effectiveDate: "2026-11-26",
+          requestKey: "late-recv-guard",
+        })
+      ).status,
+    ).toBe(400);
+
+    // Whole-piece supply rejects fractional receiving & usage.
+    expect(
+      (
+        await postReceiving(ctx, owner, sealsId, {
+          quantity: 2.5,
+          requestKey: "seals-bad-recv",
+        })
+      ).status,
+    ).toBe(400);
+    expect(
+      (
+        await postUsage(ctx, employee, sealsId, {
+          quantity: 1.2,
+          purpose: "Sealing",
+          requestKey: "seals-bad-use",
+        })
+      ).status,
+    ).toBe(400);
+
+    // Stock Used on non-operating-supply (ROUND) is rejected.
+    expect(
+      (await postOpeningStock(ctx, owner, "ROUND", { quantity: 5 })).status,
+    ).toBe(201);
+    expect(
+      (
+        await postUsage(ctx, employee, "ROUND", {
+          quantity: 1,
+          purpose: "Not a supply",
+          requestKey: "round-use",
+        })
+      ).status,
+    ).toBe(400);
+
+    // Employee records 1.5 L Stock Used -> reaches -0.25 L and sets needsReconciliation: true.
+    ctx.clock.advance(60_000);
+    const useRes = await postUsage(ctx, employee, liquidId, {
+      quantity: 1.5,
+      purpose: "Deep cleaning",
+      requestKey: "use-liquid-1",
+    });
+    expect(useRes.status).toBe(201);
+    expect(useRes.body.replayed).toBe(false);
+    expect(useRes.body.item).toMatchObject({
+      currentQuantity: -0.25,
+      needsReconciliation: true,
+    });
+    expect(useRes.body.movement).toMatchObject({
+      movementType: "STOCK_USED",
+      quantity: 1.5,
+      quantityDelta: -1.5,
+      balanceBefore: 1.25,
+      balanceAfter: -0.25,
+      unit: "L",
+      effectiveDate: "2026-11-27",
+      note: "Deep cleaning",
+      recordedBy: "emp_inv1",
+    });
+
+    // Repeat same requestKey -> 200 replayed with single stock effect.
+    const useReplay = await postUsage(ctx, employee, liquidId, {
+      quantity: 1.5,
+      purpose: "Deep cleaning",
+      requestKey: "use-liquid-1",
+    });
+    expect(useReplay.status).toBe(200);
+    expect(useReplay.body.replayed).toBe(true);
+    expect(useReplay.body.item.currentQuantity).toBe(-0.25);
+
+    // Reusing same requestKey with different quantity returns 409 REQUEST_KEY_CONFLICT.
+    const useConflict = await postUsage(ctx, employee, liquidId, {
+      quantity: 0.5,
+      purpose: "Deep cleaning",
+      requestKey: "use-liquid-1",
+    });
+    expect(useConflict.status).toBe(409);
+    expect(useConflict.body.error.code).toBe("REQUEST_KEY_CONFLICT");
+
+    // Employee cannot call receiving or reconciliation (403).
+    expect(
+      (
+        await postReceiving(ctx, employee, liquidId, {
+          quantity: 2,
+          requestKey: "emp-recv-403",
+        })
+      ).status,
+    ).toBe(403);
+    expect(
+      (
+        await postReconciliation(ctx, employee, liquidId, {
+          physicalCount: 2,
+          reason: "Emp attempt",
+          expectedRevision: useRes.body.item.stockRevision,
+          expectedCurrentQuantity: -0.25,
+          requestKey: "emp-rec-403",
+        })
+      ).status,
+    ).toBe(403);
+
+    // Owner records Stock Received +2 L -> balance becomes 1.75 L, but needsReconciliation stays true (INV-009)!
+    ctx.clock.advance(60_000);
+    const recvRes = await postReceiving(ctx, owner, liquidId, {
+      quantity: 2,
+      note: "Supplier jug delivery",
+      requestKey: "recv-liquid-1",
+    });
+    expect(recvRes.status).toBe(201);
+    expect(recvRes.body.item).toMatchObject({
+      currentQuantity: 1.75,
+      needsReconciliation: true,
+    });
+    expect(recvRes.body.movement).toMatchObject({
+      movementType: "STOCK_RECEIVED",
+      quantity: 2,
+      quantityDelta: 2,
+      balanceBefore: -0.25,
+      balanceAfter: 1.75,
+      effectiveDate: "2026-11-27",
+      note: "Supplier jug delivery",
+    });
+
+    // Repeat receiving requestKey -> replayed once.
+    const recvReplay = await postReceiving(ctx, owner, liquidId, {
+      quantity: 2,
+      note: "Supplier jug delivery",
+      requestKey: "recv-liquid-1",
+    });
+    expect(recvReplay.status).toBe(200);
+    expect(recvReplay.body.replayed).toBe(true);
+    expect(recvReplay.body.item.currentQuantity).toBe(1.75);
+
+    // Owner runs INV-009 physical count at 2 L -> balance becomes 2 and needsReconciliation clears to false.
+    ctx.clock.advance(60_000);
+    const recRes = await postReconciliation(ctx, owner, liquidId, {
+      physicalCount: 2,
+      reason: "Measured remaining bottle after refill",
+      expectedRevision: recvRes.body.item.stockRevision,
+      expectedCurrentQuantity: 1.75,
+      requestKey: "rec-liquid-1",
+    });
+    expect(recRes.status).toBe(201);
+    expect(recRes.body.item).toMatchObject({
+      currentQuantity: 2,
+      needsReconciliation: false,
+    });
+    expect(recRes.body.reconciliation).toMatchObject({
+      balanceBefore: 1.75,
+      physicalCount: 2,
+      quantityDelta: 0.25,
+      balanceAfter: 2,
+    });
+
+    // Dashboard Stock Trend reads opening + STOCK_USED + STOCK_RECEIVED + PHYSICAL_COUNT_RECONCILIATION cleanly; Employee gets 403.
+    const empTrend = await request(ctx.app)
+      .get(`/api/dashboard/stocks/${encodeURIComponent(liquidId)}/trend`)
+      .set("Cookie", employee.cookie);
+    expect(empTrend.status).toBe(403);
+
+    const ownerTrend = await request(ctx.app)
+      .get(`/api/dashboard/stocks/${encodeURIComponent(liquidId)}/trend`)
+      .set("Cookie", owner.cookie);
+    expect(ownerTrend.status).toBe(200);
+    expect(ownerTrend.body.historyState).toBe("COMPLETE");
+    expect(ownerTrend.body.item).toMatchObject({
+      unit: "L",
+      currentQuantity: 2,
+    });
+    expect(ownerTrend.body.points.map((p: any) => p.movementType)).toEqual([
+      "OPENING_COUNT",
+      "STOCK_USED",
+      "STOCK_RECEIVED",
+      "PHYSICAL_COUNT_RECONCILIATION",
+    ]);
+    expect(ownerTrend.body.points.map((p: any) => p.balanceAfter)).toEqual([1.25, -0.25, 1.75, 2]);
+  });
+
+  it("supports archiving an operating supply and replacing it in a new unit while retaining prior history (INV-039)", async () => {
+    const oldSalt = await postProduct(ctx, owner, {
+      category: "OPERATING_SUPPLY",
+      name: "Industrial Salt",
+      unit: "packs",
+      allowDecimalQuantity: false,
+      unitConfirmed: true,
+    });
+    expect(oldSalt.status).toBe(201);
+    const oldSaltId = oldSalt.body.item.id as string;
+
+    expect((await postOpeningStock(ctx, owner, oldSaltId, { quantity: 4 })).status).toBe(201);
+    ctx.clock.advance(60_000);
+    expect(
+      (
+        await postUsage(ctx, employee, oldSaltId, {
+          quantity: 1,
+          purpose: "Brine tank",
+          requestKey: "salt-use-1",
+        })
+      ).status,
+    ).toBe(201);
+
+    const archived = await archiveProduct(ctx, owner, oldSaltId);
+    expect(archived.status).toBe(200);
+    expect(archived.body.item.archivedAt).toBeTruthy();
+
+    // Archived supply blocks further receiving and usage.
+    expect(
+      (
+        await postReceiving(ctx, owner, oldSaltId, {
+          quantity: 2,
+          requestKey: "archived-recv",
+        })
+      ).status,
+    ).toBe(409);
+    expect(
+      (
+        await postUsage(ctx, employee, oldSaltId, {
+          quantity: 1,
+          purpose: "Blocked",
+          requestKey: "archived-use",
+        })
+      ).status,
+    ).toBe(409);
+
+    // Owner creates replacement in kg with a new opening count.
+    const newSalt = await postProduct(ctx, owner, {
+      category: "OPERATING_SUPPLY",
+      name: "Industrial Salt",
+      unit: "kg",
+      allowDecimalQuantity: true,
+      unitConfirmed: true,
+    });
+    expect(newSalt.status).toBe(201);
+    const newSaltId = newSalt.body.item.id as string;
+    expect(newSalt.body.item.status).toBe("NOT_SET");
+
+    const newOpen = await postOpeningStock(ctx, owner, newSaltId, { quantity: 25.5 });
+    expect(newOpen.status).toBe(201);
+    expect(newOpen.body.item).toMatchObject({
+      unit: "kg",
+      currentQuantity: 25.5,
+    });
+
+    // Archived record remains preserved in its original unit and balance when includeArchived=true.
+    const withArchived = await request(ctx.app)
+      .get("/api/inventory/items?includeArchived=true")
+      .set("Cookie", owner.cookie);
+    expect(withArchived.status).toBe(200);
+    const oldArchivedView = withArchived.body.items.find((i: any) => i.id === oldSaltId);
+    const newActiveView = withArchived.body.items.find((i: any) => i.id === newSaltId);
+    expect(oldArchivedView).toMatchObject({
+      unit: "packs",
+      currentQuantity: 3,
+      openingStock: { quantity: 4, unit: "packs" },
+    });
+    expect(newActiveView).toMatchObject({
+      unit: "kg",
+      currentQuantity: 25.5,
+      archivedAt: null,
     });
   });
 });

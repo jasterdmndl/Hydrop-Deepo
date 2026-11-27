@@ -1,17 +1,17 @@
 /** Pure formatting, grouping, reconciliation, and input helpers for Inventory. */
 
 export type ContainerShape = "ROUND" | "SLIM";
-export type InventoryCategory = "CONTAINER" | "MERCHANDISE";
+export type InventoryCategory = "CONTAINER" | "MERCHANDISE" | "OPERATING_SUPPLY";
 export type PosSection = string;
 export type FaucetReportingType = "PUSH_TYPE" | "TWIST_TYPE";
 export type OpeningStockStatus = "NOT_SET" | "INITIALIZED";
 export type InventoryCategoryFilter = string;
-export type StockStatusTone = "unset" | "out" | "in";
+export type StockStatusTone = "unset" | "out" | "in" | "low" | "discrepancy";
 export type InventoryLoadPhase = "initial-loading" | "initial-error" | "ready" | "refresh-error";
 
 export interface StockStatusMeta {
   tone: StockStatusTone;
-  label: "Not Set" | "No Stock" | "In Stock";
+  label: "Not Set" | "No Stock" | "In Stock" | "Low Stock" | "Needs Reconciliation";
 }
 
 export interface OpeningStockRecord {
@@ -76,6 +76,8 @@ export interface InventoryItemView {
   shape: ContainerShape | null;
   description?: string | null;
   unit: string;
+  allowDecimalQuantity?: boolean;
+  needsReconciliation?: boolean;
   unitPriceCentavos?: number | null;
   showInPos?: boolean;
   posSection?: PosSection | null;
@@ -96,10 +98,28 @@ export interface InventoryItemView {
   createdAt?: string;
 }
 
+export interface StockMovementView {
+  id: string;
+  itemId: string;
+  movementType: "STOCK_RECEIVED" | "STOCK_USED";
+  quantity: number;
+  quantityDelta: number;
+  balanceBefore: number;
+  balanceAfter: number;
+  unit: string;
+  effectiveDate: string | null;
+  note: string | null;
+  recordedBy: string;
+  recordedAt: string;
+}
+
 export interface InventoryPermissions {
   canView: boolean;
   canInitializeOpeningStock: boolean;
   canCreateProduct?: boolean;
+  canRecordReceiving?: boolean;
+  canRecordUsage?: boolean;
+  canReconcile?: boolean;
 }
 
 export interface InventoryItemsResponse {
@@ -115,60 +135,125 @@ export const DEFAULT_POS_SECTIONS: readonly PosSectionView[] = [
   { code: "CHANGE_OF_GRIPO", name: "Change of Gripo", isBuiltIn: true, sortOrder: 30 },
 ];
 
+export const QUANTITY_SCALE = 10_000;
 export const MAX_OPENING_QUANTITY = 1_000_000;
 export const MAX_UNIT_PRICE_CENTAVOS = 10_000_000;
 
 const MANILA_OFFSET_MS = 8 * 60 * 60 * 1000;
 const SHORT_MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"] as const;
 
-export function parseOpeningQuantityInput(
+function parseQuantityInputInternal(
   raw: string,
-  unit = "containers",
+  unit: string,
+  options: { allowDecimal: boolean; allowZero: boolean },
 ): { ok: true; quantity: number } | { ok: false; message: string } {
   const trimmed = raw.trim();
   const unitNoun = unit === "containers" ? "container" : unit;
   if (!trimmed) {
-    return { ok: false, message: `Enter the actual ${unitNoun} count (0 or more).` };
+    return {
+      ok: false,
+      message: options.allowZero
+        ? `Enter the actual ${unitNoun} count (0 or more).`
+        : `Enter a positive quantity of ${unit}.`,
+    };
   }
-  if (!/^\d+$/.test(trimmed)) {
-    return { ok: false, message: `Enter a whole number of ${unit} (0 or more).` };
+
+  const pattern = options.allowDecimal ? /^(?:\d+|\d*\.\d+)$/ : /^\d+$/;
+  if (!pattern.test(trimmed)) {
+    return {
+      ok: false,
+      message: options.allowDecimal
+        ? `Enter a valid number of ${unit} (up to 4 decimal places).`
+        : options.allowZero
+          ? `Enter a whole number of ${unit} (0 or more).`
+          : `Enter a positive whole number of ${unit}.`,
+    };
   }
+
+  if (options.allowDecimal && trimmed.includes(".")) {
+    const decimals = trimmed.split(".")[1] ?? "";
+    if (decimals.length > 4) {
+      return {
+        ok: false,
+        message: `Enter at most 4 decimal places for ${unit}.`,
+      };
+    }
+  }
+
   const quantity = Number(trimmed);
-  if (!Number.isSafeInteger(quantity) || quantity < 0 || quantity > MAX_OPENING_QUANTITY) {
-    return { ok: false, message: "Enter a whole number from 0 to 1,000,000." };
+  if (!Number.isFinite(quantity)) {
+    return { ok: false, message: `Enter a valid number of ${unit}.` };
   }
-  return { ok: true, quantity };
+  const scaled = Math.round(quantity * QUANTITY_SCALE);
+  const normalized = scaled / QUANTITY_SCALE;
+
+  if (options.allowZero) {
+    if (scaled < 0 || normalized > MAX_OPENING_QUANTITY) {
+      return {
+        ok: false,
+        message: options.allowDecimal
+          ? "Enter a quantity from 0 to 1,000,000."
+          : "Enter a whole number from 0 to 1,000,000.",
+      };
+    }
+  } else if (scaled <= 0 || normalized > MAX_OPENING_QUANTITY) {
+    return {
+      ok: false,
+      message: options.allowDecimal
+        ? "Enter a positive quantity up to 1,000,000."
+        : "Enter a whole number from 1 to 1,000,000.",
+    };
+  }
+
+  return { ok: true, quantity: normalized };
+}
+
+export function parseOpeningQuantityInput(
+  raw: string,
+  unit = "containers",
+  allowDecimal = false,
+): { ok: true; quantity: number } | { ok: false; message: string } {
+  return parseQuantityInputInternal(raw, unit, { allowDecimal, allowZero: true });
 }
 
 export function parsePhysicalCountInput(
   raw: string,
   unit = "containers",
+  allowDecimal = false,
 ): { ok: true; quantity: number } | { ok: false; message: string } {
-  return parseOpeningQuantityInput(raw, unit);
+  return parseQuantityInputInternal(raw, unit, { allowDecimal, allowZero: true });
+}
+
+export function parseMovementQuantityInput(
+  raw: string,
+  unit: string,
+  allowDecimal = false,
+): { ok: true; quantity: number } | { ok: false; message: string } {
+  return parseQuantityInputInternal(raw, unit, { allowDecimal, allowZero: false });
 }
 
 export function parseLowStockLevelInput(
   raw: string,
   unit = "units",
+  allowDecimal = false,
 ): { ok: true; value: number | null } | { ok: false; message: string } {
   const trimmed = raw.trim();
   if (!trimmed) {
     return { ok: true, value: null };
   }
-  if (!/^\d+$/.test(trimmed)) {
+  const parsed = parseQuantityInputInternal(trimmed, unit, {
+    allowDecimal,
+    allowZero: false,
+  });
+  if (!parsed.ok) {
     return {
       ok: false,
-      message: `Enter a positive whole number of ${unit} (1 or more), or leave blank to clear.`,
+      message: allowDecimal
+        ? `Enter a positive quantity of ${unit} (up to 4 decimals), or leave blank to clear.`
+        : `Enter a positive whole number of ${unit} (1 or more), or leave blank to clear.`,
     };
   }
-  const value = Number(trimmed);
-  if (!Number.isSafeInteger(value) || value < 1 || value > MAX_OPENING_QUANTITY) {
-    return {
-      ok: false,
-      message: `Enter a whole number from 1 to ${MAX_OPENING_QUANTITY.toLocaleString("en-US")}, or leave blank to clear.`,
-    };
-  }
-  return { ok: true, value };
+  return { ok: true, value: parsed.quantity };
 }
 
 export function formatFaucetReportingTypeLabel(
@@ -193,20 +278,34 @@ export function computeReconciliationPreview(
   delta: number;
   after: number;
 } {
+  const delta =
+    (Math.round(physicalCount * QUANTITY_SCALE) - Math.round(currentQuantity * QUANTITY_SCALE)) /
+    QUANTITY_SCALE;
   return {
     before: currentQuantity,
     physicalCount,
-    delta: physicalCount - currentQuantity,
+    delta: Object.is(delta, -0) ? 0 : delta,
     after: physicalCount,
   };
 }
 
+export function formatQuantityNumber(value: number): string {
+  const scaled = Math.round(value * QUANTITY_SCALE);
+  if (scaled === 0) return "0";
+  const normalized = scaled / QUANTITY_SCALE;
+  const abs = Math.abs(normalized);
+  const text = Number.isInteger(abs) ? String(abs) : String(Number(abs.toFixed(4)));
+  return normalized < 0 ? `−${text}` : text;
+}
+
 export function formatSignedDelta(delta: number, unit: string): string {
-  if (delta === 0) {
+  const scaled = Math.round(delta * QUANTITY_SCALE);
+  if (scaled === 0) {
     return `0 ${unit === "containers" ? "containers" : unit} (Verified match)`;
   }
-  const absLabel = formatQuantityLabel(Math.abs(delta), unit);
-  return delta > 0 ? `+${absLabel}` : `−${absLabel}`;
+  const absVal = Math.abs(scaled / QUANTITY_SCALE);
+  const absLabel = formatQuantityLabel(absVal, unit);
+  return scaled > 0 ? `+${absLabel}` : `−${absLabel}`;
 }
 
 export function parsePesoPriceToCentavos(raw: string): number | null {
@@ -242,8 +341,16 @@ export function formatQuantityLabel(quantity: number | null, unit: string): stri
   if (quantity === null) {
     return "Not Set";
   }
-  const unitLabel = quantity === 1 && unit === "containers" ? "container" : unit;
-  return `${quantity} ${unitLabel}`;
+  const unitLabel = Math.abs(quantity) === 1 && unit === "containers" ? "container" : unit;
+  return `${formatQuantityNumber(quantity)} ${unitLabel}`;
+}
+
+export function getTodayManilaDateString(now: Date = new Date()): string {
+  const shifted = new Date(now.getTime() + MANILA_OFFSET_MS);
+  const year = shifted.getUTCFullYear();
+  const month = String(shifted.getUTCMonth() + 1).padStart(2, "0");
+  const day = String(shifted.getUTCDate()).padStart(2, "0");
+  return `${year}-${month}-${day}`;
 }
 
 export function formatRecordedAtManila(iso: string): string {
@@ -279,8 +386,19 @@ export function getStockStatusMeta(item: InventoryItemView): StockStatusMeta {
   if (item.status === "NOT_SET" || item.currentQuantity === null) {
     return { tone: "unset", label: "Not Set" };
   }
+  if (item.needsReconciliation || item.currentQuantity < 0) {
+    return { tone: "discrepancy", label: "Needs Reconciliation" };
+  }
   if (item.currentQuantity === 0) {
     return { tone: "out", label: "No Stock" };
+  }
+  if (
+    item.lowStockLevel !== undefined &&
+    item.lowStockLevel !== null &&
+    item.lowStockLevel > 0 &&
+    item.currentQuantity <= item.lowStockLevel
+  ) {
+    return { tone: "low", label: "Low Stock" };
   }
   return { tone: "in", label: "In Stock" };
 }
@@ -299,7 +417,7 @@ export function getInventorySummaryCounts(items: InventoryItemView[]): {
     const { tone } = getStockStatusMeta(item);
     if (tone === "unset") {
       notSet += 1;
-    } else if (tone === "out") {
+    } else if (tone === "out" || (item.currentQuantity !== null && item.currentQuantity <= 0)) {
       noStock += 1;
     } else {
       inStock += 1;
@@ -349,6 +467,9 @@ export function getInventoryItemGroup(
 ): string {
   if (item.category === "CONTAINER") {
     return "CONTAINER";
+  }
+  if (item.category === "OPERATING_SUPPLY") {
+    return "OPERATING_SUPPLY";
   }
   if (item.posSection && item.posSection !== "CONTAINERS") {
     const known =
@@ -420,6 +541,16 @@ export function groupInventoryItems(
       title: "Other Products",
       metaPrefix: "Unassigned POS section",
       items: otherItems,
+    });
+  }
+
+  const supplyItems = buckets.get("OPERATING_SUPPLY");
+  if (supplyItems && supplyItems.length > 0) {
+    result.push({
+      key: "OPERATING_SUPPLY",
+      title: "Operating Supplies",
+      metaPrefix: "Station supplies",
+      items: supplyItems,
     });
   }
 

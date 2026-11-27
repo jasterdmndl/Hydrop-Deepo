@@ -3229,6 +3229,18 @@ textarea:focus-visible {
   color: #166534;
 }
 
+.inventory-status-pill--low {
+  background: #ffedd5;
+  border-color: #fed7aa;
+  color: #9a3412;
+}
+
+.inventory-status-pill--discrepancy {
+  background: #fee2e2;
+  border-color: #fca5a5;
+  color: #991b1b;
+}
+
 .inventory-load-alert {
   display: flex;
   flex-wrap: wrap;
@@ -3551,8 +3563,14 @@ textarea:focus-visible {
 
 .inventory-card-reconcile-row {
   display: flex;
+  flex-wrap: wrap;
   justify-content: flex-end;
+  gap: 8px;
   padding-top: 2px;
+}
+
+.inventory-item-card__qty--negative {
+  color: #b91c1c;
 }
 
 .inventory-reconcile-preview {

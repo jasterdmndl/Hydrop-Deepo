@@ -5,19 +5,24 @@ import { requireRole } from "../auth/guards.js";
 import {
   BUILT_IN_POS_SECTIONS,
   type FaucetReportingType,
+  formatManilaDate,
   inventoryPermissions,
   isUuid,
   MAX_OPENING_QUANTITY,
   parseContainerShape,
   parseFaucetReportingType,
   parseLowStockLevel,
+  parseManilaDate,
+  parseMovementNote,
   parseOpeningQuantity,
   parsePhysicalCount,
   parsePosSectionCode,
   parsePosSectionName,
   parseProductDescription,
   parseProductName,
+  parseQuantity,
   parseReconciliationReason,
+  parseRequestKey,
   parseStockUnit,
   parseUnitPriceCentavos,
   type PosSection,
@@ -25,10 +30,12 @@ import {
 import { inventoryRepository as repo, type OpeningStockTarget } from "./repository.js";
 
 const CREATE_PRODUCT_KEYS = new Set([
+  "category",
   "name",
   "description",
   "unit",
   "unitConfirmed",
+  "allowDecimalQuantity",
   "unitPriceCentavos",
   "showInPos",
   "posSection",
@@ -55,6 +62,8 @@ const RECONCILE_KEYS = new Set([
   "expectedCurrentQuantity",
   "requestKey",
 ]);
+const RECEIVING_KEYS = new Set(["quantity", "effectiveDate", "note", "requestKey"]);
+const USAGE_KEYS = new Set(["quantity", "purpose", "effectiveDate", "requestKey"]);
 
 function resolveItemTarget(rawKey: string): OpeningStockTarget | null {
   const shape = parseContainerShape(rawKey);
@@ -141,6 +150,29 @@ export function inventoryRoutes(db: Database): Router {
       return;
     }
 
+    const rawCategory = body.category === undefined ? "MERCHANDISE" : body.category;
+    if (rawCategory !== "MERCHANDISE" && rawCategory !== "OPERATING_SUPPLY") {
+      sendError(res, 400, "VALIDATION_FAILED", "Choose Merchandise or Operating Supply.");
+      return;
+    }
+    const category = rawCategory;
+
+    const allowDecimalQuantity =
+      body.allowDecimalQuantity === undefined ? false : body.allowDecimalQuantity;
+    if (typeof allowDecimalQuantity !== "boolean") {
+      sendError(res, 400, "VALIDATION_FAILED", "Allow decimal quantities must be checked or unchecked.");
+      return;
+    }
+    if (category === "MERCHANDISE" && allowDecimalQuantity) {
+      sendError(
+        res,
+        400,
+        "VALIDATION_FAILED",
+        "Merchandise sold in POS must use whole-piece stock quantities.",
+      );
+      return;
+    }
+
     const name = parseProductName(body.name);
     if (!name) {
       sendError(res, 400, "VALIDATION_FAILED", "Enter a product name (1 to 80 characters).");
@@ -164,87 +196,119 @@ export function inventoryRoutes(db: Database): Router {
       return;
     }
 
-    const unitPriceCentavos = parseUnitPriceCentavos(body.unitPriceCentavos);
-    if (unitPriceCentavos === null) {
-      sendError(res, 400, "VALIDATION_FAILED", "Enter a valid positive selling price.");
-      return;
-    }
+    let unitPriceCentavos: number | null = null;
+    let showInPos = false;
+    let validatedSection: string | null = null;
+    let faucetReportingType: FaucetReportingType | null = null;
 
-    const showInPos = body.showInPos === undefined ? false : body.showInPos;
-    if (typeof showInPos !== "boolean") {
-      sendError(res, 400, "VALIDATION_FAILED", "Show in POS must be checked or unchecked.");
-      return;
-    }
-
-    const sectionResult = parsePosSectionCode(body.posSection);
-    if (!sectionResult.ok) {
-      sendError(res, 400, "VALIDATION_FAILED", "Choose a valid POS section for this product.");
-      return;
-    }
-
-    let validatedSection: string | null = sectionResult.value;
-    if (validatedSection !== null) {
-      if (validatedSection === BUILT_IN_POS_SECTIONS.CONTAINERS) {
+    if (category === "OPERATING_SUPPLY") {
+      if (
+        (body.unitPriceCentavos !== undefined && body.unitPriceCentavos !== null) ||
+        body.showInPos === true ||
+        (body.posSection !== undefined && body.posSection !== null && body.posSection !== "") ||
+        (body.faucetReportingType !== undefined &&
+          body.faucetReportingType !== null &&
+          body.faucetReportingType !== "")
+      ) {
         sendError(
           res,
           400,
           "VALIDATION_FAILED",
-          "The Containers POS section is reserved for Round and Slim containers.",
+          "Operating supplies do not use POS selling prices, POS sections, or faucet tags.",
         );
         return;
       }
-      const foundSection = await repo.findPosSectionByCode(db, validatedSection);
-      if (!foundSection) {
+      if (body.showInPos !== undefined && typeof body.showInPos !== "boolean") {
+        sendError(res, 400, "VALIDATION_FAILED", "Show in POS must be checked or unchecked.");
+        return;
+      }
+    } else {
+      unitPriceCentavos = parseUnitPriceCentavos(body.unitPriceCentavos);
+      if (unitPriceCentavos === null) {
+        sendError(res, 400, "VALIDATION_FAILED", "Enter a valid positive selling price.");
+        return;
+      }
+
+      const rawShowInPos = body.showInPos === undefined ? false : body.showInPos;
+      if (typeof rawShowInPos !== "boolean") {
+        sendError(res, 400, "VALIDATION_FAILED", "Show in POS must be checked or unchecked.");
+        return;
+      }
+      showInPos = rawShowInPos;
+
+      const sectionResult = parsePosSectionCode(body.posSection);
+      if (!sectionResult.ok) {
         sendError(res, 400, "VALIDATION_FAILED", "Choose a valid POS section for this product.");
         return;
       }
-      validatedSection = foundSection.code;
-    }
 
-    if (showInPos && !validatedSection) {
-      sendError(
-        res,
-        400,
-        "VALIDATION_FAILED",
-        "Choose a POS section when Show in POS is enabled.",
-      );
-      return;
+      validatedSection = sectionResult.value;
+      if (validatedSection !== null) {
+        if (validatedSection === BUILT_IN_POS_SECTIONS.CONTAINERS) {
+          sendError(
+            res,
+            400,
+            "VALIDATION_FAILED",
+            "The Containers POS section is reserved for Round and Slim containers.",
+          );
+          return;
+        }
+        const foundSection = await repo.findPosSectionByCode(db, validatedSection);
+        if (!foundSection) {
+          sendError(res, 400, "VALIDATION_FAILED", "Choose a valid POS section for this product.");
+          return;
+        }
+        validatedSection = foundSection.code;
+      }
+
+      if (showInPos && !validatedSection) {
+        sendError(
+          res,
+          400,
+          "VALIDATION_FAILED",
+          "Choose a POS section when Show in POS is enabled.",
+        );
+        return;
+      }
+
+      if (body.faucetReportingType !== undefined) {
+        const faucetResult = parseFaucetReportingType(body.faucetReportingType);
+        if (!faucetResult.ok) {
+          sendError(
+            res,
+            400,
+            "VALIDATION_FAILED",
+            "Choose Push-Type, Twist-Type, or Not classified for faucet reporting type.",
+          );
+          return;
+        }
+        faucetReportingType = faucetResult.value;
+      }
     }
 
     let lowStockLevel: number | null = null;
     if (body.lowStockLevel !== undefined) {
-      const lowStockResult = parseLowStockLevel(body.lowStockLevel);
+      const lowStockResult = parseLowStockLevel(body.lowStockLevel, allowDecimalQuantity);
       if (!lowStockResult.ok) {
         sendError(
           res,
           400,
           "VALIDATION_FAILED",
-          "Low stock alert level must be a positive whole number (1 to 1,000,000), or cleared.",
+          allowDecimalQuantity
+            ? "Low stock alert level must be a positive quantity (up to 4 decimals, max 1,000,000), or cleared."
+            : "Low stock alert level must be a positive whole number (1 to 1,000,000), or cleared.",
         );
         return;
       }
       lowStockLevel = lowStockResult.value;
     }
 
-    let faucetReportingType: FaucetReportingType | null = null;
-    if (body.faucetReportingType !== undefined) {
-      const faucetResult = parseFaucetReportingType(body.faucetReportingType);
-      if (!faucetResult.ok) {
-        sendError(
-          res,
-          400,
-          "VALIDATION_FAILED",
-          "Choose Push-Type, Twist-Type, or Not classified for faucet reporting type.",
-        );
-        return;
-      }
-      faucetReportingType = faucetResult.value;
-    }
-
-    const outcome = await repo.createMerchandiseProduct(db, {
+    const outcome = await repo.createInventoryProduct(db, {
+      category,
       name,
       description: descResult.value,
       unit,
+      allowDecimalQuantity,
       unitPriceCentavos,
       showInPos,
       posSection: validatedSection,
@@ -281,9 +345,9 @@ export function inventoryRoutes(db: Database): Router {
       return;
     }
 
-    const existing = await repo.findMerchandiseById(db, id);
+    const existing = await repo.findEditableProductById(db, id);
     if (!existing) {
-      sendError(res, 404, "NOT_FOUND", "Merchandise product not found.");
+      sendError(res, 404, "NOT_FOUND", "Inventory product not found.");
       return;
     }
     if (existing.archivedAt !== null) {
@@ -292,6 +356,22 @@ export function inventoryRoutes(db: Database): Router {
         409,
         "PRODUCT_ARCHIVED",
         "Archived products cannot be edited in active Inventory.",
+      );
+      return;
+    }
+
+    if (
+      existing.category === "OPERATING_SUPPLY" &&
+      ("unitPriceCentavos" in body ||
+        "showInPos" in body ||
+        "posSection" in body ||
+        "faucetReportingType" in body)
+    ) {
+      sendError(
+        res,
+        400,
+        "VALIDATION_FAILED",
+        "Operating supplies do not use POS selling prices, POS sections, or faucet tags.",
       );
       return;
     }
@@ -370,13 +450,15 @@ export function inventoryRoutes(db: Database): Router {
     }
 
     if ("lowStockLevel" in body) {
-      const lowStockResult = parseLowStockLevel(body.lowStockLevel);
+      const lowStockResult = parseLowStockLevel(body.lowStockLevel, existing.allowDecimalQuantity);
       if (!lowStockResult.ok) {
         sendError(
           res,
           400,
           "VALIDATION_FAILED",
-          "Low stock alert level must be a positive whole number (1 to 1,000,000), or cleared.",
+          existing.allowDecimalQuantity
+            ? "Low stock alert level must be a positive quantity (up to 4 decimals, max 1,000,000), or cleared."
+            : "Low stock alert level must be a positive whole number (1 to 1,000,000), or cleared.",
         );
         return;
       }
@@ -397,10 +479,10 @@ export function inventoryRoutes(db: Database): Router {
       patch.faucetReportingType = faucetResult.value;
     }
 
-    const outcome = await repo.updateMerchandiseProduct(db, patch);
+    const outcome = await repo.updateInventoryProduct(db, patch);
 
     if (outcome.kind === "not-found") {
-      sendError(res, 404, "NOT_FOUND", "Merchandise product not found.");
+      sendError(res, 404, "NOT_FOUND", "Inventory product not found.");
       return;
     }
     if (outcome.kind === "archived") {
@@ -409,6 +491,26 @@ export function inventoryRoutes(db: Database): Router {
         409,
         "PRODUCT_ARCHIVED",
         "Archived products cannot be edited in active Inventory.",
+      );
+      return;
+    }
+    if (outcome.kind === "invalid-supply-fields") {
+      sendError(
+        res,
+        400,
+        "VALIDATION_FAILED",
+        "Operating supplies do not use POS selling prices, POS sections, or faucet tags.",
+      );
+      return;
+    }
+    if (outcome.kind === "invalid-low-stock") {
+      sendError(
+        res,
+        400,
+        "VALIDATION_FAILED",
+        outcome.allowDecimalQuantity
+          ? "Low stock alert level must be a positive quantity (up to 4 decimals, max 1,000,000), or cleared."
+          : "Low stock alert level must be a positive whole number (1 to 1,000,000), or cleared.",
       );
       return;
     }
@@ -498,14 +600,14 @@ export function inventoryRoutes(db: Database): Router {
       return;
     }
 
-    const outcome = await repo.archiveMerchandiseProduct(db, {
+    const outcome = await repo.archiveInventoryProduct(db, {
       id,
       archivedByUserId: req.auth!.user.id,
       archivedAt: req.now,
     });
 
     if (outcome.kind === "not-found") {
-      sendError(res, 404, "NOT_FOUND", "Merchandise product not found.");
+      sendError(res, 404, "NOT_FOUND", "Inventory product not found.");
       return;
     }
     if (outcome.kind === "cannot-archive-container") {
@@ -540,19 +642,19 @@ export function inventoryRoutes(db: Database): Router {
 
     const body = req.body as Record<string, unknown> | null | undefined;
     if (!body || typeof body !== "object" || Array.isArray(body)) {
-      sendError(res, 400, "VALIDATION_FAILED", "Enter a whole number (0 or more).");
+      sendError(res, 400, "VALIDATION_FAILED", "Enter a valid opening count (0 or more).");
       return;
     }
 
     const extraKeys = Object.keys(body).filter((key) => key !== "quantity");
     if (extraKeys.length > 0) {
-      sendError(res, 400, "VALIDATION_FAILED", "Enter a whole number (0 or more).");
+      sendError(res, 400, "VALIDATION_FAILED", "Enter a valid opening count (0 or more).");
       return;
     }
 
-    const quantity = parseOpeningQuantity(body.quantity);
+    const quantity = parseOpeningQuantity(body.quantity, true);
     if (quantity === null) {
-      sendError(res, 400, "VALIDATION_FAILED", "Enter a whole number (0 or more).");
+      sendError(res, 400, "VALIDATION_FAILED", "Enter a valid opening count (0 or more).");
       return;
     }
 
@@ -565,6 +667,15 @@ export function inventoryRoutes(db: Database): Router {
 
     if (outcome.kind === "not-found") {
       sendError(res, 404, "NOT_FOUND", "Inventory item not found.");
+      return;
+    }
+    if (outcome.kind === "invalid-quantity") {
+      sendError(
+        res,
+        400,
+        "VALIDATION_FAILED",
+        `Enter a whole number of ${outcome.unit} (0 or more).`,
+      );
       return;
     }
     if (outcome.kind === "archived") {
@@ -628,13 +739,13 @@ export function inventoryRoutes(db: Database): Router {
       return;
     }
 
-    const physicalCount = parsePhysicalCount(body.physicalCount);
+    const physicalCount = parsePhysicalCount(body.physicalCount, true);
     if (physicalCount === null) {
       sendError(
         res,
         400,
         "VALIDATION_FAILED",
-        `Enter a whole physical count from 0 to ${MAX_OPENING_QUANTITY.toLocaleString("en-US")}.`,
+        `Enter a valid physical count from 0 to ${MAX_OPENING_QUANTITY.toLocaleString("en-US")}.`,
       );
       return;
     }
@@ -659,26 +770,20 @@ export function inventoryRoutes(db: Database): Router {
       return;
     }
 
-    if (
-      typeof body.expectedCurrentQuantity !== "number" ||
-      !Number.isInteger(body.expectedCurrentQuantity) ||
-      body.expectedCurrentQuantity < 0
-    ) {
+    const expectedCurrentQuantity = parseQuantity(body.expectedCurrentQuantity, {
+      allowDecimal: true,
+      allowZero: true,
+      allowNegative: true,
+    });
+    if (expectedCurrentQuantity === null) {
       sendError(res, 400, "VALIDATION_FAILED", "Invalid recorded stock baseline.");
       return;
     }
 
-    let requestKey: string | null = null;
-    if (body.requestKey !== undefined) {
-      if (
-        typeof body.requestKey !== "string" ||
-        !body.requestKey.trim() ||
-        body.requestKey.trim().length > 128
-      ) {
-        sendError(res, 400, "VALIDATION_FAILED", "Invalid reconciliation request key.");
-        return;
-      }
-      requestKey = body.requestKey.trim();
+    const requestKeyResult = parseRequestKey(body.requestKey);
+    if (!requestKeyResult.ok) {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid reconciliation request key.");
+      return;
     }
 
     const outcome = await repo.recordPhysicalCountReconciliation(db, {
@@ -686,14 +791,27 @@ export function inventoryRoutes(db: Database): Router {
       physicalCount,
       reason,
       expectedRevision: body.expectedRevision,
-      expectedCurrentQuantity: body.expectedCurrentQuantity,
-      requestKey,
+      expectedCurrentQuantity,
+      requestKey: requestKeyResult.value,
       actorUserId: req.auth!.user.id,
       recordedAt: req.now,
     });
 
     if (outcome.kind === "not-found") {
       sendError(res, 404, "NOT_FOUND", "Inventory item not found.");
+      return;
+    }
+    if (outcome.kind === "invalid-quantity") {
+      sendError(
+        res,
+        400,
+        "VALIDATION_FAILED",
+        `Enter a whole physical count of ${outcome.unit} (0 or more).`,
+      );
+      return;
+    }
+    if (outcome.kind === "invalid-baseline") {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid recorded stock baseline.");
       return;
     }
     if (outcome.kind === "archived") {
@@ -771,6 +889,274 @@ export function inventoryRoutes(db: Database): Router {
     res.status(outcome.kind === "replayed" ? 200 : 201).json({
       item: outcome.item,
       reconciliation: outcome.reconciliation,
+      replayed: outcome.kind === "replayed",
+    });
+  });
+
+  router.post("/items/:itemKey/receiving", requireRole("OWNER"), async (req, res) => {
+    const rawKey = typeof req.params.itemKey === "string" ? req.params.itemKey.trim() : "";
+    const target = resolveItemTarget(rawKey);
+    if (!target) {
+      sendError(res, 400, "VALIDATION_FAILED", "Choose a valid Inventory item.");
+      return;
+    }
+
+    const body = req.body as Record<string, unknown> | null | undefined;
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      sendError(res, 400, "VALIDATION_FAILED", "Enter a valid received quantity.");
+      return;
+    }
+
+    const extraKeys = Object.keys(body).filter((key) => !RECEIVING_KEYS.has(key));
+    if (extraKeys.length > 0) {
+      sendError(res, 400, "VALIDATION_FAILED", "Unexpected Stock Received fields provided.");
+      return;
+    }
+
+    const quantity = parseQuantity(body.quantity, { allowDecimal: true, allowZero: false });
+    if (quantity === null) {
+      sendError(
+        res,
+        400,
+        "VALIDATION_FAILED",
+        "Enter a positive received quantity (up to 4 decimals, max 1,000,000).",
+      );
+      return;
+    }
+
+    const todayManila = formatManilaDate(req.now);
+    let effectiveDate = todayManila;
+    if (body.effectiveDate !== undefined && body.effectiveDate !== null) {
+      const parsedDate = parseManilaDate(body.effectiveDate);
+      if (!parsedDate) {
+        sendError(res, 400, "VALIDATION_FAILED", "Enter a valid delivery date (YYYY-MM-DD).");
+        return;
+      }
+      if (parsedDate > todayManila) {
+        sendError(res, 400, "VALIDATION_FAILED", "Delivery date cannot be in the future.");
+        return;
+      }
+      if (parsedDate < todayManila) {
+        sendError(
+          res,
+          400,
+          "VALIDATION_FAILED",
+          "Late Stock Received entries require count-coverage review, which is not yet enabled.",
+        );
+        return;
+      }
+      effectiveDate = parsedDate;
+    }
+
+    const noteResult = parseMovementNote(body.note, { required: false });
+    if (!noteResult.ok) {
+      sendError(res, 400, "VALIDATION_FAILED", "Delivery note must be 240 characters or fewer.");
+      return;
+    }
+
+    const requestKeyResult = parseRequestKey(body.requestKey);
+    if (!requestKeyResult.ok) {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid Stock Received request key.");
+      return;
+    }
+
+    const outcome = await repo.recordStockReceived(db, {
+      target,
+      quantity,
+      effectiveDate,
+      note: noteResult.value,
+      requestKey: requestKeyResult.value,
+      actorUserId: req.auth!.user.id,
+      recordedAt: req.now,
+    });
+
+    if (outcome.kind === "not-found") {
+      sendError(res, 404, "NOT_FOUND", "Inventory item not found.");
+      return;
+    }
+    if (outcome.kind === "invalid-quantity") {
+      sendError(
+        res,
+        400,
+        "VALIDATION_FAILED",
+        `Enter a positive whole number of ${outcome.unit}.`,
+      );
+      return;
+    }
+    if (outcome.kind === "archived") {
+      sendError(
+        res,
+        409,
+        "PRODUCT_ARCHIVED",
+        "Archived products cannot record Stock Received.",
+      );
+      return;
+    }
+    if (outcome.kind === "not-set") {
+      sendError(
+        res,
+        409,
+        "OPENING_STOCK_NOT_SET",
+        "Record an opening stock count before recording Stock Received.",
+      );
+      return;
+    }
+    if (outcome.kind === "not-operating-supply") {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid Stock Received item category.");
+      return;
+    }
+    if (outcome.kind === "key-conflict") {
+      sendError(
+        res,
+        409,
+        "REQUEST_KEY_CONFLICT",
+        "This Stock Received request key was already used for a different entry.",
+      );
+      return;
+    }
+
+    res.status(outcome.kind === "replayed" ? 200 : 201).json({
+      item: outcome.item,
+      movement: outcome.movement,
+      replayed: outcome.kind === "replayed",
+    });
+  });
+
+  router.post("/items/:itemKey/usage", async (req, res) => {
+    const rawKey = typeof req.params.itemKey === "string" ? req.params.itemKey.trim() : "";
+    const target = resolveItemTarget(rawKey);
+    if (!target) {
+      sendError(res, 400, "VALIDATION_FAILED", "Choose a valid Inventory item.");
+      return;
+    }
+
+    const body = req.body as Record<string, unknown> | null | undefined;
+    if (!body || typeof body !== "object" || Array.isArray(body)) {
+      sendError(res, 400, "VALIDATION_FAILED", "Enter a valid quantity used and purpose.");
+      return;
+    }
+
+    const extraKeys = Object.keys(body).filter((key) => !USAGE_KEYS.has(key));
+    if (extraKeys.length > 0) {
+      sendError(res, 400, "VALIDATION_FAILED", "Unexpected Stock Used fields provided.");
+      return;
+    }
+
+    const quantity = parseQuantity(body.quantity, { allowDecimal: true, allowZero: false });
+    if (quantity === null) {
+      sendError(
+        res,
+        400,
+        "VALIDATION_FAILED",
+        "Enter a positive quantity used (up to 4 decimals, max 1,000,000).",
+      );
+      return;
+    }
+
+    const purposeResult = parseMovementNote(body.purpose, { required: true });
+    if (!purposeResult.ok || !purposeResult.value) {
+      sendError(
+        res,
+        400,
+        "VALIDATION_FAILED",
+        "Enter a short purpose note for Stock Used (1 to 240 characters).",
+      );
+      return;
+    }
+
+    const todayManila = formatManilaDate(req.now);
+    let effectiveDate = todayManila;
+    if (body.effectiveDate !== undefined && body.effectiveDate !== null) {
+      const parsedDate = parseManilaDate(body.effectiveDate);
+      if (!parsedDate) {
+        sendError(res, 400, "VALIDATION_FAILED", "Enter a valid use date (YYYY-MM-DD).");
+        return;
+      }
+      if (parsedDate > todayManila) {
+        sendError(res, 400, "VALIDATION_FAILED", "Use date cannot be in the future.");
+        return;
+      }
+      if (parsedDate < todayManila) {
+        sendError(
+          res,
+          400,
+          "VALIDATION_FAILED",
+          "Late Stock Used entries require count-coverage review, which is not yet enabled.",
+        );
+        return;
+      }
+      effectiveDate = parsedDate;
+    }
+
+    const requestKeyResult = parseRequestKey(body.requestKey);
+    if (!requestKeyResult.ok) {
+      sendError(res, 400, "VALIDATION_FAILED", "Invalid Stock Used request key.");
+      return;
+    }
+
+    const outcome = await repo.recordStockUsed(db, {
+      target,
+      quantity,
+      effectiveDate,
+      purpose: purposeResult.value,
+      requestKey: requestKeyResult.value,
+      actorUserId: req.auth!.user.id,
+      recordedAt: req.now,
+    });
+
+    if (outcome.kind === "not-found") {
+      sendError(res, 404, "NOT_FOUND", "Inventory item not found.");
+      return;
+    }
+    if (outcome.kind === "not-operating-supply") {
+      sendError(
+        res,
+        400,
+        "VALIDATION_FAILED",
+        "Stock Used can only be recorded for operating supplies.",
+      );
+      return;
+    }
+    if (outcome.kind === "invalid-quantity") {
+      sendError(
+        res,
+        400,
+        "VALIDATION_FAILED",
+        `Enter a positive whole number of ${outcome.unit}.`,
+      );
+      return;
+    }
+    if (outcome.kind === "archived") {
+      sendError(
+        res,
+        409,
+        "PRODUCT_ARCHIVED",
+        "Archived supplies cannot record Stock Used.",
+      );
+      return;
+    }
+    if (outcome.kind === "not-set") {
+      sendError(
+        res,
+        409,
+        "OPENING_STOCK_NOT_SET",
+        "Record an opening stock count before recording Stock Used.",
+      );
+      return;
+    }
+    if (outcome.kind === "key-conflict") {
+      sendError(
+        res,
+        409,
+        "REQUEST_KEY_CONFLICT",
+        "This Stock Used request key was already used for a different entry.",
+      );
+      return;
+    }
+
+    res.status(outcome.kind === "replayed" ? 200 : 201).json({
+      item: outcome.item,
+      movement: outcome.movement,
       replayed: outcome.kind === "replayed",
     });
   });

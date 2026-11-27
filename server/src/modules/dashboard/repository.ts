@@ -478,7 +478,9 @@ export const dashboardRepository = {
         | "PRIOR_DAY_SETTLEMENT"
         | "PHYSICAL_COUNT_RECONCILIATION"
         | "SALE_ACTION_DEDUCTION"
-        | "SALE_ACTION_RESTORATION";
+        | "SALE_ACTION_RESTORATION"
+        | "STOCK_RECEIVED"
+        | "STOCK_USED";
       quantityDelta: number | string;
       balanceBefore: number | string;
       balanceAfter: number | string;

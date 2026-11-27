@@ -128,11 +128,17 @@ describe("shared sign-in and module entry", () => {
         canView: true,
         canInitializeOpeningStock: true,
         canCreateProduct: true,
+        canRecordReceiving: true,
+        canRecordUsage: true,
+        canReconcile: true,
       });
       expect(cashierInvAccess.body).toEqual({
         canView: true,
         canInitializeOpeningStock: false,
         canCreateProduct: false,
+        canRecordReceiving: false,
+        canRecordUsage: true,
+        canReconcile: false,
       });
     });
 

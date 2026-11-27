@@ -21,8 +21,10 @@ import {
   MAX_OPENING_QUANTITY,
   mergeRefreshedInventoryItems,
   parseLowStockLevelInput,
+  parseMovementQuantityInput,
   parseOpeningQuantityInput,
   parsePesoPriceToCentavos,
+  parsePhysicalCountInput,
   type PosSectionView,
 } from "./inventoryView";
 
@@ -441,5 +443,68 @@ describe("inventoryView helpers", () => {
     expect(formatFaucetReportingTypeLabel("PUSH_TYPE")).toBe("Push-Type Faucet");
     expect(formatFaucetReportingTypeLabel("TWIST_TYPE")).toBe("Twist-Type Faucet");
     expect(formatFaucetReportingTypeLabel(null)).toBe("Not classified");
+  });
+
+  it("supports decimal supply inputs, negative discrepancy badges, and Operating Supplies grouping", () => {
+    expect(parseOpeningQuantityInput("1.25", "L", true)).toEqual({ ok: true, quantity: 1.25 });
+    expect(parseOpeningQuantityInput("1.25", "pcs", false).ok).toBe(false);
+    expect(parseOpeningQuantityInput("1.12345", "L", true).ok).toBe(false);
+    expect(parsePhysicalCountInput("0.5", "kg", true)).toEqual({ ok: true, quantity: 0.5 });
+    expect(parseMovementQuantityInput("0", "L", true).ok).toBe(false);
+    expect(parseMovementQuantityInput("1.5", "L", true)).toEqual({ ok: true, quantity: 1.5 });
+    expect(parseMovementQuantityInput("1.5", "pcs", false).ok).toBe(false);
+    expect(parseLowStockLevelInput("0.5", "L", true)).toEqual({ ok: true, value: 0.5 });
+
+    expect(formatQuantityLabel(-0.25, "L")).toBe("−0.25 L");
+    expect(formatSignedDelta(-0.25, "L")).toBe("−0.25 L");
+    expect(computeReconciliationPreview(-0.25, 2)).toEqual({
+      before: -0.25,
+      physicalCount: 2,
+      delta: 2.25,
+      after: 2,
+    });
+
+    const flaggedSupply: InventoryItemView = {
+      id: "supply-1",
+      code: "SUPPLY-1",
+      name: "Dishwashing Liquid",
+      category: "OPERATING_SUPPLY",
+      shape: null,
+      unit: "L",
+      allowDecimalQuantity: true,
+      needsReconciliation: true,
+      lowStockLevel: 0.5,
+      status: "INITIALIZED",
+      currentQuantity: -0.25,
+      openingStock: {
+        quantity: 1.25,
+        unit: "L",
+        recordedBy: "owner1",
+        recordedAt: "2026-11-27T09:00:00+08:00",
+      },
+    };
+    expect(getStockStatusMeta(flaggedSupply)).toEqual({
+      tone: "discrepancy",
+      label: "Needs Reconciliation",
+    });
+
+    const lowSupply: InventoryItemView = {
+      ...flaggedSupply,
+      needsReconciliation: false,
+      currentQuantity: 0.5,
+    };
+    expect(getStockStatusMeta(lowSupply)).toEqual({
+      tone: "low",
+      label: "Low Stock",
+    });
+
+    const groups = groupInventoryItems([flaggedSupply], "ALL");
+    expect(groups).toHaveLength(1);
+    expect(groups[0]).toMatchObject({
+      key: "OPERATING_SUPPLY",
+      title: "Operating Supplies",
+      metaPrefix: "Station supplies",
+    });
+    expect(filterInventoryItems([flaggedSupply], "OPERATING_SUPPLY")).toEqual([flaggedSupply]);
   });
 });
