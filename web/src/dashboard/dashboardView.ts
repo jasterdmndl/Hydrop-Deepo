@@ -40,7 +40,8 @@ export type StockTrendMovementType =
   | "SALE_ACTION_DEDUCTION"
   | "SALE_ACTION_RESTORATION"
   | "STOCK_RECEIVED"
-  | "STOCK_USED";
+  | "STOCK_USED"
+  | "MOVEMENT_CORRECTION";
 
 export const MAX_CUSTOM_RANGE_DAYS = 366;
 
@@ -741,5 +742,7 @@ export function formatStockMovementTypeLabel(type: StockTrendMovementType): stri
       return "Stock Received";
     case "STOCK_USED":
       return "Stock Used";
+    case "MOVEMENT_CORRECTION":
+      return "Movement Correction";
   }
 }

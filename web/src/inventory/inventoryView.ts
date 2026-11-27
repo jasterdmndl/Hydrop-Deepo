@@ -106,10 +106,14 @@ export type StockMovementType =
   | "SALE_ACTION_DEDUCTION"
   | "SALE_ACTION_RESTORATION"
   | "STOCK_RECEIVED"
-  | "STOCK_USED";
+  | "STOCK_USED"
+  | "MOVEMENT_CORRECTION";
 
 export type MovementEntryStatus = "APPLIED" | "PENDING_REVIEW";
 export type MovementCoverageMode = "NONE" | "FULL" | "PARTIAL" | "UNCLEAR";
+export type CorrectionCoverageMode = MovementCoverageMode | "DIFFERENT_UNIT_RECONCILED";
+export type MovementCorrectionKind = "QUANTITY" | "CANCEL" | "RECEIPT_ITEM" | "METADATA";
+export type MovementCorrectionStatus = "APPLIED" | "PENDING_REVIEW";
 
 export interface SupportingReconciliationSummary {
   id: string;
@@ -119,6 +123,51 @@ export interface SupportingReconciliationSummary {
   reason: string;
   recordedBy: string;
   recordedAt: string;
+}
+
+export interface MovementCorrectionView {
+  id: string;
+  movementId: string;
+  correctionKind: MovementCorrectionKind;
+  status: MovementCorrectionStatus;
+  reason: string;
+  previousQuantity: number | null;
+  newQuantity: number | null;
+  previousItemId: string | null;
+  previousItemName: string | null;
+  newItemId: string | null;
+  newItemName: string | null;
+  previousUnit: string | null;
+  newUnit: string | null;
+  previousEffectiveDate: string | null;
+  newEffectiveDate: string | null;
+  previousNote: string | null;
+  newNote: string | null;
+  primaryItemId: string;
+  primaryItemName: string;
+  primaryItemUnit: string;
+  primaryRawDelta: number;
+  primaryCoverageMode: CorrectionCoverageMode | null;
+  primaryCoveredQuantity: number;
+  primaryAppliedDelta: number;
+  primarySupportingReconciliationId: string | null;
+  primarySupportingReconciliation: SupportingReconciliationSummary | null;
+  primaryCoveredByOpeningCount: boolean;
+  secondaryItemId: string | null;
+  secondaryItemName: string | null;
+  secondaryItemUnit: string | null;
+  secondaryRawDelta: number;
+  secondaryCoverageMode: CorrectionCoverageMode | null;
+  secondaryCoveredQuantity: number;
+  secondaryAppliedDelta: number;
+  secondarySupportingReconciliationId: string | null;
+  secondarySupportingReconciliation: SupportingReconciliationSummary | null;
+  secondaryCoveredByOpeningCount: boolean;
+  createdBy: string;
+  createdAt: string;
+  reviewedBy: string | null;
+  reviewedAt: string | null;
+  reviewNote: string | null;
 }
 
 export interface StockMovementView {
@@ -146,6 +195,19 @@ export interface StockMovementView {
   reviewedBy?: string | null;
   reviewedAt?: string | null;
   reviewNote?: string | null;
+  isCancelled?: boolean;
+  cancelledAt?: string | null;
+  cancelledBy?: string | null;
+  currentQuantityValue?: number | null;
+  currentItemId?: string | null;
+  currentItemName?: string | null;
+  currentItemUnit?: string | null;
+  currentEffectiveDate?: string | null;
+  currentNote?: string | null;
+  appliedNetDelta?: number;
+  correctionVersion?: number;
+  sourceCorrectionId?: string | null;
+  corrections?: MovementCorrectionView[];
 }
 
 export interface PendingMovementReviewView {
@@ -153,6 +215,18 @@ export interface PendingMovementReviewView {
   item: InventoryItemView;
   applicableReconciliations: StockReconciliationView[];
   openingCountCoversDate: boolean;
+}
+
+export interface PendingCorrectionReviewView {
+  correction: MovementCorrectionView;
+  movement: StockMovementView;
+  primaryItem: InventoryItemView;
+  primaryApplicableReconciliations: StockReconciliationView[];
+  primaryOpeningCountCoversDate: boolean;
+  qualifyingPrimaryReconciliationIds?: string[];
+  secondaryItem: InventoryItemView | null;
+  secondaryApplicableReconciliations: StockReconciliationView[];
+  secondaryOpeningCountCoversDate: boolean;
 }
 
 export interface InventoryItemHistoryView {
@@ -173,6 +247,7 @@ export interface InventoryPermissions {
   canViewFullHistory?: boolean;
   canViewOwnUsageHistory?: boolean;
   canReviewPendingEntries?: boolean;
+  canCorrectMovements?: boolean;
 }
 
 export interface InventoryItemsResponse {
@@ -181,6 +256,7 @@ export interface InventoryItemsResponse {
   posSections?: PosSectionView[];
   pendingStockReviews?: PendingSaleActionStockReviewView[];
   pendingMovementReviewsCount?: number;
+  pendingCorrectionReviewsCount?: number;
 }
 
 export const DEFAULT_POS_SECTIONS: readonly PosSectionView[] = [
@@ -1105,6 +1181,222 @@ export function computeLateCoveragePreview(params: {
     signedDelta: signedScaledDelta / QUANTITY_SCALE,
     projectedBalance,
     pendingReview: false,
+  };
+}
+
+export interface CorrectionPreview {
+  rawDelta: number;
+  coveredQuantity: number;
+  appliedDelta: number;
+  projectedBalance: number | null;
+  pendingReview: boolean;
+  requiresCountBeforeNegative: boolean;
+}
+
+function computeSignedCorrectionPreview(params: {
+  rawSignedDelta: number;
+  currentBalance: number | null;
+  category: InventoryCategory;
+  coverageMode: MovementCoverageMode;
+  coveredQuantity?: number;
+}): CorrectionPreview | null {
+  const rawScaled = parseExactFourDecimalScaled(params.rawSignedDelta);
+  if (rawScaled === null || rawScaled === 0) {
+    return null;
+  }
+  const absScaled = Math.abs(rawScaled);
+  if (params.coverageMode === "UNCLEAR") {
+    return {
+      rawDelta: rawScaled / QUANTITY_SCALE,
+      coveredQuantity: 0,
+      appliedDelta: 0,
+      projectedBalance: params.currentBalance,
+      pendingReview: true,
+      requiresCountBeforeNegative: false,
+    };
+  }
+  let coveredScaled = 0;
+  if (params.coverageMode === "FULL") {
+    coveredScaled = absScaled;
+  } else if (params.coverageMode === "PARTIAL") {
+    const parsed =
+      typeof params.coveredQuantity === "number"
+        ? parseExactFourDecimalScaled(params.coveredQuantity)
+        : null;
+    if (parsed === null || parsed <= 0 || parsed >= absScaled) {
+      return null;
+    }
+    coveredScaled = parsed;
+  }
+
+  const remainingScaled = absScaled - coveredScaled;
+  const appliedScaled =
+    remainingScaled === 0 ? 0 : rawScaled > 0 ? remainingScaled : -remainingScaled;
+  let projectedBalance = params.currentBalance;
+  if (params.currentBalance !== null) {
+    const currScaled = parseExactFourDecimalScaled(params.currentBalance);
+    projectedBalance =
+      currScaled !== null
+        ? (currScaled + appliedScaled) / QUANTITY_SCALE
+        : params.currentBalance + appliedScaled / QUANTITY_SCALE;
+  }
+  const requiresCountBeforeNegative =
+    params.category !== "OPERATING_SUPPLY" &&
+    appliedScaled < 0 &&
+    projectedBalance !== null &&
+    projectedBalance < 0;
+
+  return {
+    rawDelta: rawScaled / QUANTITY_SCALE,
+    coveredQuantity: coveredScaled / QUANTITY_SCALE,
+    appliedDelta: appliedScaled / QUANTITY_SCALE,
+    projectedBalance,
+    pendingReview: false,
+    requiresCountBeforeNegative,
+  };
+}
+
+export function computeQuantityCorrectionPreview(params: {
+  movementType: "STOCK_RECEIVED" | "STOCK_USED";
+  previousQuantity: number;
+  newQuantity: number;
+  currentBalance: number | null;
+  category: InventoryCategory;
+  coverageMode: MovementCoverageMode;
+  coveredQuantity?: number;
+}): CorrectionPreview | null {
+  const prevScaled = parseExactFourDecimalScaled(params.previousQuantity);
+  const newScaled = parseExactFourDecimalScaled(params.newQuantity);
+  if (prevScaled === null || newScaled === null || prevScaled <= 0 || newScaled <= 0) {
+    return null;
+  }
+  const diffScaled = newScaled - prevScaled;
+  if (diffScaled === 0) return null;
+  const rawSignedScaled =
+    params.movementType === "STOCK_RECEIVED" ? diffScaled : -diffScaled;
+  return computeSignedCorrectionPreview({
+    rawSignedDelta: rawSignedScaled / QUANTITY_SCALE,
+    currentBalance: params.currentBalance,
+    category: params.category,
+    coverageMode: params.coverageMode,
+    coveredQuantity: params.coveredQuantity,
+  });
+}
+
+export function computeCancelMovementPreview(params: {
+  movementType: "STOCK_RECEIVED" | "STOCK_USED";
+  entryStatus: MovementEntryStatus;
+  latestQuantity: number;
+  appliedNetDelta?: number;
+  currentBalance: number | null;
+  category: InventoryCategory;
+  coverageMode: MovementCoverageMode;
+  coveredQuantity?: number;
+}): CorrectionPreview | null {
+  if (params.entryStatus === "PENDING_REVIEW") {
+    return {
+      rawDelta: 0,
+      coveredQuantity: params.latestQuantity,
+      appliedDelta: 0,
+      projectedBalance: params.currentBalance,
+      pendingReview: false,
+      requiresCountBeforeNegative: false,
+    };
+  }
+  const latestScaled = parseExactFourDecimalScaled(params.latestQuantity);
+  if (latestScaled === null || latestScaled <= 0) return null;
+
+  let outstandingScaled = latestScaled;
+  if (typeof params.appliedNetDelta === "number") {
+    const appliedNetScaled = parseExactFourDecimalScaled(params.appliedNetDelta);
+    if (appliedNetScaled !== null) {
+      const appliedMagnitudeScaled =
+        params.movementType === "STOCK_RECEIVED"
+          ? Math.max(0, appliedNetScaled)
+          : Math.max(0, -appliedNetScaled);
+      outstandingScaled = Math.min(latestScaled, appliedMagnitudeScaled);
+    }
+  }
+  if (outstandingScaled <= 0) {
+    return {
+      rawDelta: 0,
+      coveredQuantity: params.latestQuantity,
+      appliedDelta: 0,
+      projectedBalance: params.currentBalance,
+      pendingReview: false,
+      requiresCountBeforeNegative: false,
+    };
+  }
+
+  const rawSignedScaled =
+    params.movementType === "STOCK_RECEIVED" ? -outstandingScaled : outstandingScaled;
+  return computeSignedCorrectionPreview({
+    rawSignedDelta: rawSignedScaled / QUANTITY_SCALE,
+    currentBalance: params.currentBalance,
+    category: params.category,
+    coverageMode: params.coverageMode,
+    coveredQuantity: params.coveredQuantity,
+  });
+}
+
+export function computeReceiptItemCorrectionPreview(params: {
+  quantity: number;
+  wrongItem: InventoryItemView;
+  correctItem: InventoryItemView;
+  wrongCoverageMode: MovementCoverageMode;
+  wrongCoveredQuantity?: number;
+  correctCoverageMode: MovementCoverageMode;
+  correctCoveredQuantity?: number;
+}):
+  | {
+      kind: "DIFFERENT_UNITS";
+      wrongUnit: string;
+      correctUnit: string;
+    }
+  | {
+      kind: "SAME_UNIT";
+      wrongSide: CorrectionPreview;
+      correctSide: CorrectionPreview;
+      pendingReview: boolean;
+      requiresCountBeforeNegative: boolean;
+    }
+  | null {
+  const unitsMatch =
+    params.wrongItem.unit.trim().toLowerCase() === params.correctItem.unit.trim().toLowerCase();
+  const qtyFitsTarget =
+    params.correctItem.allowDecimalQuantity || Number.isInteger(params.quantity);
+  if (!unitsMatch || !qtyFitsTarget) {
+    return {
+      kind: "DIFFERENT_UNITS",
+      wrongUnit: params.wrongItem.unit,
+      correctUnit: params.correctItem.unit,
+    };
+  }
+  const qtyScaled = parseExactFourDecimalScaled(params.quantity);
+  if (qtyScaled === null || qtyScaled <= 0) return null;
+
+  const wrongSide = computeSignedCorrectionPreview({
+    rawSignedDelta: -params.quantity,
+    currentBalance: params.wrongItem.currentQuantity,
+    category: params.wrongItem.category,
+    coverageMode: params.wrongCoverageMode,
+    coveredQuantity: params.wrongCoveredQuantity,
+  });
+  const correctSide = computeSignedCorrectionPreview({
+    rawSignedDelta: params.quantity,
+    currentBalance: params.correctItem.currentQuantity,
+    category: params.correctItem.category,
+    coverageMode: params.correctCoverageMode,
+    coveredQuantity: params.correctCoveredQuantity,
+  });
+  if (!wrongSide || !correctSide) return null;
+  const pendingReview = wrongSide.pendingReview || correctSide.pendingReview;
+  return {
+    kind: "SAME_UNIT",
+    wrongSide: pendingReview ? { ...wrongSide, appliedDelta: 0 } : wrongSide,
+    correctSide: pendingReview ? { ...correctSide, appliedDelta: 0 } : correctSide,
+    pendingReview,
+    requiresCountBeforeNegative: !pendingReview && wrongSide.requiresCountBeforeNegative,
   };
 }
 

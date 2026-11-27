@@ -3441,6 +3441,7 @@ describe("POS station day and refill sales", () => {
           "0021_inventory_supplies_and_movements.sql",
           "0022_inventory_movement_request_tombstones.sql",
           "0023_inventory_late_entries_and_reviews.sql",
+          "0024_inventory_movement_corrections.sql",
         ]);
 
         const cashierAfter = await signIn(upgradeApp, "upcashier", upCashier.password);
@@ -3557,6 +3558,7 @@ describe("POS station day and refill sales", () => {
           "0021_inventory_supplies_and_movements.sql",
           "0022_inventory_movement_request_tombstones.sql",
           "0023_inventory_late_entries_and_reviews.sql",
+          "0024_inventory_movement_corrections.sql",
         ]);
       } finally {
         await revisedDb.close();
@@ -3693,6 +3695,7 @@ describe("POS station day and refill sales", () => {
           "0021_inventory_supplies_and_movements.sql",
           "0022_inventory_movement_request_tombstones.sql",
           "0023_inventory_late_entries_and_reviews.sql",
+          "0024_inventory_movement_corrections.sql",
         ]);
 
         const cashier = await signIn(upgradeApp, "f6cashier", upCashier.password);
@@ -3944,6 +3947,7 @@ describe("POS station day and refill sales", () => {
           "0021_inventory_supplies_and_movements.sql",
           "0022_inventory_movement_request_tombstones.sql",
           "0023_inventory_late_entries_and_reviews.sql",
+          "0024_inventory_movement_corrections.sql",
         ]);
 
         const cashier = await signIn(upgradeApp, "f7cashier", upCashier.password);
@@ -4189,6 +4193,7 @@ describe("POS station day and refill sales", () => {
           "0021_inventory_supplies_and_movements.sql",
           "0022_inventory_movement_request_tombstones.sql",
           "0023_inventory_late_entries_and_reviews.sql",
+          "0024_inventory_movement_corrections.sql",
         ]);
 
         // Cross Asia/Manila midnight with cash collection never started on draftRef

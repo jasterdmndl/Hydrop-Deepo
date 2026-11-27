@@ -19,7 +19,8 @@ export type StockTrendMovementType =
   | "SALE_ACTION_DEDUCTION"
   | "SALE_ACTION_RESTORATION"
   | "STOCK_RECEIVED"
-  | "STOCK_USED";
+  | "STOCK_USED"
+  | "MOVEMENT_CORRECTION";
 
 export interface StockTrendItemSummary {
   id: string;
@@ -51,7 +52,8 @@ export interface StockTrendMovementInput {
     | "SALE_ACTION_DEDUCTION"
     | "SALE_ACTION_RESTORATION"
     | "STOCK_RECEIVED"
-    | "STOCK_USED";
+    | "STOCK_USED"
+    | "MOVEMENT_CORRECTION";
   quantityDelta: number;
   balanceBefore: number;
   balanceAfter: number;

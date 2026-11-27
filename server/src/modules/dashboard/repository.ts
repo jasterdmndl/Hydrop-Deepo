@@ -485,7 +485,8 @@ export const dashboardRepository = {
         | "SALE_ACTION_DEDUCTION"
         | "SALE_ACTION_RESTORATION"
         | "STOCK_RECEIVED"
-        | "STOCK_USED";
+        | "STOCK_USED"
+        | "MOVEMENT_CORRECTION";
       quantityDelta: number | string;
       balanceBefore: number | string;
       balanceAfter: number | string;
