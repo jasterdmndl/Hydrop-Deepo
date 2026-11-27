@@ -2866,8 +2866,71 @@ describe("Final Inventory Task 2 — late-entry review and role-scoped history (
     expect(alreadyResolved.status).toBe(409);
     expect(alreadyResolved.body.error.code).toBe("MOVEMENT_ALREADY_RESOLVED");
 
-    // Owner full-coverage resolution on unclearRecv leaves balance at 12 and adds zero Trend points.
+    // Finding 1 regression: full-coverage pending-review resolution must reject omitted snapshots (400),
+    // stale count snapshots (409 STALE_REVIEW_CONTEXT), and stale stock revisions/balances (409 STALE_STOCK_BALANCE).
     const unclearRecvId = unclearRecv.body.movement.id as string;
+    const resolveMissingSnapshot = await request(ctx.app)
+      .post(`/api/inventory/pending-reviews/${encodeURIComponent(unclearRecvId)}/resolve`)
+      .set("Cookie", ownerDay4.cookie)
+      .set("X-CSRF-Token", ownerDay4.csrfToken)
+      .send({
+        coverageMode: "FULL",
+        supportingReconciliationId: rec2Id,
+        expectedRevision: resolvedUse.body.item.stockRevision,
+        expectedCurrentQuantity: 12,
+        requestKey: "t2-resolve-full-missing-snap",
+      });
+    expect(resolveMissingSnapshot.status).toBe(400);
+    expect(resolveMissingSnapshot.body.error.code).toBe("VALIDATION_FAILED");
+
+    const resolveMissingOpeningSnapshot = await request(ctx.app)
+      .post(`/api/inventory/pending-reviews/${encodeURIComponent(unclearRecvId)}/resolve`)
+      .set("Cookie", ownerDay4.cookie)
+      .set("X-CSRF-Token", ownerDay4.csrfToken)
+      .send({
+        coverageMode: "FULL",
+        supportingReconciliationId: rec2Id,
+        expectedLatestReconciliationId: rec2Id,
+        expectedRevision: resolvedUse.body.item.stockRevision,
+        expectedCurrentQuantity: 12,
+        requestKey: "t2-resolve-full-missing-open-snap",
+      });
+    expect(resolveMissingOpeningSnapshot.status).toBe(400);
+    expect(resolveMissingOpeningSnapshot.body.error.code).toBe("VALIDATION_FAILED");
+
+    const resolveFullStaleCount = await request(ctx.app)
+      .post(`/api/inventory/pending-reviews/${encodeURIComponent(unclearRecvId)}/resolve`)
+      .set("Cookie", ownerDay4.cookie)
+      .set("X-CSRF-Token", ownerDay4.csrfToken)
+      .send({
+        coverageMode: "FULL",
+        supportingReconciliationId: rec2Id,
+        expectedLatestReconciliationId: rec1Id,
+        expectedOpeningCountCoversDate: false,
+        expectedRevision: resolvedUse.body.item.stockRevision,
+        expectedCurrentQuantity: 12,
+        requestKey: "t2-resolve-full-stale-count",
+      });
+    expect(resolveFullStaleCount.status).toBe(409);
+    expect(resolveFullStaleCount.body.error.code).toBe("STALE_REVIEW_CONTEXT");
+
+    const resolveFullStaleBalance = await request(ctx.app)
+      .post(`/api/inventory/pending-reviews/${encodeURIComponent(unclearRecvId)}/resolve`)
+      .set("Cookie", ownerDay4.cookie)
+      .set("X-CSRF-Token", ownerDay4.csrfToken)
+      .send({
+        coverageMode: "FULL",
+        supportingReconciliationId: rec2Id,
+        expectedLatestReconciliationId: rec2Id,
+        expectedOpeningCountCoversDate: false,
+        expectedRevision: rec2.body.item.stockRevision,
+        expectedCurrentQuantity: 13,
+        requestKey: "t2-resolve-full-stale-balance",
+      });
+    expect(resolveFullStaleBalance.status).toBe(409);
+    expect(resolveFullStaleBalance.body.error.code).toBe("STALE_STOCK_BALANCE");
+
+    // Owner full-coverage resolution on unclearRecv with fresh snapshot & baseline leaves balance at 12 and adds zero Trend points.
     const resolveFullRecv = await request(ctx.app)
       .post(`/api/inventory/pending-reviews/${encodeURIComponent(unclearRecvId)}/resolve`)
       .set("Cookie", ownerDay4.cookie)
@@ -2921,6 +2984,8 @@ describe("Final Inventory Task 2 — late-entry review and role-scoped history (
 
     const openRes = await postOpeningStock(ctx, owner, supplyId, { quantity: 20 });
     expect(openRes.status).toBe(201);
+    const roundOpenRes = await postOpeningStock(ctx, owner, "ROUND", { quantity: 10 });
+    expect(roundOpenRes.status).toBe(201);
 
     // Next day: Owner records receiving + usage; Employee records late usage after no intervening reconciliation.
     ctx.clock.set("2026-11-25T10:00:00+08:00");
@@ -2953,6 +3018,7 @@ describe("Final Inventory Task 2 — late-entry review and role-scoped history (
     });
     expect(empLateUseNoCount.status).toBe(201);
     expect(empLateUseNoCount.body.item.currentQuantity).toBe(21.5);
+    expect(empLateUseNoCount.body.item.openingStock).toBeNull();
     expect(empLateUseNoCount.body.movement).toMatchObject({
       entryStatus: "APPLIED",
       coverageMode: "NONE",
@@ -3032,16 +3098,44 @@ describe("Final Inventory Task 2 — late-entry review and role-scoped history (
     expect(empItemsRes.body.pendingMovementReviewsCount).toBe(0);
     expect(empItemsRes.body.items.some((i: any) => i.id === archivedSupplyId)).toBe(false);
     const empSaltItem = empItemsRes.body.items.find((i: any) => i.id === supplyId);
+    expect(empSaltItem.status).toBe("INITIALIZED");
     expect(empSaltItem.currentQuantity).toBe(21);
+    expect(empSaltItem.openingStock).toBeNull();
     expect(empSaltItem.latestReconciliation).toBeNull();
     expect(empSaltItem.pendingStockReviews).toEqual([]);
 
-    // 3. GET /items/:key/history as Employee returns ONLY emp1's own STOCK_USED movements (no owner1 usage, no receiving, no reconciliations, no archived item access).
+    // DEC-065 preserved: Employee still views Round container opening count.
+    const empRoundItem = empItemsRes.body.items.find((i: any) => i.shape === "ROUND");
+    expect(empRoundItem.openingStock).toMatchObject({
+      quantity: 10,
+      unit: "containers",
+      recordedBy: "owner1",
+    });
+
+    // Recovery lookup & already-saved cancel for Employee usage also redact operating-supply openingStock.
+    const empByKeyRes = await request(ctx.app)
+      .get("/api/inventory/movements/by-request-key/rbac-emp-use-late")
+      .set("Cookie", empDay3.cookie);
+    expect(empByKeyRes.status).toBe(200);
+    expect(empByKeyRes.body.status).toBe("SAVED");
+    expect(empByKeyRes.body.item.openingStock).toBeNull();
+
+    const empCancelSavedRes = await request(ctx.app)
+      .post("/api/inventory/movements/by-request-key/rbac-emp-use-late/cancel")
+      .set("Cookie", empDay3.cookie)
+      .set("X-CSRF-Token", empDay3.csrfToken)
+      .send({ itemKey: supplyId, movementType: "STOCK_USED" });
+    expect(empCancelSavedRes.status).toBe(200);
+    expect(empCancelSavedRes.body.status).toBe("SAVED");
+    expect(empCancelSavedRes.body.item.openingStock).toBeNull();
+
+    // 3. GET /items/:key/history as Employee returns ONLY emp1's own STOCK_USED movements (no owner1 usage, no receiving, no reconciliations, no archived item access, no supply opening audit).
     const empHistory = await request(ctx.app)
       .get(`/api/inventory/items/${encodeURIComponent(supplyId)}/history`)
       .set("Cookie", empDay3.cookie);
     expect(empHistory.status).toBe(200);
     expect(empHistory.body.scope).toBe("OWN_USAGE");
+    expect(empHistory.body.item.openingStock).toBeNull();
     expect(empHistory.body.openingStock).toBeNull();
     expect(empHistory.body.reconciliations).toEqual([]);
     expect(empHistory.body.movements).toHaveLength(2);

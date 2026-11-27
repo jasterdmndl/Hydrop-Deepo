@@ -798,8 +798,7 @@ export function mergeRefreshedInventoryItems(
     if (
       existing &&
       existing.status === "INITIALIZED" &&
-      existing.openingStock !== null &&
-      (fetched.status === "NOT_SET" || fetched.openingStock === null)
+      fetched.status === "NOT_SET"
     ) {
       return existing;
     }
@@ -870,10 +869,14 @@ export function isValidInventoryItemPayload(value: unknown): value is InventoryI
     return candidate.currentQuantity === null && candidate.openingStock === null;
   }
   if (candidate.status === "INITIALIZED") {
+    const validOpeningStock =
+      candidate.openingStock === null
+        ? candidate.category === "OPERATING_SUPPLY"
+        : isValidOpeningStockRecord(candidate.openingStock);
     return (
       typeof candidate.currentQuantity === "number" &&
       parseExactFourDecimalScaled(candidate.currentQuantity) !== null &&
-      isValidOpeningStockRecord(candidate.openingStock)
+      validOpeningStock
     );
   }
   return false;

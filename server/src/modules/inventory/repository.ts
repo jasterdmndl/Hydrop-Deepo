@@ -243,6 +243,8 @@ function toStockMovementView(row: StockMovementDbRow): StockMovementView {
 export function redactItemForEmployee(item: InventoryItemView): InventoryItemView {
   return {
     ...item,
+    // Keep Round/Slim opening counts visible per DEC-065; redact Owner opening audit metadata on operating supplies.
+    openingStock: item.category === "OPERATING_SUPPLY" ? null : item.openingStock,
     latestReconciliation: null,
     pendingStockReviews: [],
   };
@@ -801,7 +803,19 @@ function evaluateOwnerCoverageSelection(params: {
   openingCountCoversDate: boolean;
   selection: LateCoverageSelectionInput;
   requireExplicitWhenCountsExist: boolean;
+  requireSnapshot?: boolean;
 }): CoverageResolutionOutcome {
+  if (
+    params.requireSnapshot &&
+    (params.selection.expectedLatestReconciliationId === undefined ||
+      params.selection.expectedOpeningCountCoversDate === undefined)
+  ) {
+    return {
+      ok: false,
+      kind: "invalid-coverage",
+      message: "Missing count-review snapshot reference. Refresh the pending review and try again.",
+    };
+  }
   const latestRecId = params.applicableReconciliations[0]?.id ?? null;
   if (
     params.selection.expectedLatestReconciliationId !== undefined &&
@@ -2633,6 +2647,7 @@ export const inventoryRepository = {
         openingCountCoversDate: counts.openingCountCoversDate,
         selection: { ...input.coverage, coverageMode: mode },
         requireExplicitWhenCountsExist: true,
+        requireSnapshot: true,
       });
       if (!coverageOutcome.ok) {
         if (coverageOutcome.kind === "stale-review") {
@@ -2653,31 +2668,29 @@ export const inventoryRepository = {
 
       const currentQuantity = Number(locked.currentQuantity);
       const stockRevision = Number(locked.stockRevision);
-      if (coverageOutcome.deltaMagnitude > 0) {
-        const validatedBaseline = parseStoredBalanceBaseline(input.expectedCurrentQuantity, {
-          allowDecimal,
-          allowNegative: locked.category === "OPERATING_SUPPLY",
-        });
-        if (validatedBaseline === null) {
-          return {
-            kind: "invalid-baseline" as const,
-            allowDecimalQuantity: allowDecimal,
-            unit: locked.unit,
-          };
-        }
-        if (
-          stockRevision !== input.expectedRevision ||
-          !quantitiesEqual(currentQuantity, validatedBaseline)
-        ) {
-          const latestItem = await findItemById(tx, locked.id);
-          return {
-            kind: "stale" as const,
-            item: latestItem!,
-            entry: toStockMovementView(existing),
-            applicableReconciliations: counts.applicableReconciliations,
-            openingCountCoversDate: counts.openingCountCoversDate,
-          };
-        }
+      const validatedBaseline = parseStoredBalanceBaseline(input.expectedCurrentQuantity, {
+        allowDecimal,
+        allowNegative: locked.category === "OPERATING_SUPPLY",
+      });
+      if (validatedBaseline === null) {
+        return {
+          kind: "invalid-baseline" as const,
+          allowDecimalQuantity: allowDecimal,
+          unit: locked.unit,
+        };
+      }
+      if (
+        stockRevision !== input.expectedRevision ||
+        !quantitiesEqual(currentQuantity, validatedBaseline)
+      ) {
+        const latestItem = await findItemById(tx, locked.id);
+        return {
+          kind: "stale" as const,
+          item: latestItem!,
+          entry: toStockMovementView(existing),
+          applicableReconciliations: counts.applicableReconciliations,
+          openingCountCoversDate: counts.openingCountCoversDate,
+        };
       }
 
       const deltaMagnitude = coverageOutcome.deltaMagnitude;

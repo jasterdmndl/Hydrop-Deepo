@@ -3040,55 +3040,74 @@ export function InventoryPage() {
                         )}
 
                         <div className="inventory-item-card__body">
-                          {!isNotSet && item.openingStock ? (
+                          {!isNotSet ? (
                             <>
-                              <dl className="detail-list inventory-detail-list">
-                                <div className="detail-list__row">
-                                  <dt>Opening count</dt>
-                                  <dd>{formatQuantityLabel(item.openingStock.quantity, item.openingStock.unit)}</dd>
-                                </div>
-                                <div className="detail-list__row">
-                                  <dt>Recorded by</dt>
-                                  <dd>{item.openingStock.recordedBy}</dd>
-                                </div>
-                                <div className="detail-list__row">
-                                  <dt>Recorded at</dt>
-                                  <dd>{formatRecordedAtManila(item.openingStock.recordedAt)}</dd>
-                                </div>
-                                {item.availableQuantity !== undefined &&
+                              {(() => {
+                                const showOpeningAudit =
+                                  Boolean(item.openingStock) && (canViewFullHistory || !isSupply);
+                                const showAvailableRow =
+                                  item.availableQuantity !== undefined &&
                                   item.availableQuantity !== null &&
-                                  (item.activeHolds ?? []).some((h) => h.reducesAvailability) && (
-                                    <div className="detail-list__row">
-                                      <dt>Available to sell</dt>
-                                      <dd>
-                                        {formatQuantityLabel(item.availableQuantity, item.unit)} (
-                                        {formatQuantityLabel(
-                                          (item.activeHolds ?? [])
-                                            .filter((h) => h.reducesAvailability)
-                                            .reduce((sum, h) => sum + h.quantity, 0),
-                                          item.unit,
-                                        )}{" "}
-                                        held pre-sale)
-                                      </dd>
-                                    </div>
-                                  )}
-                                {item.latestReconciliation && (
-                                  <div className="detail-list__row">
-                                    <dt>Last physical count</dt>
-                                    <dd>
-                                      {formatQuantityLabel(
-                                        item.latestReconciliation.physicalCount,
-                                        item.latestReconciliation.unit,
-                                      )}{" "}
-                                      ({formatSignedDelta(
-                                        item.latestReconciliation.quantityDelta,
-                                        item.latestReconciliation.unit,
-                                      )}
-                                      ) · {item.latestReconciliation.recordedBy}
-                                    </dd>
-                                  </div>
-                                )}
-                              </dl>
+                                  (item.activeHolds ?? []).some((h) => h.reducesAvailability);
+                                const showDetailList =
+                                  showOpeningAudit || showAvailableRow || Boolean(item.latestReconciliation);
+                                if (!showDetailList) {
+                                  return null;
+                                }
+                                return (
+                                  <dl className="detail-list inventory-detail-list">
+                                    {showOpeningAudit && item.openingStock && (
+                                      <>
+                                        <div className="detail-list__row">
+                                          <dt>Opening count</dt>
+                                          <dd>{formatQuantityLabel(item.openingStock.quantity, item.openingStock.unit)}</dd>
+                                        </div>
+                                        <div className="detail-list__row">
+                                          <dt>Recorded by</dt>
+                                          <dd>{item.openingStock.recordedBy}</dd>
+                                        </div>
+                                        <div className="detail-list__row">
+                                          <dt>Recorded at</dt>
+                                          <dd>{formatRecordedAtManila(item.openingStock.recordedAt)}</dd>
+                                        </div>
+                                      </>
+                                    )}
+                                    {showAvailableRow &&
+                                      item.availableQuantity !== undefined &&
+                                      item.availableQuantity !== null && (
+                                      <div className="detail-list__row">
+                                        <dt>Available to sell</dt>
+                                        <dd>
+                                          {formatQuantityLabel(item.availableQuantity, item.unit)} (
+                                          {formatQuantityLabel(
+                                            (item.activeHolds ?? [])
+                                              .filter((h) => h.reducesAvailability)
+                                              .reduce((sum, h) => sum + h.quantity, 0),
+                                            item.unit,
+                                          )}{" "}
+                                          held pre-sale)
+                                        </dd>
+                                      </div>
+                                    )}
+                                    {item.latestReconciliation && (
+                                      <div className="detail-list__row">
+                                        <dt>Last physical count</dt>
+                                        <dd>
+                                          {formatQuantityLabel(
+                                            item.latestReconciliation.physicalCount,
+                                            item.latestReconciliation.unit,
+                                          )}{" "}
+                                          ({formatSignedDelta(
+                                            item.latestReconciliation.quantityDelta,
+                                            item.latestReconciliation.unit,
+                                          )}
+                                          ) · {item.latestReconciliation.recordedBy}
+                                        </dd>
+                                      </div>
+                                    )}
+                                  </dl>
+                                );
+                              })()}
                               {item.activeHolds && item.activeHolds.length > 0 && (
                                 <div className="callout callout--warning" role="status">
                                   <p className="callout__title">Held / unavailable units</p>
@@ -3152,11 +3171,13 @@ export function InventoryPage() {
                                   {formatRecordedAtManila(item.latestReconciliation.recordedAt)})
                                 </p>
                               )}
-                              <p className="inventory-card-footnote">
-                                {isZero
-                                  ? "Explicit zero confirmed · Opening count is preserved."
-                                  : "Opening count is preserved and cannot be overwritten."}
-                              </p>
+                              {item.openingStock && (canViewFullHistory || !isSupply) && (
+                                <p className="inventory-card-footnote">
+                                  {isZero
+                                    ? "Explicit zero confirmed · Opening count is preserved."
+                                    : "Opening count is preserved and cannot be overwritten."}
+                                </p>
+                              )}
                               {(canRecordReceiving || (isSupply && canRecordUsage) || canInitialize || canViewFullHistory || isSupply) && (
                                 <div className="inventory-card-reconcile-row">
                                   {canRecordReceiving && (

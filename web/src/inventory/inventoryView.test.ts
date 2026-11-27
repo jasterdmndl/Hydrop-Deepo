@@ -20,6 +20,7 @@ import {
   groupInventoryItems,
   type InventoryItemView,
   isUncertainSubmissionError,
+  isValidSavedMovementItemPayload,
   loadPendingMovementAttempts,
   MAX_OPENING_QUANTITY,
   mergeRefreshedInventoryItems,
@@ -951,9 +952,78 @@ describe("inventoryView helpers", () => {
         item: partialSaved.item,
         movement: partialSaved.movement,
       });
+
+      // Task 2 Finding 2 regression: Employee OPERATING_SUPPLY SAVED payloads redact openingStock to null,
+      // while still rejecting missing/null openingStock on initialized CONTAINER/MERCHANDISE items.
+      const redactedEmployeeSaved = {
+        status: "SAVED",
+        item: {
+          ...savedItem,
+          currentQuantity: 9,
+          openingStock: null,
+        },
+        movement: {
+          ...savedMovement,
+          quantity: 1,
+          quantityDelta: -1,
+          balanceBefore: 10,
+          balanceAfter: 9,
+        },
+      };
+      mockPayload = { kind: "json", body: redactedEmployeeSaved };
+      expect(await requestPendingMovementStatus(empAttempt)).toEqual({
+        kind: "SAVED",
+        item: redactedEmployeeSaved.item,
+        movement: redactedEmployeeSaved.movement,
+      });
+      expect(await requestPendingMovementCancel(empAttempt, "supply-1")).toEqual({
+        kind: "SAVED",
+        item: redactedEmployeeSaved.item,
+        movement: redactedEmployeeSaved.movement,
+      });
+
+      expect(
+        isValidSavedMovementItemPayload({
+          ...savedItem,
+          category: "CONTAINER",
+          openingStock: null,
+        }),
+      ).toBe(false);
+      expect(
+        isValidSavedMovementItemPayload({
+          ...savedItem,
+          openingStock: { quantity: 10 },
+        }),
+      ).toBe(false);
     } finally {
       globalThis.fetch = originalFetch;
     }
+  });
+
+  it("refreshes initialized operating supplies whose openingStock is redacted for Employee", () => {
+    const existingSupply: InventoryItemView = {
+      id: "supply-1",
+      code: "SALT",
+      name: "Industrial Salt",
+      category: "OPERATING_SUPPLY",
+      shape: null,
+      unit: "kg",
+      allowDecimalQuantity: true,
+      status: "INITIALIZED",
+      currentQuantity: 10,
+      stockRevision: 1,
+      openingStock: null,
+      latestReconciliation: null,
+      needsReconciliation: false,
+    };
+    const refreshedSupply: InventoryItemView = {
+      ...existingSupply,
+      currentQuantity: 8.5,
+      stockRevision: 2,
+    };
+    expect(mergeRefreshedInventoryItems([existingSupply], [refreshedSupply])).toEqual([
+      refreshedSupply,
+    ]);
   });
 
   it("computes exact late-entry count coverage previews for receiving and usage (Task 2)", () => {

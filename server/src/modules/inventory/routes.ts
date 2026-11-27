@@ -116,7 +116,7 @@ const CANCEL_MOVEMENT_KEYS = new Set(["itemKey", "movementType"]);
 
 function parseCoverageRequestFields(
   body: Record<string, unknown>,
-  options: { requireMode: boolean },
+  options: { requireMode: boolean; requireSnapshot?: boolean },
 ):
   | { ok: true; value: LateCoverageSelectionInput; hasCoverageFields: boolean }
   | { ok: false; message: string } {
@@ -191,6 +191,11 @@ function parseCoverageRequestFields(
     } else {
       return { ok: false, message: "Invalid count-review revision reference." };
     }
+  } else if (options.requireSnapshot) {
+    return {
+      ok: false,
+      message: "Missing count-review revision reference. Refresh the pending review and try again.",
+    };
   }
 
   let expectedOpeningCountCoversDate: boolean | undefined = undefined;
@@ -199,6 +204,11 @@ function parseCoverageRequestFields(
       return { ok: false, message: "Invalid opening-count review reference." };
     }
     expectedOpeningCountCoversDate = body.expectedOpeningCountCoversDate;
+  } else if (options.requireSnapshot) {
+    return {
+      ok: false,
+      message: "Missing opening-count review reference. Refresh the pending review and try again.",
+    };
   }
 
   return {
@@ -1032,7 +1042,10 @@ export function inventoryRoutes(db: Database): Router {
       return;
     }
 
-    const coverageParsed = parseCoverageRequestFields(body, { requireMode: true });
+    const coverageParsed = parseCoverageRequestFields(body, {
+      requireMode: true,
+      requireSnapshot: true,
+    });
     if (!coverageParsed.ok) {
       sendError(res, 400, "VALIDATION_FAILED", coverageParsed.message);
       return;
