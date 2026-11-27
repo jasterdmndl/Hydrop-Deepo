@@ -147,6 +147,7 @@ function CorrectionCoverageSelector({
   allowUnclear,
   requireNewCountFullOnly = false,
   minRecordedAfterIso,
+  qualifyingReconciliationIds,
   disabled,
   onChange,
   onReconcileFirst,
@@ -158,15 +159,18 @@ function CorrectionCoverageSelector({
   allowUnclear: boolean;
   requireNewCountFullOnly?: boolean;
   minRecordedAfterIso?: string;
+  qualifyingReconciliationIds?: string[];
   disabled: boolean;
   onChange: (next: CoverageInputState) => void;
   onReconcileFirst?: (item: InventoryItemView) => void;
 }) {
   const minCreatedMs = minRecordedAfterIso ? Date.parse(minRecordedAfterIso) : null;
   const selectableReconciliations =
-    minCreatedMs !== null && Number.isFinite(minCreatedMs)
-      ? counts.reconciliations.filter((rec) => Date.parse(rec.recordedAt) > minCreatedMs)
-      : counts.reconciliations;
+    qualifyingReconciliationIds !== undefined
+      ? counts.reconciliations.filter((rec) => qualifyingReconciliationIds.includes(rec.id))
+      : minCreatedMs !== null && Number.isFinite(minCreatedMs)
+        ? counts.reconciliations.filter((rec) => Date.parse(rec.recordedAt) > minCreatedMs)
+        : counts.reconciliations;
   const allowOpeningCountSource = !requireNewCountFullOnly && counts.openingCountCoversDate;
   const hasCounts = selectableReconciliations.length > 0 || allowOpeningCountSource;
 
@@ -571,6 +575,11 @@ export function MovementCorrectionDialog({
       : EMPTY_COUNTS,
   );
   const [oldDateCounts, setOldDateCounts] = useState<CountsState>(EMPTY_COUNTS);
+  const [qualifyingPrimaryRecIds, setQualifyingPrimaryRecIds] = useState<string[] | undefined>(() =>
+    modal.kind === "RESOLVE_CORRECTION"
+      ? modal.review.qualifyingPrimaryReconciliationIds
+      : undefined,
+  );
   const [secondaryCounts, setSecondaryCounts] = useState<CountsState>(() =>
     modal.kind === "RESOLVE_CORRECTION"
       ? {
@@ -739,6 +748,9 @@ export function MovementCorrectionDialog({
         | StockReconciliationView[]
         | undefined;
       const sOpen = err.details?.secondaryOpeningCountCoversDate as boolean | undefined;
+      if (Array.isArray(err.details?.qualifyingPrimaryReconciliationIds)) {
+        setQualifyingPrimaryRecIds(err.details.qualifyingPrimaryReconciliationIds as string[]);
+      }
       if (pItem) setPrimaryItemState(pItem);
       if (sItem) setSecondaryItemState(sItem);
       if (pRecs) {
@@ -1052,8 +1064,11 @@ export function MovementCorrectionDialog({
         const corr = modal.review.correction;
         if (requiresNewCountResolve) {
           const minMs = Date.parse(corr.createdAt);
-          const validNewRec = primaryCounts.reconciliations.some(
-            (r) => r.id === primaryCov.countSource && Date.parse(r.recordedAt) > minMs,
+          const validNewRec = primaryCounts.reconciliations.some((r) =>
+            r.id === primaryCov.countSource &&
+            (qualifyingPrimaryRecIds !== undefined
+              ? qualifyingPrimaryRecIds.includes(r.id)
+              : Date.parse(r.recordedAt) > minMs),
           );
           if (primaryCov.mode !== "FULL" || !validNewRec) {
             setError(
@@ -1284,6 +1299,11 @@ export function MovementCorrectionDialog({
               minRecordedAfterIso={
                 requiresNewCountResolve && modal.kind === "RESOLVE_CORRECTION"
                   ? modal.review.correction.createdAt
+                  : undefined
+              }
+              qualifyingReconciliationIds={
+                requiresNewCountResolve && modal.kind === "RESOLVE_CORRECTION"
+                  ? qualifyingPrimaryRecIds
                   : undefined
               }
               disabled={submitting}

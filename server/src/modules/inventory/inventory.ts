@@ -282,6 +282,7 @@ export interface PendingCorrectionReviewView {
   primaryItem: InventoryItemView;
   primaryApplicableReconciliations: StockReconciliationView[];
   primaryOpeningCountCoversDate: boolean;
+  qualifyingPrimaryReconciliationIds?: string[];
   secondaryItem: InventoryItemView | null;
   secondaryApplicableReconciliations: StockReconciliationView[];
   secondaryOpeningCountCoversDate: boolean;

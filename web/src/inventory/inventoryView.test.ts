@@ -1173,6 +1173,27 @@ describe("inventoryView helpers", () => {
       requiresCountBeforeNegative: false,
     });
 
+    // Finding 2 (re-review) regression: cancelling a switched 5 L receipt on the new item
+    // uses the new item's appliedNetDelta (+5 L, 10 -> 15 L), not the original item's covered delta (+3 L).
+    expect(
+      computeCancelMovementPreview({
+        movementType: "STOCK_RECEIVED",
+        entryStatus: "APPLIED",
+        latestQuantity: 5,
+        appliedNetDelta: 5,
+        currentBalance: 15,
+        category: "OPERATING_SUPPLY",
+        coverageMode: "NONE",
+      }),
+    ).toEqual({
+      rawDelta: -5,
+      coveredQuantity: 0,
+      appliedDelta: -5,
+      projectedBalance: 10,
+      pendingReview: false,
+      requiresCountBeforeNegative: false,
+    });
+
     const roundItem: InventoryItemView = {
       code: "ROUND",
       name: "Round Container",

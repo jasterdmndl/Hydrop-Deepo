@@ -3122,16 +3122,7 @@ export const inventoryRepository = {
         const corrections = correctionsByMovement.get(row.id) ?? [];
         const appliedNetDelta =
           row.movementType === "STOCK_RECEIVED" || row.movementType === "STOCK_USED"
-            ? corrections
-                .filter(
-                  (c) =>
-                    c.status === "APPLIED" &&
-                    (c.correctionKind === "QUANTITY" || c.correctionKind === "METADATA"),
-                )
-                .reduce(
-                  (sum, c) => addQuantities(sum, c.primaryAppliedDelta),
-                  Number(row.quantityDelta),
-                )
+            ? computeCurrentItemAppliedNetDelta(row, corrections)
             : undefined;
         return {
           ...toStockMovementView(row),
@@ -3189,9 +3180,14 @@ export const inventoryRepository = {
     }
     const movMap = new Map<string, StockMovementView>();
     for (const row of movRows) {
+      const corrections = correctionsByMovement.get(row.id) ?? [];
       movMap.set(row.id, {
         ...toStockMovementView(row),
-        corrections: correctionsByMovement.get(row.id) ?? [],
+        appliedNetDelta:
+          row.movementType === "STOCK_RECEIVED" || row.movementType === "STOCK_USED"
+            ? computeCurrentItemAppliedNetDelta(row, corrections)
+            : undefined,
+        corrections,
       });
     }
 
@@ -3205,7 +3201,10 @@ export const inventoryRepository = {
         movement.currentEffectiveDate ??
         movement.effectiveDate ??
         formatManilaDate(toDate(movement.recordedAt));
-      const primaryCounts = await loadApplicableCountsForDate(db, corr.primaryItemId, sinceDate);
+      const [primaryCounts, qualifyingPrimaryReconciliationIds] = await Promise.all([
+        loadApplicableCountsForDate(db, corr.primaryItemId, sinceDate),
+        listReconciliationIdsRecordedAfterCorrection(db, corr.primaryItemId, corr.id),
+      ]);
       const secondaryItem = corr.secondaryItemId ? (itemMap.get(corr.secondaryItemId) ?? null) : null;
       const secondaryCounts = corr.secondaryItemId
         ? await loadApplicableCountsForDate(db, corr.secondaryItemId, sinceDate)
@@ -3217,6 +3216,7 @@ export const inventoryRepository = {
         primaryItem,
         primaryApplicableReconciliations: primaryCounts.applicableReconciliations,
         primaryOpeningCountCoversDate: primaryCounts.openingCountCoversDate,
+        qualifyingPrimaryReconciliationIds,
         secondaryItem,
         secondaryApplicableReconciliations: secondaryCounts.applicableReconciliations,
         secondaryOpeningCountCoversDate: secondaryCounts.openingCountCoversDate,
@@ -4594,7 +4594,13 @@ export const inventoryRepository = {
           input.primaryCoverage.expectedOpeningCountCoversDate !==
             primaryCounts.openingCountCoversDate
         ) {
-          return buildStaleReviewOutcome(tx, primaryLocked.id, existing.id, primaryCounts);
+          return buildStaleReviewOutcome(
+            tx,
+            primaryLocked.id,
+            existing.id,
+            primaryCounts,
+            pendingCorr.id,
+          );
         }
 
         if (primaryMode !== "FULL") {
@@ -4613,14 +4619,16 @@ export const inventoryRepository = {
           };
         }
 
-        const pendingCreatedMs = toDate(pendingCorr.createdAt).getTime();
         const selectedRecId = input.primaryCoverage.supportingReconciliationId ?? null;
-        const selectedRec = selectedRecId
-          ? primaryCounts.applicableReconciliations.find(
-              (rec) =>
-                rec.id === selectedRecId && toDate(rec.recordedAt).getTime() > pendingCreatedMs,
-            )
-          : undefined;
+        const qualifyingRecIds = await listReconciliationIdsRecordedAfterCorrection(
+          tx,
+          primaryLocked.id,
+          pendingCorr.id,
+        );
+        const selectedRec =
+          selectedRecId && qualifyingRecIds.includes(selectedRecId)
+            ? primaryCounts.applicableReconciliations.find((rec) => rec.id === selectedRecId)
+            : undefined;
         if (!selectedRec) {
           const latestPrimary = await findItemById(tx, primaryLocked.id);
           return {
@@ -4912,6 +4920,7 @@ export type MovementCorrectionActionResult =
       movement: StockMovementView;
       primaryApplicableReconciliations: StockReconciliationView[];
       primaryOpeningCountCoversDate: boolean;
+      qualifyingPrimaryReconciliationIds?: string[];
       secondaryApplicableReconciliations: StockReconciliationView[];
       secondaryOpeningCountCoversDate: boolean;
     }
@@ -5048,23 +5057,97 @@ async function hasOpenPendingCorrectionForMovement(
   return rows.length > 0;
 }
 
+/**
+ * Net stock effect that this movement currently has on its owning item
+ * (`currentItemId ?? itemId`), including same-unit receipt switches (`RECEIPT_ITEM`)
+ * and subsequent quantity/metadata adjustments.
+ */
+function computeCurrentItemAppliedNetDelta(
+  movement: {
+    itemId: string;
+    currentItemId: string | null;
+    quantityDelta: number | string;
+  },
+  corrections: ReadonlyArray<{
+    status: string;
+    primaryItemId: string;
+    primaryAppliedDelta: number | string;
+    secondaryItemId: string | null;
+    secondaryAppliedDelta: number | string;
+  }>,
+): number {
+  const currentItemId = movement.currentItemId ?? movement.itemId;
+  let net = movement.itemId === currentItemId ? Number(movement.quantityDelta) : 0;
+  for (const corr of corrections) {
+    if (corr.status !== "APPLIED") continue;
+    if (corr.primaryItemId === currentItemId) {
+      net = addQuantities(net, Number(corr.primaryAppliedDelta));
+    }
+    if (corr.secondaryItemId === currentItemId) {
+      net = addQuantities(net, Number(corr.secondaryAppliedDelta));
+    }
+  }
+  return net;
+}
+
 async function computeAppliedNetDeltaForMovement(
   tx: Queryable,
   movement: StockMovementDbRow,
 ): Promise<number> {
-  let net = Number(movement.quantityDelta);
-  const { rows } = await tx.query<{ primaryAppliedDelta: number | string }>(
-    `SELECT primary_applied_delta AS "primaryAppliedDelta"
+  const { rows } = await tx.query<{
+    status: string;
+    primaryItemId: string;
+    primaryAppliedDelta: number | string;
+    secondaryItemId: string | null;
+    secondaryAppliedDelta: number | string;
+  }>(
+    `SELECT status,
+            primary_item_id AS "primaryItemId",
+            primary_applied_delta AS "primaryAppliedDelta",
+            secondary_item_id AS "secondaryItemId",
+            secondary_applied_delta AS "secondaryAppliedDelta"
        FROM inventory_movement_corrections
       WHERE movement_id = $1
         AND status = 'APPLIED'
-        AND correction_kind IN ('QUANTITY', 'METADATA')`,
+      ORDER BY created_at ASC, id ASC`,
     [movement.id],
   );
-  for (const row of rows) {
-    net = addQuantities(net, Number(row.primaryAppliedDelta));
-  }
-  return net;
+  return computeCurrentItemAppliedNetDelta(movement, rows);
+}
+
+/**
+ * Checks physical-count timestamps in PostgreSQL rather than using second-truncated API strings,
+ * so counts recorded later within the same second remain eligible.
+ */
+async function listReconciliationIdsRecordedAfterCorrection(
+  db: Queryable,
+  itemId: string,
+  correctionId: string,
+): Promise<string[]> {
+  const { rows } = await db.query<{ id: string }>(
+    `SELECT r.id
+       FROM inventory_reconciliations r
+       JOIN inventory_movement_corrections mc ON mc.id = $2
+      WHERE r.item_id = $1
+        AND r.recorded_at > mc.created_at
+      ORDER BY r.recorded_at DESC, r.id DESC`,
+    [itemId, correctionId],
+  );
+  return rows.map((row) => row.id);
+}
+
+function toHydratedMovementView(
+  row: StockMovementDbRow,
+  corrections: MovementCorrectionView[],
+): StockMovementView {
+  return {
+    ...toStockMovementView(row),
+    appliedNetDelta:
+      row.movementType === "STOCK_RECEIVED" || row.movementType === "STOCK_USED"
+        ? computeCurrentItemAppliedNetDelta(row, corrections)
+        : undefined,
+    corrections,
+  };
 }
 
 async function findCorrectionByRequestKey(
@@ -5100,14 +5183,12 @@ async function hydrateCorrectionOutcome(
     tx.query<StockMovementDbRow>(`${STOCK_MOVEMENT_SELECT} WHERE m.id = $1`, [corrRow.movementId]),
     loadCorrectionsByMovementIds(tx, [corrRow.movementId]),
   ]);
+  const corrections = corrMap.get(corrRow.movementId) ?? [];
   return {
     kind,
     primaryItem: primaryItem!,
     secondaryItem: secondaryItem ?? null,
-    movement: {
-      ...toStockMovementView(movRows[0]!),
-      corrections: corrMap.get(corrRow.movementId) ?? [],
-    },
+    movement: toHydratedMovementView(movRows[0]!, corrections),
     correction: toMovementCorrectionView(corrRow),
   };
 }
@@ -5140,10 +5221,7 @@ async function buildStaleMovementOutcome(
     kind: "stale-movement",
     primaryItem: primaryItem!,
     secondaryItem: secondaryItem ?? null,
-    movement: {
-      ...toStockMovementView(movRows[0]!),
-      corrections: corrMap.get(movementId) ?? [],
-    },
+    movement: toHydratedMovementView(movRows[0]!, corrMap.get(movementId) ?? []),
   };
 }
 
@@ -5163,10 +5241,7 @@ async function buildStaleStockOutcome(
     kind: "stale-stock",
     primaryItem: primaryItem!,
     secondaryItem: secondaryItem ?? null,
-    movement: {
-      ...toStockMovementView(movRows[0]!),
-      corrections: corrMap.get(movementId) ?? [],
-    },
+    movement: toHydratedMovementView(movRows[0]!, corrMap.get(movementId) ?? []),
   };
 }
 
@@ -5175,22 +5250,25 @@ async function buildStaleReviewOutcome(
   primaryItemId: string,
   movementId: string,
   counts: { applicableReconciliations: StockReconciliationView[]; openingCountCoversDate: boolean },
+  pendingCorrectionId?: string,
 ): Promise<MovementCorrectionActionResult> {
-  const [primaryItem, { rows: movRows }, corrMap] = await Promise.all([
-    findItemById(tx, primaryItemId),
-    tx.query<StockMovementDbRow>(`${STOCK_MOVEMENT_SELECT} WHERE m.id = $1`, [movementId]),
-    loadCorrectionsByMovementIds(tx, [movementId]),
-  ]);
+  const [primaryItem, { rows: movRows }, corrMap, qualifyingPrimaryReconciliationIds] =
+    await Promise.all([
+      findItemById(tx, primaryItemId),
+      tx.query<StockMovementDbRow>(`${STOCK_MOVEMENT_SELECT} WHERE m.id = $1`, [movementId]),
+      loadCorrectionsByMovementIds(tx, [movementId]),
+      pendingCorrectionId
+        ? listReconciliationIdsRecordedAfterCorrection(tx, primaryItemId, pendingCorrectionId)
+        : Promise.resolve(undefined),
+    ]);
   return {
     kind: "stale-review",
     primaryItem: primaryItem!,
     secondaryItem: null,
-    movement: {
-      ...toStockMovementView(movRows[0]!),
-      corrections: corrMap.get(movementId) ?? [],
-    },
+    movement: toHydratedMovementView(movRows[0]!, corrMap.get(movementId) ?? []),
     primaryApplicableReconciliations: counts.applicableReconciliations,
     primaryOpeningCountCoversDate: counts.openingCountCoversDate,
+    ...(qualifyingPrimaryReconciliationIds ? { qualifyingPrimaryReconciliationIds } : {}),
     secondaryApplicableReconciliations: [],
     secondaryOpeningCountCoversDate: false,
   };
@@ -5214,10 +5292,7 @@ async function buildStaleDualReviewOutcome(
     kind: "stale-review",
     primaryItem: primaryItem!,
     secondaryItem: secondaryItem!,
-    movement: {
-      ...toStockMovementView(movRows[0]!),
-      corrections: corrMap.get(movementId) ?? [],
-    },
+    movement: toHydratedMovementView(movRows[0]!, corrMap.get(movementId) ?? []),
     primaryApplicableReconciliations: primaryCounts.applicableReconciliations,
     primaryOpeningCountCoversDate: primaryCounts.openingCountCoversDate,
     secondaryApplicableReconciliations: secondaryCounts.applicableReconciliations,

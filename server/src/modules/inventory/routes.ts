@@ -317,6 +317,9 @@ function sendCorrectionOutcome(
       openingCountCoversDate: outcome.primaryOpeningCountCoversDate,
       primaryApplicableReconciliations: outcome.primaryApplicableReconciliations,
       primaryOpeningCountCoversDate: outcome.primaryOpeningCountCoversDate,
+      ...(outcome.qualifyingPrimaryReconciliationIds
+        ? { qualifyingPrimaryReconciliationIds: outcome.qualifyingPrimaryReconciliationIds }
+        : {}),
       secondaryApplicableReconciliations: outcome.secondaryApplicableReconciliations,
       secondaryOpeningCountCoversDate: outcome.secondaryOpeningCountCoversDate,
     });
