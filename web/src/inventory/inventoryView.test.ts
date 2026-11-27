@@ -25,12 +25,17 @@ import {
   parseLowStockLevelInput,
   parseMovementQuantityInput,
   parseOpeningQuantityInput,
+  parsePendingMovementCancelResponse,
+  parsePendingMovementStatusResponse,
   parsePesoPriceToCentavos,
   parsePhysicalCountInput,
   type PendingStockMovementAttempt,
   type PosSectionView,
   removePendingMovementAttempt,
+  requestPendingMovementCancel,
+  requestPendingMovementStatus,
   savePendingMovementAttempts,
+  type StockMovementView,
   type StorageLike,
   upsertPendingMovementAttempt,
 } from "./inventoryView";
@@ -572,5 +577,135 @@ describe("inventoryView helpers", () => {
     savePendingMovementAttempts("emp1", clearedEmp, memoryStorage);
     expect(loadPendingMovementAttempts("emp1", memoryStorage)).toEqual([]);
     expect(loadPendingMovementAttempts("owner1", memoryStorage)).toEqual([ownerAttempt]);
+  });
+
+  it("Finding 1: preserves original reference when cancellation or status JSON response is truncated or unexpected", async () => {
+    const store = new Map<string, string>();
+    const memoryStorage: StorageLike = {
+      getItem: (key) => store.get(key) ?? null,
+      setItem: (key, value) => {
+        store.set(key, value);
+      },
+      removeItem: (key) => {
+        store.delete(key);
+      },
+    };
+
+    const empAttempt: PendingStockMovementAttempt = {
+      movementType: "STOCK_USED",
+      itemKey: "supply-1",
+      itemName: "Dishwashing Liquid",
+      unit: "L",
+      quantityInput: "1",
+      noteOrPurposeInput: "Bottle rinse",
+      effectiveDate: "2026-11-27",
+      requestKey: "cancel-truncate-1",
+      expectedRevision: 2,
+      expectedCurrentQuantity: 10,
+    };
+    savePendingMovementAttempts("emp1", upsertPendingMovementAttempt([], empAttempt), memoryStorage);
+
+    const savedItem: InventoryItemView = {
+      id: "supply-1",
+      code: "SUPPLY-1",
+      name: "Dishwashing Liquid",
+      category: "OPERATING_SUPPLY",
+      shape: null,
+      unit: "L",
+      allowDecimalQuantity: true,
+      status: "INITIALIZED",
+      currentQuantity: 9,
+      stockRevision: 3,
+      openingStock: {
+        quantity: 10,
+        unit: "L",
+        recordedBy: "owner1",
+        recordedAt: "2026-11-27T08:00:00+08:00",
+      },
+    };
+    const savedMovement: StockMovementView = {
+      id: "mov-1",
+      itemId: "supply-1",
+      movementType: "STOCK_USED",
+      quantity: 1,
+      quantityDelta: -1,
+      balanceBefore: 10,
+      balanceAfter: 9,
+      unit: "L",
+      effectiveDate: "2026-11-27",
+      note: "Bottle rinse",
+      recordedBy: "emp1",
+      recordedAt: "2026-11-27T09:05:00+08:00",
+    };
+
+    // Strict parser only accepts explicit CANCELLED or validated SAVED payloads.
+    expect(parsePendingMovementCancelResponse({})).toEqual({ kind: "UNEXPECTED" });
+    expect(parsePendingMovementCancelResponse(null)).toEqual({ kind: "UNEXPECTED" });
+    expect(parsePendingMovementCancelResponse({ status: "NOT_FOUND" })).toEqual({
+      kind: "UNEXPECTED",
+    });
+    expect(parsePendingMovementCancelResponse({ status: "OTHER" })).toEqual({ kind: "UNEXPECTED" });
+    expect(parsePendingMovementCancelResponse({ status: "SAVED", item: savedItem })).toEqual({
+      kind: "UNEXPECTED",
+    });
+    expect(parsePendingMovementCancelResponse({ status: "CANCELLED" })).toEqual({
+      kind: "CANCELLED",
+    });
+    expect(parsePendingMovementStatusResponse({})).toEqual({ kind: "UNEXPECTED" });
+    expect(parsePendingMovementStatusResponse({ status: "NOT_FOUND" })).toEqual({
+      kind: "NOT_FOUND",
+    });
+
+    const originalFetch = globalThis.fetch;
+    let phase: "truncated-cancel" | "truncated-status" | "valid-recovery" = "truncated-cancel";
+    globalThis.fetch = (async () => {
+      if (phase === "truncated-cancel" || phase === "truncated-status") {
+        // Simulates an interrupted HTTP 200 SAVED JSON response (api() resolves {} when json() rejects).
+        return new Response('{"status":"SAVED","item":{"id":"supply-1","currentQuantity":9', {
+          status: 200,
+          headers: { "Content-Type": "application/json" },
+        });
+      }
+      return new Response(
+        JSON.stringify({ status: "SAVED", item: savedItem, movement: savedMovement }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }) as typeof fetch;
+
+    try {
+      // 1. Truncated HTTP 200 SAVED cancellation response must return UNEXPECTED (never CANCELLED).
+      const truncatedCancel = await requestPendingMovementCancel("cancel-truncate-1", {
+        itemKey: "supply-1",
+        movementType: "STOCK_USED",
+      });
+      expect(truncatedCancel).toEqual({ kind: "UNEXPECTED" });
+      expect(loadPendingMovementAttempts("emp1", memoryStorage)).toEqual([empAttempt]);
+
+      // 2. Truncated HTTP 200 SAVED status-check response also returns UNEXPECTED (never NOT_FOUND/CANCELLED).
+      phase = "truncated-status";
+      const truncatedStatus = await requestPendingMovementStatus("cancel-truncate-1");
+      expect(truncatedStatus).toEqual({ kind: "UNEXPECTED" });
+      expect(loadPendingMovementAttempts("emp1", memoryStorage)).toEqual([empAttempt]);
+
+      // 3. Subsequent readable status check or cancel retry recovers the saved movement with original requestKey.
+      phase = "valid-recovery";
+      const recoveredStatus = await requestPendingMovementStatus("cancel-truncate-1");
+      expect(recoveredStatus).toEqual({
+        kind: "SAVED",
+        item: savedItem,
+        movement: savedMovement,
+      });
+      const recoveredCancel = await requestPendingMovementCancel("cancel-truncate-1", {
+        itemKey: "supply-1",
+        movementType: "STOCK_USED",
+      });
+      expect(recoveredCancel).toEqual({
+        kind: "SAVED",
+        item: savedItem,
+        movement: savedMovement,
+      });
+    } finally {
+      globalThis.fetch = originalFetch;
+    }
   });
 });

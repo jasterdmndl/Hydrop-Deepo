@@ -1,4 +1,5 @@
 /** Pure formatting, grouping, reconciliation, and input helpers for Inventory. */
+import { api } from "../api";
 
 export type ContainerShape = "ROUND" | "SLIM";
 export type InventoryCategory = "CONTAINER" | "MERCHANDISE" | "OPERATING_SUPPLY";
@@ -759,4 +760,119 @@ export function mergeRefreshedInventoryItems(
     }
     return fetched;
   });
+}
+
+export function isValidInventoryItemPayload(value: unknown): value is InventoryItemView {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    typeof candidate.code === "string" &&
+    candidate.code.length > 0 &&
+    typeof candidate.name === "string" &&
+    candidate.name.length > 0 &&
+    typeof candidate.unit === "string" &&
+    candidate.unit.length > 0 &&
+    (candidate.status === "NOT_SET" || candidate.status === "INITIALIZED")
+  );
+}
+
+export function isValidStockMovementPayload(value: unknown): value is StockMovementView {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  const candidate = value as Record<string, unknown>;
+  return (
+    typeof candidate.id === "string" &&
+    candidate.id.length > 0 &&
+    (candidate.movementType === "STOCK_RECEIVED" || candidate.movementType === "STOCK_USED") &&
+    typeof candidate.quantity === "number" &&
+    Number.isFinite(candidate.quantity) &&
+    typeof candidate.unit === "string" &&
+    candidate.unit.length > 0
+  );
+}
+
+export type PendingMovementStatusResult =
+  | { kind: "SAVED"; item: InventoryItemView; movement: StockMovementView }
+  | { kind: "CANCELLED" }
+  | { kind: "NOT_FOUND" }
+  | { kind: "UNEXPECTED" };
+
+export type PendingMovementCancelResult =
+  | { kind: "SAVED"; item: InventoryItemView; movement: StockMovementView }
+  | { kind: "CANCELLED" }
+  | { kind: "UNEXPECTED" };
+
+export function parsePendingMovementStatusResponse(payload: unknown): PendingMovementStatusResult {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return { kind: "UNEXPECTED" };
+  }
+  const candidate = payload as Record<string, unknown>;
+  if (candidate.status === "SAVED") {
+    if (
+      isValidInventoryItemPayload(candidate.item) &&
+      isValidStockMovementPayload(candidate.movement)
+    ) {
+      return {
+        kind: "SAVED",
+        item: candidate.item,
+        movement: candidate.movement,
+      };
+    }
+    return { kind: "UNEXPECTED" };
+  }
+  if (candidate.status === "CANCELLED") {
+    return { kind: "CANCELLED" };
+  }
+  if (candidate.status === "NOT_FOUND") {
+    return { kind: "NOT_FOUND" };
+  }
+  return { kind: "UNEXPECTED" };
+}
+
+export function parsePendingMovementCancelResponse(payload: unknown): PendingMovementCancelResult {
+  if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
+    return { kind: "UNEXPECTED" };
+  }
+  const candidate = payload as Record<string, unknown>;
+  if (candidate.status === "SAVED") {
+    if (
+      isValidInventoryItemPayload(candidate.item) &&
+      isValidStockMovementPayload(candidate.movement)
+    ) {
+      return {
+        kind: "SAVED",
+        item: candidate.item,
+        movement: candidate.movement,
+      };
+    }
+    return { kind: "UNEXPECTED" };
+  }
+  if (candidate.status === "CANCELLED") {
+    return { kind: "CANCELLED" };
+  }
+  return { kind: "UNEXPECTED" };
+}
+
+export async function requestPendingMovementStatus(
+  requestKey: string,
+  fetcher: typeof api = api,
+): Promise<PendingMovementStatusResult> {
+  const payload = await fetcher<unknown>(
+    `/api/inventory/movements/by-request-key/${encodeURIComponent(requestKey)}`,
+  );
+  return parsePendingMovementStatusResponse(payload);
+}
+
+export async function requestPendingMovementCancel(
+  requestKey: string,
+  body: { itemKey: string; movementType: "STOCK_RECEIVED" | "STOCK_USED" },
+  fetcher: typeof api = api,
+): Promise<PendingMovementCancelResult> {
+  const payload = await fetcher<unknown>(
+    `/api/inventory/movements/by-request-key/${encodeURIComponent(requestKey)}/cancel`,
+    {
+      method: "POST",
+      body,
+    },
+  );
+  return parsePendingMovementCancelResponse(payload);
 }
