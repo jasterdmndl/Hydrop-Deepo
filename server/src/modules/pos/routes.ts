@@ -9,6 +9,7 @@ import {
   computeSaleActionFinancials,
   extractAddedDemandMap,
   type SaleActionStockDispositionInput,
+  type SaleActionSubmittedContainerLine,
   validateConfirmCashSettlement,
 } from "./saleActions.js";
 import {
@@ -52,6 +53,8 @@ function hasMissingContainerGripo(items: QuoteLineItem[]): boolean {
   return items.some(
     (item) =>
       item.kind === "CONTAINER_PACKAGE" &&
+      typeof item.catalogCode === "string" &&
+      item.catalogCode.startsWith("SLIM_") &&
       item.includedGripo !== "PUSH_TYPE" &&
       item.includedGripo !== "TWIST_TYPE",
   );
@@ -98,14 +101,16 @@ const containerPackageItemSchema = z
       "SLIM_PURIFIED",
       "SLIM_ALKALINE",
     ]),
-    includedGripo: z.enum(["PUSH_TYPE", "TWIST_TYPE"]),
+    includedGripo: z.enum(["PUSH_TYPE", "TWIST_TYPE"]).optional(),
     quantity: z.number().int().min(1).max(MAX_QUANTITY_PER_LINE),
   })
   .strict();
 
-const confirmContainerPackageItemSchema = containerPackageItemSchema.extend({
-  includedGripo: z.enum(["PUSH_TYPE", "TWIST_TYPE"]).optional(),
+const correctContainerPackageItemSchema = containerPackageItemSchema.extend({
+  originalLineIndex: z.number().int().min(0).max(MAX_ITEMS_PER_SALE - 1).optional(),
 });
+
+const confirmContainerPackageItemSchema = containerPackageItemSchema;
 
 const cartItemSchema = z.discriminatedUnion("kind", [
   standardItemSchema,
@@ -118,7 +123,7 @@ const correctCartItemSchema = z.discriminatedUnion("kind", [
   standardItemSchema,
   customItemSchema,
   correctMerchandiseItemSchema,
-  containerPackageItemSchema,
+  correctContainerPackageItemSchema,
 ]);
 
 const confirmCartItemSchema = z.discriminatedUnion("kind", [
@@ -1151,7 +1156,7 @@ export function posRoutes(db: Database): Router {
         res,
         409,
         "GRIPO_CHOICE_REQUIRED",
-        "Select Push-Type or Twist-Type gripo before starting cash payment. Return to selection to update this unpaid draft.",
+        "Select Push-Type or Twist-Type gripo for Slim container packages before starting cash payment. Return to selection to update this unpaid draft.",
       );
       return;
     }
@@ -1531,7 +1536,7 @@ export function posRoutes(db: Database): Router {
         res,
         409,
         "GRIPO_CHOICE_REQUIRED",
-        "Select Push-Type or Twist-Type gripo before confirming payment. Return to selection to update this unpaid draft.",
+        "Select Push-Type or Twist-Type gripo for Slim container packages before confirming payment. Return to selection to update this unpaid draft.",
       );
       return;
     }
@@ -2736,6 +2741,7 @@ export function posRoutes(db: Database): Router {
       quantity: number;
       originalLineIndex: number | null;
     }>,
+    savedSubmittedContainerLines?: ReadonlyArray<SaleActionSubmittedContainerLine>,
   ): boolean {
     if (savedSubmittedMerchandiseLines !== undefined) {
       const submittedMerch = submittedItems
@@ -2761,11 +2767,49 @@ export function posRoutes(db: Database): Router {
       }
     }
 
-    const strippedSubmitted: z.infer<typeof cartItemSchema>[] = submittedItems.map((item) =>
-      item.kind === "MERCHANDISE"
-        ? { kind: "MERCHANDISE", productId: item.productId, quantity: item.quantity }
-        : item,
-    );
+    if (savedSubmittedContainerLines !== undefined) {
+      const submittedContainers = submittedItems
+        .filter(
+          (item): item is z.infer<typeof correctContainerPackageItemSchema> =>
+            item.kind === "CONTAINER_PACKAGE",
+        )
+        .map((item) => ({
+          packageCode: item.packageCode,
+          includedGripo: item.includedGripo ?? null,
+          quantity: item.quantity,
+          originalLineIndex: item.originalLineIndex ?? null,
+        }));
+      if (submittedContainers.length !== savedSubmittedContainerLines.length) {
+        return false;
+      }
+      for (let i = 0; i < submittedContainers.length; i += 1) {
+        const sub = submittedContainers[i]!;
+        const saved = savedSubmittedContainerLines[i]!;
+        if (
+          sub.packageCode !== saved.packageCode ||
+          (sub.includedGripo ?? null) !== (saved.includedGripo ?? null) ||
+          sub.quantity !== saved.quantity ||
+          (sub.originalLineIndex ?? null) !== (saved.originalLineIndex ?? null)
+        ) {
+          return false;
+        }
+      }
+    }
+
+    const strippedSubmitted: z.infer<typeof cartItemSchema>[] = submittedItems.map((item) => {
+      if (item.kind === "MERCHANDISE") {
+        return { kind: "MERCHANDISE", productId: item.productId, quantity: item.quantity };
+      }
+      if (item.kind === "CONTAINER_PACKAGE") {
+        return {
+          kind: "CONTAINER_PACKAGE",
+          packageCode: item.packageCode,
+          ...(item.includedGripo !== undefined ? { includedGripo: item.includedGripo } : {}),
+          quantity: item.quantity,
+        };
+      }
+      return item;
+    });
 
     if (submittedItemsMatchQuote(strippedSubmitted, savedItems)) {
       return true;
@@ -2854,6 +2898,7 @@ export function posRoutes(db: Database): Router {
                   body.items,
                   existingView.correctedItems,
                   existingView.merchandisePlan.submittedMerchandiseLines,
+                  existingView.merchandisePlan.submittedContainerLines,
                 );
           const sameRequest =
             existingByKey.originalSaleId === saleRow.id &&
@@ -2893,12 +2938,21 @@ export function posRoutes(db: Database): Router {
       const origDemandById = aggregateMerchandiseDemand(saleRow.items);
       const origMerchLinesById = new Map<string, QuoteLineItem[]>();
       const origMerchByLineIndex = new Map<number, QuoteLineItem>();
+      const origContainerByLineIndex = new Map<number, QuoteLineItem>();
+      const origRoundLines: QuoteLineItem[] = [];
       for (const origLine of saleRow.items) {
         if (origLine.kind === "MERCHANDISE" && origLine.productId) {
           origMerchByLineIndex.set(origLine.lineIndex, origLine);
           const bucket = origMerchLinesById.get(origLine.productId);
           if (bucket) bucket.push(origLine);
           else origMerchLinesById.set(origLine.productId, [origLine]);
+        } else if (origLine.kind === "CONTAINER_PACKAGE" && origLine.catalogCode) {
+          origContainerByLineIndex.set(origLine.lineIndex, origLine);
+          if (
+            containerShapeFromPackageCode(origLine.catalogCode as ContainerPackageCode) === "ROUND"
+          ) {
+            origRoundLines.push(origLine);
+          }
         }
       }
 
@@ -2967,6 +3021,26 @@ export function posRoutes(db: Database): Router {
             );
           } else if (item.kind === "CONTAINER_PACKAGE") {
             const shape = containerShapeFromPackageCode(item.packageCode);
+            if (item.originalLineIndex !== undefined) {
+              if (seenOrigLineIndexes.has(item.originalLineIndex)) {
+                return {
+                  kind: "validation-failed" as const,
+                  message: "Duplicate saved line selection in corrected container items.",
+                };
+              }
+              const origLine = origContainerByLineIndex.get(item.originalLineIndex);
+              if (
+                !origLine ||
+                !origLine.catalogCode ||
+                containerShapeFromPackageCode(origLine.catalogCode as ContainerPackageCode) !== shape
+              ) {
+                return {
+                  kind: "validation-failed" as const,
+                  message: "Selected saved container line does not belong to this sale.",
+                };
+              }
+              seenOrigLineIndexes.add(item.originalLineIndex);
+            }
             submittedShapeQty.set(shape, (submittedShapeQty.get(shape) ?? 0) + item.quantity);
           }
         }
@@ -3162,16 +3236,109 @@ export function posRoutes(db: Database): Router {
           }
         }
 
-        const strippedItems = body.items.map((item) =>
-          item.kind === "MERCHANDISE"
-            ? { kind: "MERCHANDISE" as const, productId: item.productId, quantity: item.quantity }
-            : item,
+        const origRoundQty = origRoundLines.reduce((sum, l) => sum + l.quantity, 0);
+        const submittedRoundQty = submittedShapeQty.get("ROUND") ?? 0;
+        const roundProductId = containerIdsByShape.get("ROUND");
+        const exchangedRoundQty = roundProductId ? (exchangedById.get(roundProductId) ?? 0) : 0;
+        const retainedRoundBudget = Math.max(
+          0,
+          Math.min(origRoundQty, submittedRoundQty) - exchangedRoundQty,
         );
+        const remainingOrigRoundQty = new Map<number, number>(
+          origRoundLines.map((l) => [l.lineIndex, l.quantity]),
+        );
+        let retainedRoundUsed = 0;
+        const allowLegacyRoundGripoIndexes = new Set<number>();
+
+        for (let i = 0; i < body.items.length; i += 1) {
+          const item = body.items[i]!;
+          if (
+            item.kind !== "CONTAINER_PACKAGE" ||
+            containerShapeFromPackageCode(item.packageCode) !== "ROUND" ||
+            item.originalLineIndex === undefined
+          ) {
+            continue;
+          }
+          const origLine = origContainerByLineIndex.get(item.originalLineIndex)!;
+          const availOnLine = remainingOrigRoundQty.get(origLine.lineIndex) ?? 0;
+          const budgetRemaining = retainedRoundBudget - retainedRoundUsed;
+          if (item.includedGripo !== undefined) {
+            if (
+              origLine.includedGripo !== item.includedGripo ||
+              item.quantity > availOnLine ||
+              item.quantity > budgetRemaining
+            ) {
+              return {
+                kind: "validation-failed" as const,
+                message:
+                  "New Round container packages do not accept a faucet type selection.",
+              };
+            }
+            allowLegacyRoundGripoIndexes.add(i);
+          }
+          const consumed = Math.min(item.quantity, availOnLine, budgetRemaining);
+          remainingOrigRoundQty.set(origLine.lineIndex, availOnLine - consumed);
+          retainedRoundUsed += consumed;
+        }
+
+        for (let i = 0; i < body.items.length; i += 1) {
+          const item = body.items[i]!;
+          if (
+            item.kind !== "CONTAINER_PACKAGE" ||
+            containerShapeFromPackageCode(item.packageCode) !== "ROUND" ||
+            item.originalLineIndex !== undefined ||
+            item.includedGripo === undefined
+          ) {
+            continue;
+          }
+          let need = item.quantity;
+          for (const origLine of origRoundLines) {
+            if (need <= 0) break;
+            if (
+              origLine.catalogCode !== item.packageCode ||
+              origLine.includedGripo !== item.includedGripo
+            ) {
+              continue;
+            }
+            const availOnLine = remainingOrigRoundQty.get(origLine.lineIndex) ?? 0;
+            const budgetRemaining = retainedRoundBudget - retainedRoundUsed;
+            const take = Math.min(need, availOnLine, budgetRemaining);
+            if (take > 0) {
+              remainingOrigRoundQty.set(origLine.lineIndex, availOnLine - take);
+              retainedRoundUsed += take;
+              need -= take;
+            }
+          }
+          if (need > 0) {
+            return {
+              kind: "validation-failed" as const,
+              message:
+                "New Round container packages do not accept a faucet type selection.",
+            };
+          }
+          allowLegacyRoundGripoIndexes.add(i);
+        }
+
+        const strippedItems = body.items.map((item) => {
+          if (item.kind === "MERCHANDISE") {
+            return { kind: "MERCHANDISE" as const, productId: item.productId, quantity: item.quantity };
+          }
+          if (item.kind === "CONTAINER_PACKAGE") {
+            return {
+              kind: "CONTAINER_PACKAGE" as const,
+              packageCode: item.packageCode,
+              ...(item.includedGripo !== undefined ? { includedGripo: item.includedGripo } : {}),
+              quantity: item.quantity,
+            };
+          }
+          return item;
+        });
         const quoted = buildValidatedQuote(
           strippedItems,
           catalogByWaterType,
           merchandiseById,
           containerPackagesByCode,
+          { allowLegacyRoundGripoIndexes },
         );
         if (!quoted.ok) {
           if (quoted.code === "PRODUCT_UNAVAILABLE") {
@@ -3273,6 +3440,17 @@ export function posRoutes(db: Database): Router {
                 )
                 .map((item) => ({
                   productId: item.productId,
+                  quantity: item.quantity,
+                  originalLineIndex: item.originalLineIndex ?? null,
+                })),
+              submittedContainerLines: body.items
+                .filter(
+                  (item): item is z.infer<typeof correctContainerPackageItemSchema> =>
+                    item.kind === "CONTAINER_PACKAGE",
+                )
+                .map((item) => ({
+                  packageCode: item.packageCode,
+                  includedGripo: item.includedGripo ?? null,
                   quantity: item.quantity,
                   originalLineIndex: item.originalLineIndex ?? null,
                 })),

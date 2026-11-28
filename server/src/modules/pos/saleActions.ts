@@ -59,10 +59,18 @@ export interface SaleActionSubmittedMerchandiseLine {
   originalLineIndex: number | null;
 }
 
+export interface SaleActionSubmittedContainerLine {
+  packageCode: string;
+  includedGripo: "PUSH_TYPE" | "TWIST_TYPE" | null;
+  quantity: number;
+  originalLineIndex: number | null;
+}
+
 export interface SaleActionMerchandisePlan {
   hasMerchandise: boolean;
   requiresInventoryReview: boolean;
   submittedMerchandiseLines?: SaleActionSubmittedMerchandiseLine[];
+  submittedContainerLines?: SaleActionSubmittedContainerLine[];
   items: SaleActionMerchandisePlanItem[];
   retained: Array<{ productId: string; quantity: number }>;
   added: Array<{ productId: string; quantity: number }>;

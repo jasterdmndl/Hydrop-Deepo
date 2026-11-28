@@ -1,5 +1,7 @@
 /** Pure POS domain view types, formatting, cart scoping, and recovery state machine. */
 
+import { MAX_LINE_QTY } from "./quantityInput";
+
 export type WaterType = "PURIFIED" | "ALKALINE";
 export type ItemKind = "STANDARD" | "CUSTOM" | "MERCHANDISE" | "CONTAINER_PACKAGE";
 export type PosSection = string;
@@ -16,6 +18,20 @@ export type ContainerPackageCode =
 
 export function formatIncludedGripoLabel(gripo: IncludedGripoType): string {
   return gripo === "PUSH_TYPE" ? "Push-Type gripo" : "Twist-Type gripo";
+}
+
+export function containerShapeFromPackageCode(code: ContainerPackageCode): ContainerShape {
+  return code.startsWith("ROUND_") ? "ROUND" : "SLIM";
+}
+
+export function formatContainerPackageDisplayLabel(
+  name: string,
+  includedGripo: IncludedGripoType | null | undefined,
+): string {
+  if (includedGripo === "PUSH_TYPE" || includedGripo === "TWIST_TYPE") {
+    return `${name} · ${formatIncludedGripoLabel(includedGripo)}`;
+  }
+  return name;
 }
 export type DayState = "NOT_STARTED" | "OPEN" | "CLOSED" | "PREVIOUS_DAY_OPEN";
 export type CheckoutStatus =
@@ -726,37 +742,124 @@ export function computeCashSummary(
 }
 
 export function toCartItemInputs(lines: CartDraftLine[]): CartItemInput[] {
-  return lines.map((line) => {
+  return lines.flatMap((line): CartItemInput[] => {
     if (line.kind === "STANDARD") {
-      return { kind: "STANDARD", waterType: line.waterType, quantity: line.quantity };
+      return [{ kind: "STANDARD", waterType: line.waterType, quantity: line.quantity }];
     }
     if (line.kind === "CUSTOM") {
-      return {
-        kind: "CUSTOM",
-        waterType: line.waterType,
-        unitVolumeLiters: line.unitVolumeLiters,
-        unitPriceCentavos: line.unitPriceCentavos,
-        quantity: line.quantity,
-      };
+      return [
+        {
+          kind: "CUSTOM",
+          waterType: line.waterType,
+          unitVolumeLiters: line.unitVolumeLiters,
+          unitPriceCentavos: line.unitPriceCentavos,
+          quantity: line.quantity,
+        },
+      ];
     }
     if (line.kind === "CONTAINER_PACKAGE") {
-      return {
-        kind: "CONTAINER_PACKAGE",
-        packageCode: line.packageCode,
-        ...(line.includedGripo ? { includedGripo: line.includedGripo } : {}),
-        quantity: line.quantity,
-      };
+      const items: CartItemInput[] = [];
+      let remaining = line.quantity;
+      while (remaining > 0) {
+        const chunkQty = Math.min(MAX_LINE_QTY, remaining);
+        items.push({
+          kind: "CONTAINER_PACKAGE",
+          packageCode: line.packageCode,
+          ...(line.includedGripo ? { includedGripo: line.includedGripo } : {}),
+          quantity: chunkQty,
+        });
+        remaining -= chunkQty;
+      }
+      return items;
     }
-    return {
-      kind: "MERCHANDISE",
-      productId: line.productId,
-      quantity: line.quantity,
-    };
+    return [
+      {
+        kind: "MERCHANDISE",
+        productId: line.productId,
+        quantity: line.quantity,
+      },
+    ];
   });
 }
 
 export function cartLinesSignature(lines: CartDraftLine[]): string {
   return JSON.stringify(toCartItemInputs(lines));
+}
+
+export function containerPkgLineId(
+  packageCode: ContainerPackageCode,
+  includedGripo: IncludedGripoType | null,
+): string {
+  return includedGripo ? `pkg-${packageCode}-${includedGripo}` : `pkg-${packageCode}`;
+}
+
+export function normalizeEditableCartLines(
+  lines: CartDraftLine[],
+  options?: {
+    dropMissingSlimGripo?: boolean;
+    packageNamesByCode?: ReadonlyMap<ContainerPackageCode, string>;
+  },
+): CartDraftLine[] {
+  const next: CartDraftLine[] = [];
+  const roundIndexByCode = new Map<ContainerPackageCode, number>();
+  for (const line of lines) {
+    if (line.kind !== "CONTAINER_PACKAGE") {
+      next.push(line);
+      continue;
+    }
+    if (containerShapeFromPackageCode(line.packageCode) === "SLIM") {
+      if (!options?.dropMissingSlimGripo || line.includedGripo !== null) {
+        next.push(line);
+      }
+      continue;
+    }
+    const existingIdx = roundIndexByCode.get(line.packageCode);
+    const baseName =
+      options?.packageNamesByCode?.get(line.packageCode) ??
+      line.displayName.replace(/\s*·\s*(?:Push|Twist)-Type gripo$/i, "");
+    if (existingIdx !== undefined) {
+      const existing = next[existingIdx]!;
+      if (existing.kind === "CONTAINER_PACKAGE") {
+        next[existingIdx] = {
+          ...existing,
+          quantity: existing.quantity + line.quantity,
+        };
+      }
+    } else {
+      roundIndexByCode.set(line.packageCode, next.length);
+      next.push({
+        ...line,
+        id: containerPkgLineId(line.packageCode, null),
+        includedGripo: null,
+        displayName: baseName,
+      });
+    }
+  }
+  return next;
+}
+
+export function restoreUnpaidCartSnapshot(snapshot: UnpaidCartSnapshot): {
+  lines: CartDraftLine[];
+  preparedCheckout: CheckoutView | null;
+  prepareKey: string | null;
+  prepareSignature: string | null;
+} {
+  const rawLines = Array.isArray(snapshot.lines) ? snapshot.lines : [];
+  const preparedCheckout = snapshot.preparedCheckout ?? null;
+  const prepareKey = snapshot.prepareKey ?? null;
+  const prepareSignature = snapshot.prepareSignature ?? null;
+  if (preparedCheckout !== null) {
+    return { lines: rawLines, preparedCheckout, prepareKey, prepareSignature };
+  }
+  if (prepareKey && prepareSignature && prepareSignature === cartLinesSignature(rawLines)) {
+    return { lines: rawLines, preparedCheckout: null, prepareKey, prepareSignature };
+  }
+  return {
+    lines: normalizeEditableCartLines(rawLines),
+    preparedCheckout: null,
+    prepareKey: null,
+    prepareSignature: null,
+  };
 }
 
 function browserStorage(kind: "local" | "session"): StorageLike | null {

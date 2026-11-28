@@ -568,6 +568,9 @@ export function toSaleActionRequestView(row: SaleActionRequestDbRow): SaleAction
       ...(Array.isArray(rawPlan.submittedMerchandiseLines)
         ? { submittedMerchandiseLines: rawPlan.submittedMerchandiseLines }
         : {}),
+      ...(Array.isArray(rawPlan.submittedContainerLines)
+        ? { submittedContainerLines: rawPlan.submittedContainerLines }
+        : {}),
       items: Array.isArray(rawPlan.items) ? (rawPlan.items as SaleActionMerchandisePlanItem[]) : [],
       retained: Array.isArray(rawPlan.retained) ? rawPlan.retained : [],
       added: Array.isArray(rawPlan.added) ? rawPlan.added : [],

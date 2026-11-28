@@ -15,6 +15,7 @@ import {
   loadPendingRecoveryByReference,
   loadUnpaidCart,
   mergeRecoveryLookup,
+  normalizeEditableCartLines,
   notifyPosStateChanged,
   parseLitersInput,
   parsePesoInputToCentavos,
@@ -22,6 +23,7 @@ import {
   reconcileRecoveryTodayDate,
   removePendingRecovery,
   resolveRecoveryPresentation,
+  restoreUnpaidCartSnapshot,
   savePendingRecovery,
   saveUnpaidCart,
   toCartItemInputs,
@@ -973,15 +975,15 @@ describe("account-scoped unpaid cart and workstation recovery storage", () => {
     ).toBe(false);
   });
 
-  it("maps container package cart lines cleanly with included gripo choices and excludes container package checkouts from prior-day refill settlement", () => {
+  it("maps Round container packages without includedGripo while preserving Slim included gripo choices and prior-day settlement rules", () => {
     const pkgDraft: CartDraftLine[] = [
       {
-        id: "pkg-ROUND_EMPTY-PUSH_TYPE",
+        id: "pkg-ROUND_EMPTY",
         kind: "CONTAINER_PACKAGE",
         packageCode: "ROUND_EMPTY",
-        includedGripo: "PUSH_TYPE",
+        includedGripo: null,
         productId: "22222222-2222-4222-8222-222222222222",
-        displayName: "Empty Round Container · Push-Type gripo",
+        displayName: "Empty Round Container",
         unitVolumeMl: 0,
         unitVolumeLiters: 0,
         unitPriceCentavos: 17500,
@@ -989,15 +991,28 @@ describe("account-scoped unpaid cart and workstation recovery storage", () => {
         quantity: 1,
       },
       {
-        id: "pkg-ROUND_EMPTY-TWIST_TYPE",
+        id: "pkg-SLIM_EMPTY-PUSH_TYPE",
         kind: "CONTAINER_PACKAGE",
-        packageCode: "ROUND_EMPTY",
-        includedGripo: "TWIST_TYPE",
-        productId: "22222222-2222-4222-8222-222222222222",
-        displayName: "Empty Round Container · Twist-Type gripo",
+        packageCode: "SLIM_EMPTY",
+        includedGripo: "PUSH_TYPE",
+        productId: "33333333-3333-4333-8333-333333333333",
+        displayName: "Empty Slim Container · Push-Type gripo",
         unitVolumeMl: 0,
         unitVolumeLiters: 0,
-        unitPriceCentavos: 17500,
+        unitPriceCentavos: 20000,
+        stockUnit: "containers",
+        quantity: 1,
+      },
+      {
+        id: "pkg-SLIM_EMPTY-TWIST_TYPE",
+        kind: "CONTAINER_PACKAGE",
+        packageCode: "SLIM_EMPTY",
+        includedGripo: "TWIST_TYPE",
+        productId: "33333333-3333-4333-8333-333333333333",
+        displayName: "Empty Slim Container · Twist-Type gripo",
+        unitVolumeMl: 0,
+        unitVolumeLiters: 0,
+        unitPriceCentavos: 20000,
         stockUnit: "containers",
         quantity: 1,
       },
@@ -1006,12 +1021,17 @@ describe("account-scoped unpaid cart and workstation recovery storage", () => {
       {
         kind: "CONTAINER_PACKAGE",
         packageCode: "ROUND_EMPTY",
+        quantity: 1,
+      },
+      {
+        kind: "CONTAINER_PACKAGE",
+        packageCode: "SLIM_EMPTY",
         includedGripo: "PUSH_TYPE",
         quantity: 1,
       },
       {
         kind: "CONTAINER_PACKAGE",
-        packageCode: "ROUND_EMPTY",
+        packageCode: "SLIM_EMPTY",
         includedGripo: "TWIST_TYPE",
         quantity: 1,
       },
@@ -1891,6 +1911,245 @@ describe("account-scoped unpaid cart and workstation recovery storage", () => {
           source: "server",
         },
       ]);
+    });
+
+    it("normalizes legacy unpaid Round carts on restore while preserving prepared checkouts and lost-prepare replay keys (DEC-119 Finding 1)", () => {
+      const storage = makeMemoryStorage();
+      const legacyEditable: CartDraftLine[] = [
+        {
+          id: "pkg-ROUND_EMPTY-PUSH_TYPE",
+          kind: "CONTAINER_PACKAGE",
+          packageCode: "ROUND_EMPTY",
+          includedGripo: "PUSH_TYPE",
+          productId: "round-1",
+          displayName: "Empty Round Container · Push-Type gripo",
+          unitVolumeMl: 0,
+          unitVolumeLiters: 0,
+          unitPriceCentavos: 17500,
+          stockUnit: "containers",
+          quantity: 1,
+        },
+        {
+          id: "pkg-ROUND_EMPTY-TWIST_TYPE",
+          kind: "CONTAINER_PACKAGE",
+          packageCode: "ROUND_EMPTY",
+          includedGripo: "TWIST_TYPE",
+          productId: "round-1",
+          displayName: "Empty Round Container · Twist-Type gripo",
+          unitVolumeMl: 0,
+          unitVolumeLiters: 0,
+          unitPriceCentavos: 17500,
+          stockUnit: "containers",
+          quantity: 2,
+        },
+        {
+          id: "pkg-SLIM_EMPTY-TWIST_TYPE",
+          kind: "CONTAINER_PACKAGE",
+          packageCode: "SLIM_EMPTY",
+          includedGripo: "TWIST_TYPE",
+          productId: "slim-1",
+          displayName: "Empty Slim Container · Twist-Type gripo",
+          unitVolumeMl: 0,
+          unitVolumeLiters: 0,
+          unitPriceCentavos: 20000,
+          stockUnit: "containers",
+          quantity: 1,
+        },
+      ];
+
+      // 1) Persisted baseline editable cart (no preparedCheckout, no matching prepareKey) normalizes Round lines on restore
+      saveUnpaidCart(
+        {
+          ownerUsername: "owner1",
+          businessDate: "2026-11-28",
+          lines: legacyEditable,
+          preparedCheckout: null,
+          prepareKey: null,
+          prepareSignature: null,
+        },
+        storage,
+      );
+      const loadedEditable = loadUnpaidCart("owner1", storage)!;
+      const restoredEditable = restoreUnpaidCartSnapshot(loadedEditable);
+      expect(restoredEditable.preparedCheckout).toBeNull();
+      expect(restoredEditable.lines).toEqual([
+        expect.objectContaining({
+          id: "pkg-ROUND_EMPTY",
+          kind: "CONTAINER_PACKAGE",
+          packageCode: "ROUND_EMPTY",
+          includedGripo: null,
+          displayName: "Empty Round Container",
+          quantity: 3,
+        }),
+        expect.objectContaining({
+          id: "pkg-SLIM_EMPTY-TWIST_TYPE",
+          kind: "CONTAINER_PACKAGE",
+          packageCode: "SLIM_EMPTY",
+          includedGripo: "TWIST_TYPE",
+          quantity: 1,
+        }),
+      ]);
+      expect(toCartItemInputs(restoredEditable.lines)).toEqual([
+        { kind: "CONTAINER_PACKAGE", packageCode: "ROUND_EMPTY", quantity: 3 },
+        { kind: "CONTAINER_PACKAGE", packageCode: "SLIM_EMPTY", includedGripo: "TWIST_TYPE", quantity: 1 },
+      ]);
+
+      // 2) Prepared checkout snapshot preserves legacy Round selection untouched
+      const preparedSnapshot = makeLookup({}).checkout;
+      const restoredPrepared = restoreUnpaidCartSnapshot({
+        ownerUsername: "owner1",
+        businessDate: "2026-11-28",
+        lines: [legacyEditable[0]!],
+        preparedCheckout: preparedSnapshot,
+        prepareKey: "prep-1",
+        prepareSignature: cartLinesSignature([legacyEditable[0]!]),
+      });
+      expect(restoredPrepared.preparedCheckout).toBe(preparedSnapshot);
+      expect(restoredPrepared.lines).toEqual([legacyEditable[0]!]);
+      expect(restoredPrepared.prepareKey).toBe("prep-1");
+
+      // 3) Lost prepare response (matching prepareKey + prepareSignature) preserves lines & key for safe same-key replay
+      const lostPrepareSig = cartLinesSignature([legacyEditable[0]!]);
+      const restoredLostPrepare = restoreUnpaidCartSnapshot({
+        ownerUsername: "owner1",
+        businessDate: "2026-11-28",
+        lines: [legacyEditable[0]!],
+        preparedCheckout: null,
+        prepareKey: "prep-lost-1",
+        prepareSignature: lostPrepareSig,
+      });
+      expect(restoredLostPrepare.preparedCheckout).toBeNull();
+      expect(restoredLostPrepare.lines).toEqual([legacyEditable[0]!]);
+      expect(restoredLostPrepare.prepareKey).toBe("prep-lost-1");
+      expect(restoredLostPrepare.prepareSignature).toBe(lostPrepareSig);
+
+      // 4) normalizeEditableCartLines with dropMissingSlimGripo removes incomplete Slim lines cleanly
+      expect(
+        normalizeEditableCartLines(
+          [
+            {
+              id: "pkg-SLIM_EMPTY-UNSPECIFIED",
+              kind: "CONTAINER_PACKAGE",
+              packageCode: "SLIM_EMPTY",
+              includedGripo: null,
+              productId: "slim-1",
+              displayName: "Empty Slim Container",
+              unitVolumeMl: 0,
+              unitVolumeLiters: 0,
+              unitPriceCentavos: 20000,
+              stockUnit: "containers",
+              quantity: 1,
+            },
+            legacyEditable[0]!,
+          ],
+          { dropMissingSlimGripo: true },
+        ),
+      ).toEqual([
+        expect.objectContaining({
+          id: "pkg-ROUND_EMPTY",
+          includedGripo: null,
+          displayName: "Empty Round Container",
+        }),
+      ]);
+    });
+
+    it("preserves full quantity across 500 and 501 boundaries when merging legacy Round lines into one visible option (DEC-119 Finding 3)", () => {
+      const storage = makeMemoryStorage();
+      const makeLegacyLine = (
+        gripo: "PUSH_TYPE" | "TWIST_TYPE",
+        quantity: number,
+      ): CartDraftLine => ({
+        id: `pkg-ROUND_EMPTY-${gripo}`,
+        kind: "CONTAINER_PACKAGE",
+        packageCode: "ROUND_EMPTY",
+        includedGripo: gripo,
+        productId: "round-1",
+        displayName: `Empty Round Container · ${gripo === "PUSH_TYPE" ? "Push-Type" : "Twist-Type"} gripo`,
+        unitVolumeMl: 0,
+        unitVolumeLiters: 0,
+        unitPriceCentavos: 17500,
+        stockUnit: "containers",
+        quantity,
+      });
+
+      // 1) 500 boundary: 250 Push-Type + 250 Twist-Type merges to 1 line of 500 and emits 1 API item of 500
+      saveUnpaidCart(
+        {
+          ownerUsername: "owner1",
+          businessDate: "2026-11-28",
+          lines: [makeLegacyLine("PUSH_TYPE", 250), makeLegacyLine("TWIST_TYPE", 250)],
+          preparedCheckout: null,
+          prepareKey: null,
+          prepareSignature: null,
+        },
+        storage,
+      );
+      const restored500 = restoreUnpaidCartSnapshot(loadUnpaidCart("owner1", storage)!);
+      expect(restored500.lines).toHaveLength(1);
+      expect(restored500.lines[0]).toMatchObject({
+        id: "pkg-ROUND_EMPTY",
+        includedGripo: null,
+        displayName: "Empty Round Container",
+        quantity: 500,
+      });
+      expect(toCartItemInputs(restored500.lines)).toEqual([
+        { kind: "CONTAINER_PACKAGE", packageCode: "ROUND_EMPTY", quantity: 500 },
+      ]);
+
+      // 2) 501 boundary: 250 Push-Type + 251 Twist-Type merges to 1 visible line of 501 and chunks API payload into 500 + 1
+      saveUnpaidCart(
+        {
+          ownerUsername: "owner1",
+          businessDate: "2026-11-28",
+          lines: [makeLegacyLine("PUSH_TYPE", 250), makeLegacyLine("TWIST_TYPE", 251)],
+          preparedCheckout: null,
+          prepareKey: null,
+          prepareSignature: null,
+        },
+        storage,
+      );
+      const restored501 = restoreUnpaidCartSnapshot(loadUnpaidCart("owner1", storage)!);
+      expect(restored501.lines).toHaveLength(1);
+      expect(restored501.lines[0]).toMatchObject({
+        id: "pkg-ROUND_EMPTY",
+        includedGripo: null,
+        displayName: "Empty Round Container",
+        quantity: 501,
+      });
+      expect(toCartItemInputs(restored501.lines)).toEqual([
+        { kind: "CONTAINER_PACKAGE", packageCode: "ROUND_EMPTY", quantity: 500 },
+        { kind: "CONTAINER_PACKAGE", packageCode: "ROUND_EMPTY", quantity: 1 },
+      ]);
+
+      // 3) Leaving review (dropMissingSlimGripo: true) preserves 501 as one faucet-free Round line and valid chunked inputs
+      const afterLeaveReview = normalizeEditableCartLines(
+        [makeLegacyLine("PUSH_TYPE", 250), makeLegacyLine("TWIST_TYPE", 251)],
+        { dropMissingSlimGripo: true },
+      );
+      expect(afterLeaveReview).toHaveLength(1);
+      expect(afterLeaveReview[0]).toMatchObject({
+        id: "pkg-ROUND_EMPTY",
+        includedGripo: null,
+        quantity: 501,
+      });
+      expect(toCartItemInputs(afterLeaveReview)).toEqual([
+        { kind: "CONTAINER_PACKAGE", packageCode: "ROUND_EMPTY", quantity: 500 },
+        { kind: "CONTAINER_PACKAGE", packageCode: "ROUND_EMPTY", quantity: 1 },
+      ]);
+
+      // 4) Previously prepared checkout snapshot (e.g., 250 + 251) remains untouched
+      const preparedSnapshot = makeLookup({}).checkout;
+      const legacy501Lines = [makeLegacyLine("PUSH_TYPE", 250), makeLegacyLine("TWIST_TYPE", 251)];
+      const preservedPrepared = restoreUnpaidCartSnapshot({
+        ownerUsername: "owner1",
+        businessDate: "2026-11-28",
+        lines: legacy501Lines,
+        preparedCheckout: preparedSnapshot,
+        prepareKey: "prep-501",
+        prepareSignature: cartLinesSignature(legacy501Lines),
+      });
+      expect(preservedPrepared.preparedCheckout).toBe(preparedSnapshot);
+      expect(preservedPrepared.lines).toEqual(legacy501Lines);
     });
   });
 });

@@ -37,12 +37,15 @@ import {
   computeCashSummary,
   type ConfirmSaleResponse,
   type ContainerPackageCode,
+  containerPkgLineId,
+  containerShapeFromPackageCode,
   createServerRecoveryRecord,
   currentManilaIso,
   type DaySummaryView,
   type EndDayResponse,
   evaluateEndDayGuard,
   formatCentavos,
+  formatContainerPackageDisplayLabel,
   formatIncludedGripoLabel,
   formatLiters,
   formatManilaTimestamp,
@@ -55,6 +58,7 @@ import {
   loadPendingRecoveryByReference,
   loadUnpaidCart,
   mergeRecoveryLookup,
+  normalizeEditableCartLines,
   notifyPosStateChanged,
   parseLitersInput,
   parsePesoInputToCentavos,
@@ -69,6 +73,7 @@ import {
   reconcileRecoveryTodayDate,
   removePendingRecovery,
   resolveRecoveryPresentation,
+  restoreUnpaidCartSnapshot,
   savePendingRecovery,
   saveUnpaidCart,
   type SaleView,
@@ -147,15 +152,11 @@ const INCLUDED_GRIPO_OPTIONS: readonly { value: IncludedGripoType; label: string
   { value: "TWIST_TYPE", label: "Twist-Type gripo" },
 ];
 
-function containerPkgKey(packageCode: ContainerPackageCode, includedGripo: IncludedGripoType): string {
-  return `${packageCode}:${includedGripo}`;
-}
-
-function containerPkgLineId(
+function containerPkgKey(
   packageCode: ContainerPackageCode,
   includedGripo: IncludedGripoType | null,
 ): string {
-  return `pkg-${packageCode}-${includedGripo ?? "UNSPECIFIED"}`;
+  return `${packageCode}:${includedGripo ?? "NONE"}`;
 }
 
 function formatCartCountPill(containers: number, merchandiseQty: number): string {
@@ -582,11 +583,12 @@ export function PosPage() {
     if (isCartHydrated || showRecoveryScreen || activeConfirming !== null) return;
     const savedCart = loadUnpaidCart(user.username);
     if (savedCart) {
-      setLines(Array.isArray(savedCart.lines) ? savedCart.lines : []);
-      setPreparedCheckout(savedCart.preparedCheckout ?? null);
-      setPrepareKey(savedCart.prepareKey ?? null);
-      setPrepareSignature(savedCart.prepareSignature ?? null);
-      setStep(savedCart.preparedCheckout ? "review" : "select");
+      const restored = restoreUnpaidCartSnapshot(savedCart);
+      setLines(restored.lines);
+      setPreparedCheckout(restored.preparedCheckout);
+      setPrepareKey(restored.prepareKey);
+      setPrepareSignature(restored.prepareSignature);
+      setStep(restored.preparedCheckout ? "review" : "select");
     } else {
       setLines([]);
       setPreparedCheckout(null);
@@ -686,8 +688,9 @@ export function PosPage() {
   const containerPkgQtyByKey = useMemo(() => {
     const map = new Map<string, number>();
     for (const line of lines) {
-      if (line.kind === "CONTAINER_PACKAGE" && line.includedGripo) {
-        map.set(containerPkgKey(line.packageCode, line.includedGripo), line.quantity);
+      if (line.kind === "CONTAINER_PACKAGE") {
+        const key = containerPkgKey(line.packageCode, line.includedGripo);
+        map.set(key, (map.get(key) ?? 0) + line.quantity);
       }
     }
     return map;
@@ -711,12 +714,13 @@ export function PosPage() {
       const next = { ...prev };
       for (const pkg of containerPackages) {
         const isInStock = pkg.stockStatus === "IN_STOCK" && (pkg.availableQuantity ?? 0) > 0;
-        for (const gripo of INCLUDED_GRIPO_OPTIONS) {
-          const fieldId = containerPkgLineId(pkg.packageCode, gripo.value);
+        const gripoChoices: Array<IncludedGripoType | null> =
+          pkg.shape === "SLIM" ? INCLUDED_GRIPO_OPTIONS.map((g) => g.value) : [null];
+        for (const gripo of gripoChoices) {
+          const fieldId = containerPkgLineId(pkg.packageCode, gripo);
           const edit = next[fieldId];
           if (!edit) continue;
-          const qty =
-            containerPkgQtyByKey.get(containerPkgKey(pkg.packageCode, gripo.value)) ?? 0;
+          const qty = containerPkgQtyByKey.get(containerPkgKey(pkg.packageCode, gripo)) ?? 0;
           const rowMax = getContainerPackageRowMax(
             lines,
             pkg.productId,
@@ -973,11 +977,11 @@ export function PosPage() {
   function updateContainerPackageLines(
     prev: CartDraftLine[],
     pkg: PosContainerPackageItem,
-    includedGripo: IncludedGripoType,
+    includedGripo: IncludedGripoType | null,
     targetQty: number,
   ): CartDraftLine[] {
     const id = containerPkgLineId(pkg.packageCode, includedGripo);
-    const displayName = `${pkg.name} · ${formatIncludedGripoLabel(includedGripo)}`;
+    const displayName = formatContainerPackageDisplayLabel(pkg.name, includedGripo);
     const idx = prev.findIndex((l) => l.id === id);
     const currentQty = idx === -1 ? 0 : prev[idx]!.quantity;
     const rowMax = getContainerPackageRowMax(prev, pkg.productId, id, pkg.availableQuantity);
@@ -1022,7 +1026,7 @@ export function PosPage() {
 
   function setContainerPackageQuantity(
     pkg: PosContainerPackageItem,
-    includedGripo: IncludedGripoType,
+    includedGripo: IncludedGripoType | null,
     nextQty: number,
   ): boolean {
     const id = containerPkgLineId(pkg.packageCode, includedGripo);
@@ -1049,7 +1053,7 @@ export function PosPage() {
 
   function stepContainerPackageQuantity(
     pkg: PosContainerPackageItem,
-    includedGripo: IncludedGripoType,
+    includedGripo: IncludedGripoType | null,
     delta: -1 | 1,
   ): void {
     const id = containerPkgLineId(pkg.packageCode, includedGripo);
@@ -1373,13 +1377,43 @@ export function PosPage() {
     loadTrackerRef.current.next();
     dayStatusTrackerRef.current.next();
     try {
-      const res = await api<PrepareCheckoutResponse>("/api/pos/checkouts", {
-        method: "POST",
-        body: {
-          prepareKey: keyToUse,
-          items: toCartItemInputs(lines),
-        },
-      });
+      let res: PrepareCheckoutResponse;
+      try {
+        res = await api<PrepareCheckoutResponse>("/api/pos/checkouts", {
+          method: "POST",
+          body: {
+            prepareKey: keyToUse,
+            items: toCartItemInputs(lines),
+          },
+        });
+      } catch (err) {
+        const hasLegacyRoundLine = lines.some(
+          (line) =>
+            line.kind === "CONTAINER_PACKAGE" &&
+            containerShapeFromPackageCode(line.packageCode) === "ROUND" &&
+            line.includedGripo !== null,
+        );
+        if (err instanceof ApiError && err.code === "VALIDATION_FAILED" && hasLegacyRoundLine) {
+          const packageNamesByCode = new Map(
+            containerPackages.map((p) => [p.packageCode, p.name] as const),
+          );
+          const normalizedLines = normalizeEditableCartLines(lines, { packageNamesByCode });
+          const nextSignature = cartLinesSignature(normalizedLines);
+          const nextKey = generateKey();
+          setLines(normalizedLines);
+          setPrepareKey(nextKey);
+          setPrepareSignature(nextSignature);
+          res = await api<PrepareCheckoutResponse>("/api/pos/checkouts", {
+            method: "POST",
+            body: {
+              prepareKey: nextKey,
+              items: toCartItemInputs(normalizedLines),
+            },
+          });
+        } else {
+          throw err;
+        }
+      }
       dayStatusTrackerRef.current.next();
       setDayStatus((prev) => {
         if (!prev) return prev;
@@ -1627,7 +1661,11 @@ export function PosPage() {
   const draftHasMissingGripo =
     preparedCheckout?.status === "DRAFT" &&
     preparedCheckout.items.some(
-      (item) => item.kind === "CONTAINER_PACKAGE" && !item.includedGripo,
+      (item) =>
+        item.kind === "CONTAINER_PACKAGE" &&
+        typeof item.catalogCode === "string" &&
+        item.catalogCode.startsWith("SLIM_") &&
+        !item.includedGripo,
     );
 
   const cancelHoldEval = useMemo(
@@ -1646,7 +1684,12 @@ export function PosPage() {
     }
     const hadMissingGripo =
       draftHasMissingGripo ||
-      lines.some((line) => line.kind === "CONTAINER_PACKAGE" && !line.includedGripo);
+      lines.some(
+        (line) =>
+          line.kind === "CONTAINER_PACKAGE" &&
+          containerShapeFromPackageCode(line.packageCode) === "SLIM" &&
+          !line.includedGripo,
+      );
     setCancellingDraft(true);
     setSaleError(null);
     try {
@@ -1660,11 +1703,15 @@ export function PosPage() {
           ...(options?.noFilledUnitsHeldConfirmed ? { noFilledUnitsHeldConfirmed: true } : {}),
         },
       });
-      if (hadMissingGripo) {
-        setLines((prev) =>
-          prev.filter((line) => line.kind !== "CONTAINER_PACKAGE" || line.includedGripo !== null),
-        );
-      }
+      const packageNamesByCode = new Map(
+        containerPackages.map((p) => [p.packageCode, p.name] as const),
+      );
+      setLines((prev) =>
+        normalizeEditableCartLines(prev, {
+          dropMissingSlimGripo: true,
+          packageNamesByCode,
+        }),
+      );
       setPreparedCheckout(null);
       setPrepareKey(null);
       setPrepareSignature(null);
@@ -1676,7 +1723,7 @@ export function PosPage() {
       if (hadMissingGripo) {
         setSaleError(
           wrapNotice(
-            "Select Push-Type or Twist-Type gripo for each container package before continuing to payment.",
+            "Select Push-Type or Twist-Type gripo for each Slim container package before continuing to payment.",
           ),
         );
       }
@@ -3171,11 +3218,14 @@ export function PosPage() {
 
                         <div className="refill-grid">
                           {containerPackages.map((pkg) => {
+                            const roundQty =
+                              containerPkgQtyByKey.get(containerPkgKey(pkg.packageCode, null)) ?? 0;
                             const pushQty =
                               containerPkgQtyByKey.get(containerPkgKey(pkg.packageCode, "PUSH_TYPE")) ?? 0;
                             const twistQty =
                               containerPkgQtyByKey.get(containerPkgKey(pkg.packageCode, "TWIST_TYPE")) ?? 0;
-                            const isSelected = pushQty + twistQty > 0;
+                            const isSelected =
+                              pkg.shape === "ROUND" ? roundQty > 0 : pushQty + twistQty > 0;
                             const totalShapeSelected = selectedContainerQtyByProductId.get(pkg.productId) ?? 0;
                             const shapeRemaining =
                               pkg.availableQuantity === null
@@ -3190,6 +3240,115 @@ export function PosPage() {
                                   : totalShapeSelected > 0
                                     ? `${shapeRemaining} of ${pkg.availableQuantity} ${pkg.unit} left`
                                     : `${pkg.availableQuantity} ${pkg.unit} available`;
+
+                            const renderContainerPackageStepper = (
+                              includedGripo: IncludedGripoType | null,
+                              qty: number,
+                              accessibleLabel: string,
+                            ) => {
+                              const fieldId = containerPkgLineId(pkg.packageCode, includedGripo);
+                              const edit = qtyEdits[fieldId];
+                              const visibleError = getVisibleQuantityError(edit);
+                              const errorId = `qty-error-${fieldId}`;
+                              const rowMax = getContainerPackageRowMax(
+                                lines,
+                                pkg.productId,
+                                fieldId,
+                                pkg.availableQuantity,
+                              );
+                              const effectiveMax = Math.max(rowMax, qty);
+                              const overMaxMessage = getContainerPackageOverMaxMessage(
+                                rowMax,
+                                pkg.availableQuantity,
+                              );
+                              const isUnselectedUnavailable =
+                                qty === 0 && (!isInStock || rowMax <= 0);
+
+                              return {
+                                stepper: (
+                                  <QuantityStepper
+                                    value={qty}
+                                    edit={edit}
+                                    onEditChange={(nextEdit) => setFieldQtyEdit(fieldId, nextEdit)}
+                                    onCommitValidValue={(nextQty) =>
+                                      setContainerPackageQuantity(pkg, includedGripo, nextQty)
+                                    }
+                                    onStep={(delta) => {
+                                      clearFieldQtyEdit(fieldId);
+                                      stepContainerPackageQuantity(pkg, includedGripo, delta);
+                                    }}
+                                    groupLabel={`${accessibleLabel} quantity controls`}
+                                    inputLabel={`${accessibleLabel} quantity`}
+                                    decreaseLabel={`Decrease ${accessibleLabel}`}
+                                    increaseLabel={`Increase ${accessibleLabel}`}
+                                    disabled={
+                                      !dayStatus?.canSell ||
+                                      preparingCheckout ||
+                                      isUnselectedUnavailable
+                                    }
+                                    decreaseDisabled={
+                                      !dayStatus?.canSell || preparingCheckout || qty === 0
+                                    }
+                                    increaseDisabled={
+                                      !dayStatus?.canSell ||
+                                      preparingCheckout ||
+                                      !isInStock ||
+                                      qty >= rowMax
+                                    }
+                                    allowRestingZero
+                                    max={effectiveMax}
+                                    overMaxMessage={overMaxMessage}
+                                    errorId={errorId}
+                                    inputRef={(el) => {
+                                      if (el) qtyInputRefs.current.set(fieldId, el);
+                                      else qtyInputRefs.current.delete(fieldId);
+                                    }}
+                                  />
+                                ),
+                                errorNode: visibleError ? (
+                                  <div id={errorId} className="qty-stepper__error" role="alert">
+                                    <span>{visibleError}</span>
+                                    {edit?.pendingCommitValue != null && (
+                                      <div className="callout__actions">
+                                        <button
+                                          type="button"
+                                          className="button button--primary button--sm"
+                                          disabled={!dayStatus?.canSell || preparingCheckout}
+                                          onMouseDown={(event) => event.preventDefault()}
+                                          onClick={() => {
+                                            const targetQty = edit.pendingCommitValue!;
+                                            const committed = setContainerPackageQuantity(
+                                              pkg,
+                                              includedGripo,
+                                              targetQty,
+                                            );
+                                            if (committed) {
+                                              clearFieldQtyEdit(fieldId);
+                                            }
+                                          }}
+                                        >
+                                          Apply {edit.pendingCommitValue}
+                                        </button>
+                                        <button
+                                          type="button"
+                                          className="button button--ghost button--sm"
+                                          disabled={!dayStatus?.canSell || preparingCheckout}
+                                          onMouseDown={(event) => event.preventDefault()}
+                                          onClick={() => clearFieldQtyEdit(fieldId)}
+                                        >
+                                          Keep {qty}
+                                        </button>
+                                      </div>
+                                    )}
+                                  </div>
+                                ) : null,
+                              };
+                            };
+
+                            const roundControls =
+                              pkg.shape === "ROUND"
+                                ? renderContainerPackageStepper(null, roundQty, pkg.name)
+                                : null;
 
                             return (
                               <div
@@ -3212,122 +3371,50 @@ export function PosPage() {
                                 </div>
 
                                 <div className="refill-card__footer">
-                                  <div className="refill-card__price-row">
-                                    <span className="refill-card__price">
-                                      <strong>{formatCentavos(pkg.unitPriceCentavos)}</strong>
-                                    </span>
-                                    <span className="muted-sm">Same price for either gripo</span>
-                                  </div>
+                                  {roundControls ? (
+                                    <>
+                                      <div className="refill-card__price-row">
+                                        <span className="refill-card__price">
+                                          <strong>{formatCentavos(pkg.unitPriceCentavos)}</strong>
+                                        </span>
+                                        {roundControls.stepper}
+                                      </div>
+                                      {roundControls.errorNode}
+                                    </>
+                                  ) : (
+                                    <>
+                                      <div className="refill-card__price-row">
+                                        <span className="refill-card__price">
+                                          <strong>{formatCentavos(pkg.unitPriceCentavos)}</strong>
+                                        </span>
+                                        <span className="muted-sm">Same price for either gripo</span>
+                                      </div>
 
-                                  <div className="pos-gripo-rows">
-                                    {INCLUDED_GRIPO_OPTIONS.map((gripo) => {
-                                      const fieldId = containerPkgLineId(pkg.packageCode, gripo.value);
-                                      const qty =
-                                        containerPkgQtyByKey.get(
-                                          containerPkgKey(pkg.packageCode, gripo.value),
-                                        ) ?? 0;
-                                      const edit = qtyEdits[fieldId];
-                                      const visibleError = getVisibleQuantityError(edit);
-                                      const errorId = `qty-error-${fieldId}`;
-                                      const rowMax = getContainerPackageRowMax(
-                                        lines,
-                                        pkg.productId,
-                                        fieldId,
-                                        pkg.availableQuantity,
-                                      );
-                                      const effectiveMax = Math.max(rowMax, qty);
-                                      const overMaxMessage = getContainerPackageOverMaxMessage(
-                                        rowMax,
-                                        pkg.availableQuantity,
-                                      );
-                                      const isUnselectedUnavailable =
-                                        qty === 0 && (!isInStock || rowMax <= 0);
-                                      const labelWithGripo = `${pkg.name} (${gripo.label})`;
+                                      <div className="pos-gripo-rows">
+                                        {INCLUDED_GRIPO_OPTIONS.map((gripo) => {
+                                          const qty =
+                                            containerPkgQtyByKey.get(
+                                              containerPkgKey(pkg.packageCode, gripo.value),
+                                            ) ?? 0;
+                                          const slimControls = renderContainerPackageStepper(
+                                            gripo.value,
+                                            qty,
+                                            `${pkg.name} (${gripo.label})`,
+                                          );
 
-                                      return (
-                                        <div key={gripo.value} className="pos-gripo-row-wrap">
-                                          <div className="pos-gripo-row">
-                                            <span className="pos-gripo-row__label">{gripo.label}</span>
-                                            <QuantityStepper
-                                              value={qty}
-                                              edit={edit}
-                                              onEditChange={(nextEdit) => setFieldQtyEdit(fieldId, nextEdit)}
-                                              onCommitValidValue={(nextQty) =>
-                                                setContainerPackageQuantity(pkg, gripo.value, nextQty)
-                                              }
-                                              onStep={(delta) => {
-                                                clearFieldQtyEdit(fieldId);
-                                                stepContainerPackageQuantity(pkg, gripo.value, delta);
-                                              }}
-                                              groupLabel={`${labelWithGripo} quantity controls`}
-                                              inputLabel={`${labelWithGripo} quantity`}
-                                              decreaseLabel={`Decrease ${labelWithGripo}`}
-                                              increaseLabel={`Increase ${labelWithGripo}`}
-                                              disabled={
-                                                !dayStatus?.canSell ||
-                                                preparingCheckout ||
-                                                isUnselectedUnavailable
-                                              }
-                                              decreaseDisabled={
-                                                !dayStatus?.canSell || preparingCheckout || qty === 0
-                                              }
-                                              increaseDisabled={
-                                                !dayStatus?.canSell ||
-                                                preparingCheckout ||
-                                                !isInStock ||
-                                                qty >= rowMax
-                                              }
-                                              allowRestingZero
-                                              max={effectiveMax}
-                                              overMaxMessage={overMaxMessage}
-                                              errorId={errorId}
-                                              inputRef={(el) => {
-                                                if (el) qtyInputRefs.current.set(fieldId, el);
-                                                else qtyInputRefs.current.delete(fieldId);
-                                              }}
-                                            />
-                                          </div>
-                                          {visibleError && (
-                                            <div id={errorId} className="qty-stepper__error" role="alert">
-                                              <span>{visibleError}</span>
-                                              {edit?.pendingCommitValue != null && (
-                                                <div className="callout__actions">
-                                                  <button
-                                                    type="button"
-                                                    className="button button--primary button--sm"
-                                                    disabled={!dayStatus?.canSell || preparingCheckout}
-                                                    onMouseDown={(event) => event.preventDefault()}
-                                                    onClick={() => {
-                                                      const targetQty = edit.pendingCommitValue!;
-                                                      const committed = setContainerPackageQuantity(
-                                                        pkg,
-                                                        gripo.value,
-                                                        targetQty,
-                                                      );
-                                                      if (committed) {
-                                                        clearFieldQtyEdit(fieldId);
-                                                      }
-                                                    }}
-                                                  >
-                                                    Apply {edit.pendingCommitValue}
-                                                  </button>
-                                                  <button
-                                                    type="button"
-                                                    className="button button--ghost button--sm"
-                                                    disabled={!dayStatus?.canSell || preparingCheckout}
-                                                    onMouseDown={(event) => event.preventDefault()}
-                                                    onClick={() => clearFieldQtyEdit(fieldId)}
-                                                  >
-                                                    Keep {qty}
-                                                  </button>
-                                                </div>
-                                              )}
+                                          return (
+                                            <div key={gripo.value} className="pos-gripo-row-wrap">
+                                              <div className="pos-gripo-row">
+                                                <span className="pos-gripo-row__label">{gripo.label}</span>
+                                                {slimControls.stepper}
+                                              </div>
+                                              {slimControls.errorNode}
                                             </div>
-                                          )}
-                                        </div>
-                                      );
-                                    })}
-                                  </div>
+                                          );
+                                        })}
+                                      </div>
+                                    </>
+                                  )}
                                 </div>
                               </div>
                             );
@@ -3618,7 +3705,8 @@ export function PosPage() {
                             <p className="callout__title">Faucet choice required before payment</p>
                             <p className="callout__body">
                               This unpaid draft was created before Push-Type / Twist-Type gripo selection was
-                              required. Return to selection to choose the faucet type for each container package.
+                              required for Slim containers. Return to selection to choose the faucet type for
+                              each Slim container package.
                             </p>
                           </div>
                         ) : (

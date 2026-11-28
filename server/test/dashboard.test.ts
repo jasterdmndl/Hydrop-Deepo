@@ -352,7 +352,6 @@ describe("Dashboard sales report and authorization (DEC-076)", () => {
         {
           kind: "CONTAINER_PACKAGE",
           packageCode: "ROUND_EMPTY",
-          includedGripo: "PUSH_TYPE",
           quantity: 1,
         },
       ],
@@ -1071,7 +1070,6 @@ describe("Final Dashboard Sales comparison, breakdowns, and recommendations (DEC
         {
           kind: "CONTAINER_PACKAGE",
           packageCode: "ROUND_EMPTY",
-          includedGripo: "PUSH_TYPE",
           quantity: 3,
         },
         {
@@ -1699,7 +1697,6 @@ describe("Final Dashboard Sales comparison, breakdowns, and recommendations (DEC
         {
           kind: "CONTAINER_PACKAGE",
           packageCode: "ROUND_EMPTY",
-          includedGripo: "PUSH_TYPE",
           quantity: 3,
         },
       ],
@@ -1717,7 +1714,6 @@ describe("Final Dashboard Sales comparison, breakdowns, and recommendations (DEC
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_EMPTY",
-            includedGripo: "TWIST_TYPE",
             quantity: 2,
           },
         ],

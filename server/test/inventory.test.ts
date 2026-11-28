@@ -1172,7 +1172,6 @@ describe("Inventory Round/Slim opening stock and merchandise products (DEC-065, 
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_PURIFIED",
-            includedGripo: "PUSH_TYPE",
             quantity: 2,
           },
         ],
@@ -4730,7 +4729,6 @@ describe("Final Inventory Task 4 — integrated application verification (DEC-09
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_EMPTY",
-            includedGripo: "PUSH_TYPE",
             quantity: 1,
           },
           { kind: "MERCHANDISE", productId: faucetId, quantity: 1 },
@@ -4857,7 +4855,6 @@ describe("Final Inventory Task 4 — integrated application verification (DEC-09
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_EMPTY",
-            includedGripo: "PUSH_TYPE",
             quantity: 1,
           },
         ],
