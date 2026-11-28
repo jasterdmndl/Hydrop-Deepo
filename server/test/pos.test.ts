@@ -2808,7 +2808,6 @@ describe("POS station day and refill sales", () => {
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_EMPTY",
-            includedGripo: "PUSH_TYPE",
             quantity: 1,
           },
         ],
@@ -2859,13 +2858,11 @@ describe("POS station day and refill sales", () => {
             {
               kind: "CONTAINER_PACKAGE",
               packageCode: "ROUND_EMPTY",
-              includedGripo: "PUSH_TYPE",
               quantity: 3,
             },
             {
               kind: "CONTAINER_PACKAGE",
               packageCode: "ROUND_PURIFIED",
-              includedGripo: "TWIST_TYPE",
               quantity: 3,
             },
           ],
@@ -2881,13 +2878,11 @@ describe("POS station day and refill sales", () => {
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_EMPTY",
-            includedGripo: "PUSH_TYPE",
             quantity: 1,
           },
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_PURIFIED",
-            includedGripo: "TWIST_TYPE",
             quantity: 1,
           },
         ],
@@ -3202,41 +3197,41 @@ describe("POS station day and refill sales", () => {
 
     it("requires and saves customer Push-Type or Twist-Type gripo choices per container line at the same package price (Finding 4, POS-012)", async () => {
       await request(ctx.app)
-        .patch("/api/inventory/containers/ROUND")
+        .patch("/api/inventory/containers/SLIM")
         .set("Cookie", owner.cookie)
         .set("X-CSRF-Token", owner.csrfToken)
         .send({ showInPos: true });
-      await setOpeningStock("ROUND", 5);
+      await setOpeningStock("SLIM", 5);
 
       await startDay(ctx, owner, { requestKey: "finding4-day" });
 
-      // Missing includedGripo is rejected
+      // Missing includedGripo on Slim is rejected
       const missingGripo = await prepareCheckout(ctx, cashier, {
-        items: [{ kind: "CONTAINER_PACKAGE", packageCode: "ROUND_EMPTY", quantity: 1 }],
+        items: [{ kind: "CONTAINER_PACKAGE", packageCode: "SLIM_EMPTY", quantity: 1 }],
       });
       expect(missingGripo.status).toBe(400);
       expect(missingGripo.body.error.code).toBe("VALIDATION_FAILED");
 
-      // Mixed choices on the same package save as separate lines at ₱175 each with no extra charge
+      // Mixed choices on the same Slim package save as separate lines at ₱200 each with no extra charge
       const mixedGripoPrep = await prepareCheckout(ctx, cashier, {
         prepareKey: "f4-mixed-gripo",
         items: [
           {
             kind: "CONTAINER_PACKAGE",
-            packageCode: "ROUND_EMPTY",
+            packageCode: "SLIM_EMPTY",
             includedGripo: "PUSH_TYPE",
             quantity: 1,
           },
           {
             kind: "CONTAINER_PACKAGE",
-            packageCode: "ROUND_EMPTY",
+            packageCode: "SLIM_EMPTY",
             includedGripo: "TWIST_TYPE",
             quantity: 1,
           },
         ],
       });
       expect(mixedGripoPrep.status).toBe(201);
-      expect(mixedGripoPrep.body.checkout.totalCentavos).toBe(35000);
+      expect(mixedGripoPrep.body.checkout.totalCentavos).toBe(40000);
 
       const ref = mixedGripoPrep.body.checkout.reference as string;
       const confirmed = await confirmCheckout(ctx.app, cashier, ref, {
@@ -3246,21 +3241,21 @@ describe("POS station day and refill sales", () => {
       expect(confirmed.body.sale.items).toEqual([
         expect.objectContaining({
           kind: "CONTAINER_PACKAGE",
-          catalogCode: "ROUND_EMPTY",
+          catalogCode: "SLIM_EMPTY",
           includedGripo: "PUSH_TYPE",
-          displayLabel: "Empty Round Container · Push-Type gripo",
-          unitPriceCentavos: 17500,
+          displayLabel: "Empty Slim Container · Push-Type gripo",
+          unitPriceCentavos: 20000,
           quantity: 1,
-          lineTotalCentavos: 17500,
+          lineTotalCentavos: 20000,
         }),
         expect.objectContaining({
           kind: "CONTAINER_PACKAGE",
-          catalogCode: "ROUND_EMPTY",
+          catalogCode: "SLIM_EMPTY",
           includedGripo: "TWIST_TYPE",
-          displayLabel: "Empty Round Container · Twist-Type gripo",
-          unitPriceCentavos: 17500,
+          displayLabel: "Empty Slim Container · Twist-Type gripo",
+          unitPriceCentavos: 20000,
           quantity: 1,
-          lineTotalCentavos: 17500,
+          lineTotalCentavos: 20000,
         }),
       ]);
 
@@ -3274,7 +3269,7 @@ describe("POS station day and refill sales", () => {
       ]);
 
       const invAfter = await request(ctx.app).get("/api/inventory/items").set("Cookie", owner.cookie);
-      expect(invAfter.body.items.find((i: any) => i.shape === "ROUND").currentQuantity).toBe(3);
+      expect(invAfter.body.items.find((i: any) => i.shape === "SLIM").currentQuantity).toBe(3);
     });
 
     it("upgrades databases from either revision of 0009 via migration 0010 without guessing historical faucet choices (Finding 5)", async () => {
@@ -3482,7 +3477,7 @@ describe("POS station day and refill sales", () => {
         });
         expect(refillConfirm.status).toBe(201);
 
-        // New container sale saves includedGripo = TWIST_TYPE and returns it in history
+        // New Round container sale succeeds without includedGripo and saves includedGripo = null
         const newPkgPrep = await request(upgradeApp)
           .post("/api/pos/checkouts")
           .set("Cookie", cashierAfter.cookie)
@@ -3493,7 +3488,6 @@ describe("POS station day and refill sales", () => {
               {
                 kind: "CONTAINER_PACKAGE",
                 packageCode: "ROUND_EMPTY",
-                includedGripo: "TWIST_TYPE",
                 quantity: 1,
               },
             ],
@@ -3507,20 +3501,46 @@ describe("POS station day and refill sales", () => {
         expect(newPkgConfirm.body.sale.items[0]).toMatchObject({
           kind: "CONTAINER_PACKAGE",
           catalogCode: "ROUND_EMPTY",
-          includedGripo: "TWIST_TYPE",
-          displayLabel: "Empty Round Container · Twist-Type gripo",
+          includedGripo: null,
+          displayLabel: "Empty Round Container",
         });
 
-        // New container package checkout without includedGripo is rejected by Express validation
+        // New Slim container package checkout without includedGripo is rejected by Express validation,
+        // and new Round container package checkout with includedGripo is rejected
+        await upgradeDb.query(
+          `UPDATE inventory_items
+              SET show_in_pos = true,
+                  pos_section = 'CONTAINERS',
+                  current_quantity = 5,
+                  stock_revision = 1
+            WHERE category = 'CONTAINER' AND container_shape = 'SLIM'`,
+        );
         const missingGripoPrepare = await request(upgradeApp)
           .post("/api/pos/checkouts")
           .set("Cookie", cashierAfter.cookie)
           .set("X-CSRF-Token", cashierAfter.csrfToken)
           .send({
-            items: [{ kind: "CONTAINER_PACKAGE", packageCode: "ROUND_EMPTY", quantity: 1 }],
+            items: [{ kind: "CONTAINER_PACKAGE", packageCode: "SLIM_EMPTY", quantity: 1 }],
           });
         expect(missingGripoPrepare.status).toBe(400);
         expect(missingGripoPrepare.body.error.code).toBe("VALIDATION_FAILED");
+
+        const roundWithGripoPrepare = await request(upgradeApp)
+          .post("/api/pos/checkouts")
+          .set("Cookie", cashierAfter.cookie)
+          .set("X-CSRF-Token", cashierAfter.csrfToken)
+          .send({
+            items: [
+              {
+                kind: "CONTAINER_PACKAGE",
+                packageCode: "ROUND_EMPTY",
+                includedGripo: "PUSH_TYPE",
+                quantity: 1,
+              },
+            ],
+          });
+        expect(roundWithGripoPrepare.status).toBe(400);
+        expect(roundWithGripoPrepare.body.error.code).toBe("VALIDATION_FAILED");
       } finally {
         await upgradeDb.close();
       }
@@ -3744,13 +3764,28 @@ describe("POS station day and refill sales", () => {
         );
         expect(commitRows[0]!.status).toBe("CONSUMED");
 
-        // New container sale still requires includedGripo and saves it when provided
+        // New Slim container sale still requires includedGripo; new Round sale works without it
+        const { rows: slimRows } = await upgradeDb.query<{ id: string }>(
+          `UPDATE inventory_items
+              SET show_in_pos = true,
+                  pos_section = 'CONTAINERS',
+                  current_quantity = 5,
+                  stock_revision = 1
+            WHERE category = 'CONTAINER' AND container_shape = 'SLIM'
+            RETURNING id`,
+        );
+        await upgradeDb.query(
+          `INSERT INTO inventory_opening_counts (item_id, quantity, unit, recorded_by_user_id, recorded_at)
+           VALUES ($1, 5, 'containers', $2, '2026-11-22T09:00:00+08:00')`,
+          [slimRows[0]!.id, ownerId],
+        );
+
         const newMissingRes = await request(upgradeApp)
           .post("/api/pos/checkouts")
           .set("Cookie", cashier.cookie)
           .set("X-CSRF-Token", cashier.csrfToken)
           .send({
-            items: [{ kind: "CONTAINER_PACKAGE", packageCode: "ROUND_EMPTY", quantity: 1 }],
+            items: [{ kind: "CONTAINER_PACKAGE", packageCode: "SLIM_EMPTY", quantity: 1 }],
           });
         expect(newMissingRes.status).toBe(400);
         expect(newMissingRes.body.error.code).toBe("VALIDATION_FAILED");
@@ -3763,7 +3798,7 @@ describe("POS station day and refill sales", () => {
             items: [
               {
                 kind: "CONTAINER_PACKAGE",
-                packageCode: "ROUND_EMPTY",
+                packageCode: "SLIM_EMPTY",
                 includedGripo: "PUSH_TYPE",
                 quantity: 1,
               },
@@ -3858,6 +3893,22 @@ describe("POS station day and refill sales", () => {
           [roundId, ownerId],
         );
 
+        const { rows: slimRows } = await upgradeDb.query<{ id: string }>(
+          `UPDATE inventory_items
+              SET show_in_pos = true,
+                  pos_section = 'CONTAINERS',
+                  current_quantity = 5,
+                  stock_revision = 1
+            WHERE category = 'CONTAINER' AND container_shape = 'SLIM'
+            RETURNING id`,
+        );
+        const slimId = slimRows[0]!.id;
+        await upgradeDb.query(
+          `INSERT INTO inventory_opening_counts (item_id, quantity, unit, recorded_by_user_id, recorded_at)
+           VALUES ($1, 5, 'containers', $2, '2026-11-22T09:00:00+08:00')`,
+          [slimId, ownerId],
+        );
+
         const { rows: dayRows } = await upgradeDb.query<{ id: string }>(
           `INSERT INTO pos_business_days (business_date, started_by_user_id, started_at, next_reference_seq)
            VALUES ('2026-11-22', $1, '2026-11-22T09:00:00+08:00', 3)
@@ -3866,7 +3917,26 @@ describe("POS station day and refill sales", () => {
         );
         const dayId = dayRows[0]!.id;
 
-        const legacyQuoteSnapshot = [
+        const legacySlimDraftSnapshot = [
+          {
+            lineIndex: 0,
+            kind: "CONTAINER_PACKAGE",
+            catalogCode: "SLIM_EMPTY",
+            waterType: null,
+            productId: slimId,
+            stockUnit: "containers",
+            posSection: "CONTAINERS",
+            displayLabel: "Empty Slim Container",
+            unitVolumeMl: 0,
+            unitVolumeLiters: 0,
+            unitPriceCentavos: 20000,
+            quantity: 1,
+            lineTotalCentavos: 20000,
+            lineVolumeMl: 0,
+            lineVolumeLiters: 0,
+          },
+        ];
+        const legacyPendingSnapshot = [
           {
             lineIndex: 0,
             kind: "CONTAINER_PACKAGE",
@@ -3885,9 +3955,9 @@ describe("POS station day and refill sales", () => {
             lineVolumeLiters: 0,
           },
         ];
-        const snapshotJson = JSON.stringify(legacyQuoteSnapshot);
+        const snapshotJson = JSON.stringify(legacySlimDraftSnapshot);
 
-        // Two legacy unpaid DRAFT checkouts (no includedGripo) and one legacy PAYMENT_PENDING checkout
+        // Two legacy unpaid Slim DRAFT checkouts (no includedGripo) and one legacy PAYMENT_PENDING checkout
         const draftBeginRef = "HD-1122-001";
         const draftDirectConfirmRef = "HD-1122-002";
         const pendingRef = "HD-1122-003";
@@ -3898,7 +3968,7 @@ describe("POS station day and refill sales", () => {
              status, quote_hash, quote_snapshot, total_centavos, total_containers, total_volume_ml,
              created_at, updated_at
            )
-           VALUES ($1, $2, '2026-11-22', $3, 'DRAFT', 'legacy-draft-1', $4::jsonb, 17500, 0, 0,
+           VALUES ($1, $2, '2026-11-22', $3, 'DRAFT', 'legacy-draft-1', $4::jsonb, 20000, 0, 0,
                    '2026-11-22T11:10:00+08:00', '2026-11-22T11:10:00+08:00')
            RETURNING id`,
           [draftBeginRef, dayId, cashierId, snapshotJson],
@@ -3909,7 +3979,7 @@ describe("POS station day and refill sales", () => {
              status, quote_hash, quote_snapshot, total_centavos, total_containers, total_volume_ml,
              created_at, updated_at
            )
-           VALUES ($1, $2, '2026-11-22', $3, 'DRAFT', 'legacy-draft-2', $4::jsonb, 17500, 0, 0,
+           VALUES ($1, $2, '2026-11-22', $3, 'DRAFT', 'legacy-draft-2', $4::jsonb, 20000, 0, 0,
                    '2026-11-22T11:12:00+08:00', '2026-11-22T11:12:00+08:00')
            RETURNING id`,
           [draftDirectConfirmRef, dayId, cashierId, snapshotJson],
@@ -3923,7 +3993,7 @@ describe("POS station day and refill sales", () => {
            VALUES ($1, $2, '2026-11-22', $3, 'PAYMENT_PENDING', 'legacy-pending-3', $4::jsonb, 17500, 0, 0,
                    '2026-11-22T11:15:00+08:00', '2026-11-22T11:14:00+08:00', '2026-11-22T11:15:00+08:00')
            RETURNING id`,
-          [pendingRef, dayId, cashierId, snapshotJson],
+          [pendingRef, dayId, cashierId, JSON.stringify(legacyPendingSnapshot)],
         );
         await upgradeDb.query(
           `INSERT INTO pos_checkout_stock_commitments (checkout_id, item_id, quantity, status, created_at)
@@ -3983,8 +4053,8 @@ describe("POS station day and refill sales", () => {
           .set("X-CSRF-Token", cashier.csrfToken)
           .send({
             cashReceivedCentavos: 20000,
-            items: [{ kind: "CONTAINER_PACKAGE", packageCode: "ROUND_EMPTY", quantity: 1 }],
-            expectedTotalCentavos: 17500,
+            items: [{ kind: "CONTAINER_PACKAGE", packageCode: "SLIM_EMPTY", quantity: 1 }],
+            expectedTotalCentavos: 20000,
           });
         expect(directConfirmWithItems.status).toBe(409);
         expect(directConfirmWithItems.body.error.code).toBe("GRIPO_CHOICE_REQUIRED");
@@ -3995,7 +4065,7 @@ describe("POS station day and refill sales", () => {
         );
         expect(d2Sales[0]!.count).toBe("0");
 
-        // 3. Staff can cancel both unpaid drafts, then prepare & confirm a replacement with TWIST_TYPE
+        // 3. Staff can cancel both unpaid drafts, then prepare & confirm a replacement Slim sale with TWIST_TYPE
         for (const ref of [draftBeginRef, draftDirectConfirmRef]) {
           const cancelRes = await request(upgradeApp)
             .post(`/api/pos/checkouts/${ref}/cancel`)
@@ -4014,7 +4084,7 @@ describe("POS station day and refill sales", () => {
             items: [
               {
                 kind: "CONTAINER_PACKAGE",
-                packageCode: "ROUND_EMPTY",
+                packageCode: "SLIM_EMPTY",
                 includedGripo: "TWIST_TYPE",
                 quantity: 1,
               },
@@ -4050,12 +4120,17 @@ describe("POS station day and refill sales", () => {
         expect(pendingReplay.status).toBe(200);
         expect(pendingReplay.body.replayed).toBe(true);
 
-        // Stock deducted twice total: 1 for fresh TWIST_TYPE sale + 1 for pendingRef recovery = 5 -> 3
-        const { rows: stockRows } = await upgradeDb.query<{ current_quantity: number }>(
+        // Stock deducted once for Slim (5 -> 4) and once for Round pendingRef recovery (5 -> 4)
+        const { rows: roundStockRows } = await upgradeDb.query<{ current_quantity: number }>(
           `SELECT current_quantity FROM inventory_items WHERE id = $1`,
           [roundId],
         );
-        expect(Number(stockRows[0]!.current_quantity)).toBe(3);
+        expect(Number(roundStockRows[0]!.current_quantity)).toBe(4);
+        const { rows: slimStockRows } = await upgradeDb.query<{ current_quantity: number }>(
+          `SELECT current_quantity FROM inventory_items WHERE id = $1`,
+          [slimId],
+        );
+        expect(Number(slimStockRows[0]!.current_quantity)).toBe(4);
 
         // End Day closes cleanly
         const endDayRes = await request(upgradeApp)
@@ -4127,7 +4202,7 @@ describe("POS station day and refill sales", () => {
                   pos_section = 'CONTAINERS',
                   current_quantity = 5,
                   stock_revision = 1
-            WHERE category = 'CONTAINER' AND container_shape = 'ROUND'
+            WHERE category = 'CONTAINER' AND container_shape = 'SLIM'
             RETURNING id`,
         );
         const roundId = roundRows[0]!.id;
@@ -4150,17 +4225,17 @@ describe("POS station day and refill sales", () => {
           {
             lineIndex: 0,
             kind: "CONTAINER_PACKAGE",
-            catalogCode: "ROUND_EMPTY",
+            catalogCode: "SLIM_EMPTY",
             waterType: null,
             productId: roundId,
             stockUnit: "containers",
             posSection: "CONTAINERS",
-            displayLabel: "Empty Round Container",
+            displayLabel: "Empty Slim Container",
             unitVolumeMl: 0,
             unitVolumeLiters: 0,
-            unitPriceCentavos: 17500,
+            unitPriceCentavos: 20000,
             quantity: 1,
-            lineTotalCentavos: 17500,
+            lineTotalCentavos: 20000,
             lineVolumeMl: 0,
             lineVolumeLiters: 0,
           },
@@ -4171,7 +4246,7 @@ describe("POS station day and refill sales", () => {
              status, quote_hash, quote_snapshot, total_centavos, total_containers, total_volume_ml,
              created_at, updated_at
            )
-           VALUES ($1, $2, '2026-11-22', $3, 'DRAFT', 'legacy-midnight-draft', $4::jsonb, 17500, 0, 0,
+           VALUES ($1, $2, '2026-11-22', $3, 'DRAFT', 'legacy-midnight-draft', $4::jsonb, 20000, 0, 0,
                    '2026-11-22T23:40:00+08:00', '2026-11-22T23:40:00+08:00')
            RETURNING id`,
           [draftRef, dayId, cashierId, JSON.stringify(legacyQuoteSnapshot)],
@@ -4385,7 +4460,6 @@ describe("POS station day and refill sales", () => {
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_PURIFIED",
-            includedGripo: "TWIST_TYPE",
             quantity: 1,
           },
         ],
@@ -4601,7 +4675,7 @@ describe("POS station day and refill sales", () => {
       );
       expect(merchCommit[0]!.status).toBe("CONSUMED");
 
-      // Owner settles container package checkout (ROUND_PURIFIED + TWIST_TYPE) and preserves package details
+      // Owner settles container package checkout (ROUND_PURIFIED) and preserves package details
       const settlePkg = await request(ctx.app)
         .post(`/api/pos/checkouts/${encodeURIComponent(pkgRef)}/settle`)
         .set("Cookie", owner.cookie)
@@ -4609,7 +4683,7 @@ describe("POS station day and refill sales", () => {
         .send({
           paymentKeptConfirmed: true,
           itemsHandedOverConfirmed: true,
-          note: "Twist container handed over",
+          note: "Round container handed over",
         });
       expect(settlePkg.status).toBe(201);
       expect(settlePkg.body.settlement).toMatchObject({
@@ -4622,8 +4696,8 @@ describe("POS station day and refill sales", () => {
       expect(settlePkg.body.settlement.items[0]).toMatchObject({
         kind: "CONTAINER_PACKAGE",
         catalogCode: "ROUND_PURIFIED",
-        includedGripo: "TWIST_TYPE",
-        displayLabel: "Round Container (Purified · 25 L) · Twist-Type gripo",
+        includedGripo: null,
+        displayLabel: "Round Container (Purified · 25 L)",
       });
 
       const { rows: roundStockRows } = await ctx.db.query<{ current_quantity: number }>(
@@ -5228,7 +5302,6 @@ describe("POS station day and refill sales", () => {
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_EMPTY",
-            includedGripo: "PUSH_TYPE",
             quantity: 1,
           },
         ],
@@ -5359,7 +5432,6 @@ describe("POS station day and refill sales", () => {
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_EMPTY",
-            includedGripo: "TWIST_TYPE",
             quantity: 2,
           },
         ],
@@ -5490,7 +5562,6 @@ describe("POS station day and refill sales", () => {
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_EMPTY",
-            includedGripo: "PUSH_TYPE",
             quantity: 1,
           },
         ],
@@ -5513,7 +5584,6 @@ describe("POS station day and refill sales", () => {
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_EMPTY",
-            includedGripo: "TWIST_TYPE",
             quantity: 1,
           },
         ],
@@ -5616,7 +5686,6 @@ describe("POS station day and refill sales", () => {
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_PURIFIED",
-            includedGripo: "PUSH_TYPE",
             quantity: 1,
           },
         ],
@@ -5704,7 +5773,6 @@ describe("POS station day and refill sales", () => {
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_EMPTY",
-            includedGripo: "PUSH_TYPE",
             quantity: 3,
           },
         ],
@@ -5718,7 +5786,6 @@ describe("POS station day and refill sales", () => {
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_EMPTY",
-            includedGripo: "PUSH_TYPE",
             quantity: 2,
           },
         ],
@@ -5867,7 +5934,6 @@ describe("POS station day and refill sales", () => {
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_PURIFIED",
-            includedGripo: "PUSH_TYPE",
             quantity: 1,
           },
         ],
@@ -5890,7 +5956,6 @@ describe("POS station day and refill sales", () => {
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_ALKALINE",
-            includedGripo: "TWIST_TYPE",
             quantity: 1,
           },
         ],
@@ -6000,7 +6065,6 @@ describe("POS station day and refill sales", () => {
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_EMPTY",
-            includedGripo: "PUSH_TYPE",
             quantity: 3,
           },
         ],
@@ -6014,7 +6078,6 @@ describe("POS station day and refill sales", () => {
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_EMPTY",
-            includedGripo: "PUSH_TYPE",
             quantity: 2,
           },
         ],
@@ -6033,7 +6096,6 @@ describe("POS station day and refill sales", () => {
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_PURIFIED",
-            includedGripo: "PUSH_TYPE",
             quantity: 1,
           },
         ],
@@ -6134,7 +6196,6 @@ describe("POS station day and refill sales", () => {
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_EMPTY",
-            includedGripo: "PUSH_TYPE",
             quantity: 3,
           },
         ],
@@ -6149,7 +6210,6 @@ describe("POS station day and refill sales", () => {
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_PURIFIED",
-            includedGripo: "TWIST_TYPE",
             quantity: 1,
           },
         ],
@@ -6183,13 +6243,11 @@ describe("POS station day and refill sales", () => {
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_EMPTY",
-            includedGripo: "PUSH_TYPE",
             quantity: 1,
           },
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_PURIFIED",
-            includedGripo: "PUSH_TYPE",
             quantity: 1,
           },
         ],
@@ -6252,7 +6310,6 @@ describe("POS station day and refill sales", () => {
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_ALKALINE",
-            includedGripo: "TWIST_TYPE",
             quantity: 1,
           },
         ],
@@ -6295,7 +6352,6 @@ describe("POS station day and refill sales", () => {
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_PURIFIED",
-            includedGripo: "PUSH_TYPE",
             quantity: 2,
           },
         ],
@@ -6309,7 +6365,6 @@ describe("POS station day and refill sales", () => {
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_EMPTY",
-            includedGripo: "PUSH_TYPE",
             quantity: 1,
           },
         ],
@@ -6409,7 +6464,6 @@ describe("POS station day and refill sales", () => {
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_PURIFIED",
-            includedGripo: "PUSH_TYPE",
             quantity: 2,
           },
         ],
@@ -6814,7 +6868,6 @@ describe("POS station day and refill sales", () => {
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_EMPTY",
-            includedGripo: "PUSH_TYPE",
             quantity: 1,
           },
         ],
@@ -7438,7 +7491,6 @@ describe("POS station day and refill sales", () => {
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_EMPTY",
-            includedGripo: "PUSH_TYPE",
             quantity: 2,
           },
           { kind: "MERCHANDISE", productId: faucetId, quantity: 3 },
@@ -7547,7 +7599,6 @@ describe("POS station day and refill sales", () => {
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_EMPTY",
-            includedGripo: "PUSH_TYPE",
             quantity: 1,
           },
         ],
@@ -7568,7 +7619,6 @@ describe("POS station day and refill sales", () => {
             {
               kind: "CONTAINER_PACKAGE",
               packageCode: "ROUND_PURIFIED",
-              includedGripo: "TWIST_TYPE",
               quantity: 1,
             },
           ],
@@ -7606,7 +7656,6 @@ describe("POS station day and refill sales", () => {
             {
               kind: "CONTAINER_PACKAGE",
               packageCode: "ROUND_PURIFIED",
-              includedGripo: "TWIST_TYPE",
               quantity: 1,
             },
           ],
@@ -7642,7 +7691,6 @@ describe("POS station day and refill sales", () => {
             {
               kind: "CONTAINER_PACKAGE",
               packageCode: "ROUND_PURIFIED",
-              includedGripo: "TWIST_TYPE",
               quantity: 1,
             },
           ],
@@ -8035,7 +8083,6 @@ describe("POS station day and refill sales", () => {
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_PURIFIED",
-            includedGripo: "PUSH_TYPE",
             quantity: 1,
           },
         ],
@@ -8104,7 +8151,6 @@ describe("POS station day and refill sales", () => {
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_EMPTY",
-            includedGripo: "PUSH_TYPE",
             quantity: 2,
           },
         ],
@@ -8674,7 +8720,7 @@ describe("POS station day and refill sales", () => {
       expect((await startDay(ctx, owner, { requestKey: "t4-int-day1" })).status).toBe(201);
       ctx.clock.advance(5_000);
 
-      // Sale A: 1x ROUND_PURIFIED (25 L, ₱200, included Push gripo) + 1x standalone Push Faucet (₱40) = ₱240
+      // Sale A: 1x ROUND_PURIFIED (25 L, ₱200) + 1x standalone Push Faucet (₱40) = ₱240
       const saleA = await saveSale(
         cashier,
         "t4-int-sale-a",
@@ -8682,7 +8728,6 @@ describe("POS station day and refill sales", () => {
           {
             kind: "CONTAINER_PACKAGE",
             packageCode: "ROUND_PURIFIED",
-            includedGripo: "PUSH_TYPE",
             quantity: 1,
           },
           { kind: "MERCHANDISE", productId: pushId, quantity: 1 },
@@ -8705,7 +8750,6 @@ describe("POS station day and refill sales", () => {
             {
               kind: "CONTAINER_PACKAGE",
               packageCode: "ROUND_ALKALINE",
-              includedGripo: "PUSH_TYPE",
               quantity: 1,
             },
             { kind: "MERCHANDISE", productId: twistId, quantity: 1 },
@@ -8885,6 +8929,511 @@ describe("POS station day and refill sales", () => {
         "OPENING_COUNT",
         "POS_SALE",
       ]);
+    });
+  });
+
+  describe("DEC-119 — Round package faucet selection removal", () => {
+    async function setupRoundSlimAndFaucets(roundQty = 6, slimQty = 4) {
+      for (const shape of ["ROUND", "SLIM"] as const) {
+        expect(
+          (
+            await request(ctx.app)
+              .patch(`/api/inventory/containers/${shape}`)
+              .set("Cookie", owner.cookie)
+              .set("X-CSRF-Token", owner.csrfToken)
+              .send({ showInPos: true })
+          ).status,
+        ).toBe(200);
+        const qty = shape === "ROUND" ? roundQty : slimQty;
+        expect(
+          (
+            await request(ctx.app)
+              .post(`/api/inventory/items/${shape}/opening-stock`)
+              .set("Cookie", owner.cookie)
+              .set("X-CSRF-Token", owner.csrfToken)
+              .send({ quantity: qty })
+          ).status,
+        ).toBe(201);
+      }
+
+      const createMerch = async (
+        name: string,
+        faucetReportingType: "PUSH_TYPE" | "TWIST_TYPE",
+        unitPriceCentavos: number,
+        qty: number,
+      ) => {
+        const created = await request(ctx.app)
+          .post("/api/inventory/products")
+          .set("Cookie", owner.cookie)
+          .set("X-CSRF-Token", owner.csrfToken)
+          .send({
+            name,
+            unit: "pcs",
+            unitConfirmed: true,
+            unitPriceCentavos,
+            showInPos: true,
+            posSection: "CHANGE_OF_GRIPO",
+            faucetReportingType,
+          });
+        expect(created.status).toBe(201);
+        const id = created.body.item.id as string;
+        expect(
+          (
+            await request(ctx.app)
+              .post(`/api/inventory/items/${id}/opening-stock`)
+              .set("Cookie", owner.cookie)
+              .set("X-CSRF-Token", owner.csrfToken)
+              .send({ quantity: qty })
+          ).status,
+        ).toBe(201);
+        return id;
+      };
+
+      const pushFaucetId = await createMerch("Standalone Push Faucet", "PUSH_TYPE", 4000, 5);
+      const twistFaucetId = await createMerch("Standalone Twist Faucet", "TWIST_TYPE", 6000, 5);
+
+      const invRes = await request(ctx.app).get("/api/inventory/items").set("Cookie", owner.cookie);
+      const roundId = invRes.body.items.find((i: any) => i.shape === "ROUND").id as string;
+      const slimId = invRes.body.items.find((i: any) => i.shape === "SLIM").id as string;
+      return { roundId, slimId, pushFaucetId, twistFaucetId };
+    }
+
+    it("sells all three Round fill options without faucet choice, keeps standalone faucet stock separate, and preserves Slim choices", async () => {
+      const { roundId, slimId, pushFaucetId, twistFaucetId } = await setupRoundSlimAndFaucets(6, 4);
+      expect((await startDay(ctx, owner, { requestKey: "dec119-day1" })).status).toBe(201);
+
+      // 1. New Round checkouts reject includedGripo across all fill options
+      for (const packageCode of ["ROUND_EMPTY", "ROUND_PURIFIED", "ROUND_ALKALINE"] as const) {
+        for (const includedGripo of ["PUSH_TYPE", "TWIST_TYPE"] as const) {
+          const rejected = await prepareCheckout(ctx, cashier, {
+            items: [{ kind: "CONTAINER_PACKAGE", packageCode, includedGripo, quantity: 1 }],
+          });
+          expect(rejected.status).toBe(400);
+          expect(rejected.body.error.code).toBe("VALIDATION_FAILED");
+        }
+      }
+
+      // 2. Slim checkouts still require includedGripo and accept both choices
+      const slimMissing = await prepareCheckout(ctx, cashier, {
+        items: [{ kind: "CONTAINER_PACKAGE", packageCode: "SLIM_EMPTY", quantity: 1 }],
+      });
+      expect(slimMissing.status).toBe(400);
+      expect(slimMissing.body.error.code).toBe("VALIDATION_FAILED");
+
+      // 3. Sell 1x ROUND_EMPTY (₱175) + 1x ROUND_PURIFIED (₱200) + 1x ROUND_ALKALINE (₱210) = ₱585
+      const roundPrep = await prepareCheckout(ctx, cashier, {
+        prepareKey: "dec119-round-all3",
+        items: [
+          { kind: "CONTAINER_PACKAGE", packageCode: "ROUND_EMPTY", quantity: 1 },
+          { kind: "CONTAINER_PACKAGE", packageCode: "ROUND_PURIFIED", quantity: 1 },
+          { kind: "CONTAINER_PACKAGE", packageCode: "ROUND_ALKALINE", quantity: 1 },
+        ],
+      });
+      expect(roundPrep.status).toBe(201);
+      expect(roundPrep.body.checkout.totalCentavos).toBe(58500);
+      const roundRef = roundPrep.body.checkout.reference as string;
+      const roundConf = await confirmCheckout(ctx.app, cashier, roundRef, {
+        cashReceivedCentavos: 60000,
+      });
+      expect(roundConf.status).toBe(201);
+      expect(roundConf.body.sale.items).toEqual([
+        expect.objectContaining({
+          catalogCode: "ROUND_EMPTY",
+          includedGripo: null,
+          displayLabel: "Empty Round Container",
+          unitPriceCentavos: 17500,
+        }),
+        expect.objectContaining({
+          catalogCode: "ROUND_PURIFIED",
+          includedGripo: null,
+          displayLabel: "Round Container (Purified · 25 L)",
+          unitPriceCentavos: 20000,
+        }),
+        expect.objectContaining({
+          catalogCode: "ROUND_ALKALINE",
+          includedGripo: null,
+          displayLabel: "Round Container (Alkaline · 25 L)",
+          unitPriceCentavos: 21000,
+        }),
+      ]);
+
+      // Round stock: 6 -> 3; Slim stays 4; standalone faucets stay 5 & 5
+      let invAfter = await request(ctx.app).get("/api/inventory/items").set("Cookie", owner.cookie);
+      expect(invAfter.body.items.find((i: any) => i.id === roundId).currentQuantity).toBe(3);
+      expect(invAfter.body.items.find((i: any) => i.id === slimId).currentQuantity).toBe(4);
+      expect(invAfter.body.items.find((i: any) => i.id === pushFaucetId).currentQuantity).toBe(5);
+      expect(invAfter.body.items.find((i: any) => i.id === twistFaucetId).currentQuantity).toBe(5);
+
+      // 4. Standalone faucet purchase deducts from its own faucet stock without touching Round stock
+      const faucetPrep = await prepareCheckout(ctx, cashier, {
+        prepareKey: "dec119-faucet-only",
+        items: [{ kind: "MERCHANDISE", productId: pushFaucetId, quantity: 2 }],
+      });
+      expect(faucetPrep.status).toBe(201);
+      const faucetConf = await confirmCheckout(
+        ctx.app,
+        cashier,
+        faucetPrep.body.checkout.reference as string,
+        { cashReceivedCentavos: 10000 },
+      );
+      expect(faucetConf.status).toBe(201);
+
+      // 5. Slim still accepts both Push-Type and Twist-Type
+      const slimPrep = await prepareCheckout(ctx, cashier, {
+        prepareKey: "dec119-slim-both",
+        items: [
+          { kind: "CONTAINER_PACKAGE", packageCode: "SLIM_EMPTY", includedGripo: "PUSH_TYPE", quantity: 1 },
+          { kind: "CONTAINER_PACKAGE", packageCode: "SLIM_PURIFIED", includedGripo: "TWIST_TYPE", quantity: 1 },
+        ],
+      });
+      expect(slimPrep.status).toBe(201);
+      const slimConf = await confirmCheckout(
+        ctx.app,
+        cashier,
+        slimPrep.body.checkout.reference as string,
+        { cashReceivedCentavos: 50000 },
+      );
+      expect(slimConf.status).toBe(201);
+      expect(slimConf.body.sale.items.map((i: any) => i.includedGripo)).toEqual([
+        "PUSH_TYPE",
+        "TWIST_TYPE",
+      ]);
+
+      invAfter = await request(ctx.app).get("/api/inventory/items").set("Cookie", owner.cookie);
+      expect(invAfter.body.items.find((i: any) => i.id === roundId).currentQuantity).toBe(3);
+      expect(invAfter.body.items.find((i: any) => i.id === slimId).currentQuantity).toBe(2);
+      expect(invAfter.body.items.find((i: any) => i.id === pushFaucetId).currentQuantity).toBe(3);
+      expect(invAfter.body.items.find((i: any) => i.id === twistFaucetId).currentQuantity).toBe(5);
+    });
+
+    it("recovers an already-started Round checkout with its original includedGripo and handles historical vs new Round corrections", async () => {
+      const { roundId } = await setupRoundSlimAndFaucets(6, 4);
+      expect((await startDay(ctx, owner, { requestKey: "dec119-day2" })).status).toBe(201);
+
+      const { rows: dayRows } = await ctx.db.query<{ id: string }>(
+        `SELECT id FROM pos_business_days WHERE closed_at IS NULL LIMIT 1`,
+      );
+      const dayId = dayRows[0]!.id;
+      const { rows: userRows } = await ctx.db.query<{ id: string }>(
+        `SELECT id FROM app_users WHERE username = 'cashier1'`,
+      );
+      const cashierId = userRows[0]!.id;
+
+      // Seed an already-started pre-DEC-119 Round checkout carrying includedGripo = "PUSH_TYPE"
+      const legacyRef = "HD-1109-901";
+      const legacyPrepareKey = "dec119-legacy-prep-key";
+      const legacyItems = [
+        {
+          lineIndex: 0,
+          kind: "CONTAINER_PACKAGE",
+          catalogCode: "ROUND_EMPTY",
+          waterType: null,
+          productId: roundId,
+          stockUnit: "containers",
+          posSection: "CONTAINERS",
+          includedGripo: "PUSH_TYPE",
+          displayLabel: "Empty Round Container · Push-Type gripo",
+          unitVolumeMl: 0,
+          unitVolumeLiters: 0,
+          unitPriceCentavos: 17500,
+          quantity: 1,
+          lineTotalCentavos: 17500,
+          lineVolumeMl: 0,
+          lineVolumeLiters: 0,
+        },
+      ];
+      const { rows: coRows } = await ctx.db.query<{ id: string }>(
+        `INSERT INTO pos_checkouts (
+           reference, business_day_id, business_date, created_by_user_id,
+           prepare_key, status, quote_hash, quote_snapshot,
+           total_centavos, total_containers, total_volume_ml,
+           payment_started_at, created_at, updated_at
+         )
+         VALUES ($1, $2, '2026-11-09', $3, $4, 'PAYMENT_PENDING', 'dec119-legacy-hash', $5::jsonb,
+                 17500, 0, 0, '2026-11-09T09:05:00+08:00', '2026-11-09T09:04:00+08:00', '2026-11-09T09:05:00+08:00')
+         RETURNING id`,
+        [legacyRef, dayId, cashierId, legacyPrepareKey, JSON.stringify(legacyItems)],
+      );
+      await ctx.db.query(
+        `INSERT INTO pos_checkout_stock_commitments (checkout_id, item_id, quantity, status, created_at)
+         VALUES ($1, $2, 1, 'ACTIVE', '2026-11-09T09:05:00+08:00')`,
+        [coRows[0]!.id, roundId],
+      );
+
+      // Prepare replay with the original prepareKey and includedGripo succeeds
+      const replayPrep = await prepareCheckout(ctx, cashier, {
+        prepareKey: legacyPrepareKey,
+        items: [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_EMPTY",
+            includedGripo: "PUSH_TYPE",
+            quantity: 1,
+          },
+        ],
+      });
+      expect(replayPrep.status).toBe(200);
+      expect(replayPrep.body.checkout.reference).toBe(legacyRef);
+
+      // Lookup & confirm preserve includedGripo = "PUSH_TYPE" and its saved displayLabel
+      const lookup = await request(ctx.app)
+        .get(`/api/pos/checkouts/${encodeURIComponent(legacyRef)}`)
+        .set("Cookie", cashier.cookie);
+      expect(lookup.status).toBe(200);
+      expect(lookup.body.recoveryState).toBe("SAFE_TO_RETRY");
+      expect(lookup.body.checkout.items[0].includedGripo).toBe("PUSH_TYPE");
+
+      const legacyConf = await confirmCheckout(ctx.app, cashier, legacyRef, {
+        cashReceivedCentavos: 20000,
+        items: [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_EMPTY",
+            includedGripo: "PUSH_TYPE",
+            quantity: 1,
+          },
+        ],
+        expectedTotalCentavos: 17500,
+      });
+      expect(legacyConf.status).toBe(201);
+      expect(legacyConf.body.sale.items[0]).toMatchObject({
+        catalogCode: "ROUND_EMPTY",
+        includedGripo: "PUSH_TYPE",
+        displayLabel: "Empty Round Container · Push-Type gripo",
+      });
+
+      // Sale correction on the historical Round sale:
+      // a) Adding a new Round unit WITH includedGripo is rejected 400
+      const rejectExtraWithGripo = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(legacyRef)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "CORRECT",
+          reason: "Try adding new Round with gripo",
+          prepareKey: "dec119-corr-reject",
+          items: [
+            {
+              kind: "CONTAINER_PACKAGE",
+              packageCode: "ROUND_EMPTY",
+              includedGripo: "PUSH_TYPE",
+              originalLineIndex: 0,
+              quantity: 2,
+            },
+          ],
+        });
+      expect(rejectExtraWithGripo.status).toBe(400);
+      expect(rejectExtraWithGripo.body.error.code).toBe("VALIDATION_FAILED");
+
+      // b) Retaining the historical Round unit (with originalLineIndex + PUSH_TYPE) while adding 1 new Round unit (without includedGripo) succeeds
+      const splitCorrPrep = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(legacyRef)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "CORRECT",
+          reason: "Keep historical Round and add 1 new Round",
+          prepareKey: "dec119-corr-split",
+          items: [
+            {
+              kind: "CONTAINER_PACKAGE",
+              packageCode: "ROUND_EMPTY",
+              includedGripo: "PUSH_TYPE",
+              originalLineIndex: 0,
+              quantity: 1,
+            },
+            {
+              kind: "CONTAINER_PACKAGE",
+              packageCode: "ROUND_PURIFIED",
+              quantity: 1,
+            },
+          ],
+        });
+      expect(splitCorrPrep.status).toBe(201);
+      expect(splitCorrPrep.body.action.correctedItems).toEqual([
+        expect.objectContaining({
+          catalogCode: "ROUND_EMPTY",
+          includedGripo: "PUSH_TYPE",
+          displayLabel: "Empty Round Container · Push-Type gripo",
+          quantity: 1,
+        }),
+        expect.objectContaining({
+          catalogCode: "ROUND_PURIFIED",
+          includedGripo: null,
+          displayLabel: "Round Container (Purified · 25 L)",
+          quantity: 1,
+        }),
+      ]);
+
+      // Replay with same prepareKey and exact originalLineIndex works cleanly
+      const splitReplay = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(legacyRef)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "CORRECT",
+          reason: "Keep historical Round and add 1 new Round",
+          prepareKey: "dec119-corr-split",
+          items: [
+            {
+              kind: "CONTAINER_PACKAGE",
+              packageCode: "ROUND_EMPTY",
+              includedGripo: "PUSH_TYPE",
+              originalLineIndex: 0,
+              quantity: 1,
+            },
+            {
+              kind: "CONTAINER_PACKAGE",
+              packageCode: "ROUND_PURIFIED",
+              quantity: 1,
+            },
+          ],
+        });
+      expect(splitReplay.status).toBe(200);
+      expect(splitReplay.body.replayed).toBe(true);
+
+      // Finding 2: Reusing the same prepareKey with a changed/nonexistent container originalLineIndex or omitted index is rejected with 409 PAYLOAD_MISMATCH
+      const changedContainerIndexReplay = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(legacyRef)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "CORRECT",
+          reason: "Keep historical Round and add 1 new Round",
+          prepareKey: "dec119-corr-split",
+          items: [
+            {
+              kind: "CONTAINER_PACKAGE",
+              packageCode: "ROUND_EMPTY",
+              includedGripo: "PUSH_TYPE",
+              originalLineIndex: 1,
+              quantity: 1,
+            },
+            {
+              kind: "CONTAINER_PACKAGE",
+              packageCode: "ROUND_PURIFIED",
+              quantity: 1,
+            },
+          ],
+        });
+      expect(changedContainerIndexReplay.status).toBe(409);
+      expect(changedContainerIndexReplay.body.error.code).toBe("PAYLOAD_MISMATCH");
+
+      const omittedContainerIndexReplay = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(legacyRef)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "CORRECT",
+          reason: "Keep historical Round and add 1 new Round",
+          prepareKey: "dec119-corr-split",
+          items: [
+            {
+              kind: "CONTAINER_PACKAGE",
+              packageCode: "ROUND_EMPTY",
+              includedGripo: "PUSH_TYPE",
+              quantity: 1,
+            },
+            {
+              kind: "CONTAINER_PACKAGE",
+              packageCode: "ROUND_PURIFIED",
+              quantity: 1,
+            },
+          ],
+        });
+      expect(omittedContainerIndexReplay.status).toBe(409);
+      expect(omittedContainerIndexReplay.body.error.code).toBe("PAYLOAD_MISMATCH");
+
+      // Legacy already-prepared action row without submittedContainerLines remains replay-compatible
+      await ctx.db.query(
+        `UPDATE pos_sale_action_requests
+            SET merchandise_plan = merchandise_plan - 'submittedContainerLines'
+          WHERE reference = $1`,
+        [splitCorrPrep.body.action.reference],
+      );
+      const legacyPreparedReplay = await request(ctx.app)
+        .post(`/api/pos/sales/${encodeURIComponent(legacyRef)}/actions`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({
+          actionType: "CORRECT",
+          reason: "Keep historical Round and add 1 new Round",
+          prepareKey: "dec119-corr-split",
+          items: [
+            {
+              kind: "CONTAINER_PACKAGE",
+              packageCode: "ROUND_EMPTY",
+              includedGripo: "PUSH_TYPE",
+              originalLineIndex: 0,
+              quantity: 1,
+            },
+            {
+              kind: "CONTAINER_PACKAGE",
+              packageCode: "ROUND_PURIFIED",
+              quantity: 1,
+            },
+          ],
+        });
+      expect(legacyPreparedReplay.status).toBe(200);
+      expect(legacyPreparedReplay.body.replayed).toBe(true);
+
+      const splitConf = await request(ctx.app)
+        .post(`/api/pos/sale-actions/${encodeURIComponent(splitCorrPrep.body.action.reference)}/confirm`)
+        .set("Cookie", owner.cookie)
+        .set("X-CSRF-Token", owner.csrfToken)
+        .send({ cashConfirmed: true, cashTenderedCentavos: 20000 });
+      expect(splitConf.status).toBe(201);
+      expect(splitConf.body.replacementSale.items).toHaveLength(2);
+
+      // Round stock: 6 -> 5 (legacy sale) -> 4 (added 1 new Round)
+      const invFinal = await request(ctx.app).get("/api/inventory/items").set("Cookie", owner.cookie);
+      expect(invFinal.body.items.find((i: any) => i.id === roundId).currentQuantity).toBe(4);
+    });
+
+    it("enforces the 500-unit per-line cap on a single line while accepting 500 and chunked 501 Round checkouts (Finding 3)", async () => {
+      const { roundId } = await setupRoundSlimAndFaucets(600, 4);
+      expect((await startDay(ctx, owner, { requestKey: "dec119-day3" })).status).toBe(201);
+
+      // Single Round line > 500 (501) is rejected with 400 VALIDATION_FAILED
+      const singleOver500 = await prepareCheckout(ctx, cashier, {
+        items: [{ kind: "CONTAINER_PACKAGE", packageCode: "ROUND_EMPTY", quantity: 501 }],
+      });
+      expect(singleOver500.status).toBe(400);
+      expect(singleOver500.body.error.code).toBe("VALIDATION_FAILED");
+
+      // Single Round line at exact 500 boundary succeeds (201)
+      const exact500Prep = await prepareCheckout(ctx, cashier, {
+        prepareKey: "dec119-f3-exact-500",
+        items: [{ kind: "CONTAINER_PACKAGE", packageCode: "ROUND_EMPTY", quantity: 500 }],
+      });
+      expect(exact500Prep.status).toBe(201);
+      expect(exact500Prep.body.checkout.totalCentavos).toBe(8_750_000);
+      expect(
+        (await cancelCheckout(ctx, cashier, exact500Prep.body.checkout.reference as string)).status,
+      ).toBe(200);
+
+      // Chunked 501 (500 + 1) produced from merged legacy Round lines succeeds (201) and deducts 501 (600 -> 99)
+      const chunked501Prep = await prepareCheckout(ctx, cashier, {
+        prepareKey: "dec119-f3-chunked-501",
+        items: [
+          { kind: "CONTAINER_PACKAGE", packageCode: "ROUND_EMPTY", quantity: 500 },
+          { kind: "CONTAINER_PACKAGE", packageCode: "ROUND_EMPTY", quantity: 1 },
+        ],
+      });
+      expect(chunked501Prep.status).toBe(201);
+      expect(chunked501Prep.body.checkout.totalCentavos).toBe(8_767_500);
+      const chunked501Conf = await confirmCheckout(
+        ctx.app,
+        cashier,
+        chunked501Prep.body.checkout.reference as string,
+        { cashReceivedCentavos: 8_767_500 },
+      );
+      expect(chunked501Conf.status).toBe(201);
+      expect(chunked501Conf.body.sale.items).toHaveLength(2);
+      expect(chunked501Conf.body.sale.items.map((i: any) => i.quantity)).toEqual([500, 1]);
+
+      const invAfter = await request(ctx.app).get("/api/inventory/items").set("Cookie", owner.cookie);
+      expect(invAfter.body.items.find((i: any) => i.id === roundId).currentQuantity).toBe(99);
     });
   });
 });

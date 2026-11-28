@@ -25,6 +25,16 @@ export type ContainerPackageCode =
 export function formatIncludedGripoLabel(gripo: IncludedGripoType): string {
   return gripo === "PUSH_TYPE" ? "Push-Type gripo" : "Twist-Type gripo";
 }
+
+export function formatContainerPackageDisplayLabel(
+  name: string,
+  includedGripo: IncludedGripoType | null | undefined,
+): string {
+  if (includedGripo === "PUSH_TYPE" || includedGripo === "TWIST_TYPE") {
+    return `${name} · ${formatIncludedGripoLabel(includedGripo)}`;
+  }
+  return name;
+}
 export type DayState = "NOT_STARTED" | "OPEN" | "CLOSED" | "PREVIOUS_DAY_OPEN";
 export type CheckoutStatus =
   | "DRAFT"
@@ -202,19 +212,12 @@ export type CartItemInput =
   | {
       kind: "CONTAINER_PACKAGE";
       packageCode: ContainerPackageCode;
-      includedGripo: IncludedGripoType;
-      quantity: number;
-    };
-
-/** Confirm/retry items may omit includedGripo only when matching a pre-0010 quote. */
-export type ConfirmCartItemInput =
-  | Exclude<CartItemInput, { kind: "CONTAINER_PACKAGE" }>
-  | {
-      kind: "CONTAINER_PACKAGE";
-      packageCode: ContainerPackageCode;
       includedGripo?: IncludedGripoType;
       quantity: number;
     };
+
+/** Confirm/retry items may omit includedGripo when matching a legacy pre-0010 quote or DEC-119 Round package. */
+export type ConfirmCartItemInput = CartItemInput;
 
 export interface QuoteLineItem {
   lineIndex: number;
@@ -527,6 +530,7 @@ export function buildValidatedQuote(
   catalogByWaterType: ReadonlyMap<WaterType, CatalogRefill>,
   merchandiseById: ReadonlyMap<string, PosMerchandiseItem> = new Map(),
   containerPackagesByCode: ReadonlyMap<ContainerPackageCode, PosContainerPackageItem> = new Map(),
+  options?: { allowLegacyRoundGripoIndexes?: ReadonlySet<number> },
 ):
   | { ok: true; quote: ValidatedQuote }
   | { ok: false; code: "VALIDATION_FAILED" | "PRODUCT_UNAVAILABLE"; message: string } {
@@ -595,10 +599,30 @@ export function buildValidatedQuote(
           message: "One or more selected container packages are unavailable in POS.",
         };
       }
+      if (pkg.shape === "SLIM") {
+        if (item.includedGripo !== "PUSH_TYPE" && item.includedGripo !== "TWIST_TYPE") {
+          return {
+            ok: false,
+            code: "VALIDATION_FAILED",
+            message: "Select Push-Type or Twist-Type gripo for Slim container packages.",
+          };
+        }
+      } else if (
+        item.includedGripo !== undefined &&
+        !options?.allowLegacyRoundGripoIndexes?.has(i)
+      ) {
+        return {
+          ok: false,
+          code: "VALIDATION_FAILED",
+          message:
+            "Round container packages include a standard gripo and do not accept a faucet type selection.",
+        };
+      }
       const lineTotalCentavos = pkg.unitPriceCentavos * item.quantity;
       const lineVolumeMl = pkg.unitVolumeMl * item.quantity;
       totalCentavos += lineTotalCentavos;
       totalVolumeMl += lineVolumeMl;
+      const resolvedGripo = item.includedGripo ?? null;
 
       resolved.push({
         lineIndex: i,
@@ -608,8 +632,8 @@ export function buildValidatedQuote(
         productId: pkg.productId,
         stockUnit: pkg.unit,
         posSection: pkg.posSection,
-        includedGripo: item.includedGripo,
-        displayLabel: `${pkg.name} · ${formatIncludedGripoLabel(item.includedGripo)}`,
+        includedGripo: resolvedGripo,
+        displayLabel: formatContainerPackageDisplayLabel(pkg.name, resolvedGripo),
         unitVolumeMl: pkg.unitVolumeMl,
         unitVolumeLiters: pkg.unitVolumeLiters,
         unitPriceCentavos: pkg.unitPriceCentavos,

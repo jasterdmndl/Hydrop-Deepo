@@ -203,33 +203,36 @@ describe("container package shared quantity helpers", () => {
     });
   });
 
-  it("computes shared container limits across fill and gripo lines while ignoring other shapes and refills", () => {
+  it("computes shared container limits across fill and Slim gripo lines while ignoring other shapes and refills", () => {
     const lines = [
       { id: "std-PURIFIED", kind: "STANDARD", quantity: 4 },
-      { id: "pkg-ROUND_ALKALINE-PUSH_TYPE", kind: "CONTAINER_PACKAGE", productId: "round-1", quantity: 2 },
-      { id: "pkg-ROUND_ALKALINE-TWIST_TYPE", kind: "CONTAINER_PACKAGE", productId: "round-1", quantity: 1 },
-      { id: "pkg-ROUND_EMPTY-PUSH_TYPE", kind: "CONTAINER_PACKAGE", productId: "round-1", quantity: 3 },
-      { id: "pkg-SLIM_EMPTY-PUSH_TYPE", kind: "CONTAINER_PACKAGE", productId: "slim-1", quantity: 5 },
+      { id: "pkg-ROUND_ALKALINE", kind: "CONTAINER_PACKAGE", productId: "round-1", quantity: 3 },
+      { id: "pkg-ROUND_EMPTY", kind: "CONTAINER_PACKAGE", productId: "round-1", quantity: 3 },
+      { id: "pkg-SLIM_EMPTY-PUSH_TYPE", kind: "CONTAINER_PACKAGE", productId: "slim-1", quantity: 2 },
+      { id: "pkg-SLIM_EMPTY-TWIST_TYPE", kind: "CONTAINER_PACKAGE", productId: "slim-1", quantity: 3 },
     ];
 
     expect(
-      getContainerPackageOtherQuantity(lines, "round-1", "pkg-ROUND_ALKALINE-TWIST_TYPE"),
-    ).toBe(5);
+      getContainerPackageOtherQuantity(lines, "round-1", "pkg-ROUND_ALKALINE"),
+    ).toBe(3);
     expect(
-      getContainerPackageRowMax(lines, "round-1", "pkg-ROUND_ALKALINE-TWIST_TYPE", 10),
-    ).toBe(5);
+      getContainerPackageRowMax(lines, "round-1", "pkg-ROUND_ALKALINE", 10),
+    ).toBe(7);
     expect(
-      getContainerPackageRowMax(lines, "round-1", "pkg-ROUND_PURIFIED-PUSH_TYPE", 10),
+      getContainerPackageRowMax(lines, "round-1", "pkg-ROUND_PURIFIED", 10),
     ).toBe(4);
     expect(
-      getContainerPackageRowMax(lines, "round-1", "pkg-ROUND_PURIFIED-PUSH_TYPE", 4),
+      getContainerPackageRowMax(lines, "round-1", "pkg-ROUND_PURIFIED", 4),
     ).toBe(0);
     expect(
-      getContainerPackageRowMax(lines, "round-1", "pkg-ROUND_PURIFIED-PUSH_TYPE", null),
+      getContainerPackageRowMax(lines, "round-1", "pkg-ROUND_PURIFIED", null),
     ).toBe(0);
     expect(
-      getContainerPackageRowMax([], "round-1", "pkg-ROUND_PURIFIED-PUSH_TYPE", 750),
+      getContainerPackageRowMax([], "round-1", "pkg-ROUND_PURIFIED", 750),
     ).toBe(MAX_LINE_QTY);
+    expect(
+      getContainerPackageRowMax(lines, "slim-1", "pkg-SLIM_EMPTY-PUSH_TYPE", 8),
+    ).toBe(5);
   });
 
   it("formats stock-specific over-max messages and allows stale-cart reductions without allowing increases", () => {

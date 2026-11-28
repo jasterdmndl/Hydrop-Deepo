@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useMemo, useState } from "react";
 import { api, ApiError } from "../api";
 import {
+  type CartItemInput,
   type CatalogRefill,
   type ContainerPackageCode,
   type ContainerShape,
+  containerShapeFromPackageCode,
   type FaucetReportingType,
   formatCentavos,
-  formatIncludedGripoLabel,
+  formatContainerPackageDisplayLabel,
   formatLiters,
   formatManilaTimestamp,
   type IncludedGripoType,
@@ -100,10 +102,6 @@ const CONTAINER_PACKAGE_FALLBACKS: ReadonlyArray<{
     { packageCode: "SLIM_PURIFIED", shape: "SLIM", name: "Slim Container (Purified · 25 L)", waterType: "PURIFIED", unitVolumeLiters: 25, unitPriceCentavos: 20000 },
     { packageCode: "SLIM_ALKALINE", shape: "SLIM", name: "Slim Container (Alkaline · 25 L)", waterType: "ALKALINE", unitVolumeLiters: 25, unitPriceCentavos: 21000 },
   ];
-
-function shapeFromPackageCode(code: ContainerPackageCode): ContainerShape {
-  return code.startsWith("SLIM") ? "SLIM" : "ROUND";
-}
 
 function generateActionKey(): string {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
@@ -433,7 +431,7 @@ export function SaleActionModal({
   }
 
   function addContainerPackageLine(pkg: PosContainerPackageItem) {
-    const gripo: IncludedGripoType = "PUSH_TYPE";
+    const gripo: IncludedGripoType | null = pkg.shape === "SLIM" ? "PUSH_TYPE" : null;
     setCorrectionLines((prev) => {
       const existing = prev.find(
         (line) =>
@@ -459,7 +457,7 @@ export function SaleActionModal({
           faucetReportingType: null,
           originalLineIndex: null,
           originalQuantity: 0,
-          displayLabel: `${pkg.name} · ${formatIncludedGripoLabel(gripo)}`,
+          displayLabel: formatContainerPackageDisplayLabel(pkg.name, gripo),
           unitVolumeLiters: pkg.unitVolumeLiters,
           unitPriceCentavos: pkg.unitPriceCentavos,
           quantity: 1,
@@ -572,6 +570,36 @@ export function SaleActionModal({
     setError(null);
     setStatusMessage(null);
     try {
+      const roundPreviewRow = stockPlanPreviewRows.find((row) =>
+        correctionLines.some(
+          (l) =>
+            l.kind === "CONTAINER_PACKAGE" &&
+            l.packageCode &&
+            containerShapeFromPackageCode(l.packageCode) === "ROUND" &&
+            l.productId === row.productId,
+        ),
+      );
+      const origRoundQty = sale.items
+        .filter(
+          (it) =>
+            it.kind === "CONTAINER_PACKAGE" &&
+            it.catalogCode &&
+            containerShapeFromPackageCode(it.catalogCode as ContainerPackageCode) === "ROUND",
+        )
+        .reduce((sum, it) => sum + it.quantity, 0);
+      const corrRoundQty = correctionLines
+        .filter(
+          (l) =>
+            l.kind === "CONTAINER_PACKAGE" &&
+            l.packageCode &&
+            containerShapeFromPackageCode(l.packageCode) === "ROUND",
+        )
+        .reduce((sum, l) => sum + l.quantity, 0);
+      let remainingRetainedRound = Math.max(
+        0,
+        Math.min(origRoundQty, corrRoundQty) - (roundPreviewRow?.exchangedQuantity ?? 0),
+      );
+
       const payload =
         mode === "PREPARE_VOID"
           ? {
@@ -584,39 +612,102 @@ export function SaleActionModal({
             actionType: "CORRECT" as const,
             reason: trimmedReason,
             prepareKey,
-            items: correctionLines.map((line) => {
+            items: correctionLines.flatMap(
+              (
+                line,
+              ): Array<
+                | CartItemInput
+                | {
+                    kind: "MERCHANDISE";
+                    productId: string;
+                    quantity: number;
+                    originalLineIndex?: number;
+                  }
+                | {
+                    kind: "CONTAINER_PACKAGE";
+                    packageCode: ContainerPackageCode;
+                    includedGripo?: IncludedGripoType;
+                    originalLineIndex?: number;
+                    quantity: number;
+                  }
+              > => {
               if (line.kind === "STANDARD") {
-                return {
-                  kind: "STANDARD" as const,
-                  waterType: line.waterType ?? "PURIFIED",
-                  quantity: line.quantity,
-                };
+                return [
+                  {
+                    kind: "STANDARD" as const,
+                    waterType: line.waterType ?? "PURIFIED",
+                    quantity: line.quantity,
+                  },
+                ];
               }
               if (line.kind === "MERCHANDISE") {
-                return {
-                  kind: "MERCHANDISE" as const,
-                  productId: line.productId!,
-                  quantity: line.quantity,
-                  ...(line.originalLineIndex !== null
-                    ? { originalLineIndex: line.originalLineIndex }
-                    : {}),
-                };
+                return [
+                  {
+                    kind: "MERCHANDISE" as const,
+                    productId: line.productId!,
+                    quantity: line.quantity,
+                    ...(line.originalLineIndex !== null
+                      ? { originalLineIndex: line.originalLineIndex }
+                      : {}),
+                  },
+                ];
               }
               if (line.kind === "CONTAINER_PACKAGE") {
-                return {
-                  kind: "CONTAINER_PACKAGE" as const,
-                  packageCode: line.packageCode!,
-                  includedGripo: line.includedGripo ?? "PUSH_TYPE",
-                  quantity: line.quantity,
-                };
+                const shape = containerShapeFromPackageCode(line.packageCode!);
+                if (shape === "SLIM") {
+                  return [
+                    {
+                      kind: "CONTAINER_PACKAGE" as const,
+                      packageCode: line.packageCode!,
+                      includedGripo: line.includedGripo ?? "PUSH_TYPE",
+                      quantity: line.quantity,
+                    },
+                  ];
+                }
+                if (line.includedGripo !== null && line.originalLineIndex !== null) {
+                  const retainedQty = Math.min(
+                    line.quantity,
+                    line.originalQuantity,
+                    remainingRetainedRound,
+                  );
+                  remainingRetainedRound -= retainedQty;
+                  const addedQty = line.quantity - retainedQty;
+                  const out = [];
+                  if (retainedQty > 0) {
+                    out.push({
+                      kind: "CONTAINER_PACKAGE" as const,
+                      packageCode: line.packageCode!,
+                      includedGripo: line.includedGripo,
+                      originalLineIndex: line.originalLineIndex,
+                      quantity: retainedQty,
+                    });
+                  }
+                  if (addedQty > 0) {
+                    out.push({
+                      kind: "CONTAINER_PACKAGE" as const,
+                      packageCode: line.packageCode!,
+                      quantity: addedQty,
+                    });
+                  }
+                  return out;
+                }
+                return [
+                  {
+                    kind: "CONTAINER_PACKAGE" as const,
+                    packageCode: line.packageCode!,
+                    quantity: line.quantity,
+                  },
+                ];
               }
-              return {
-                kind: "CUSTOM" as const,
-                waterType: line.waterType ?? "PURIFIED",
-                unitVolumeLiters: line.unitVolumeLiters,
-                unitPriceCentavos: line.unitPriceCentavos,
-                quantity: line.quantity,
-              };
+              return [
+                {
+                  kind: "CUSTOM" as const,
+                  waterType: line.waterType ?? "PURIFIED",
+                  unitVolumeLiters: line.unitVolumeLiters,
+                  unitPriceCentavos: line.unitPriceCentavos,
+                  quantity: line.quantity,
+                },
+              ];
             }),
             ...(dispositionsPayload.length > 0 ? { stockDispositions: dispositionsPayload } : {}),
           };
@@ -976,7 +1067,10 @@ export function SaleActionModal({
                                     catalogContainers.find((c) => c.packageCode === nextCode) ??
                                     CONTAINER_PACKAGE_FALLBACKS.find((c) => c.packageCode === nextCode);
                                   if (!pkgMeta) return;
-                                  const gripo = line.includedGripo ?? "PUSH_TYPE";
+                                  const gripo =
+                                    containerShapeFromPackageCode(nextCode) === "SLIM"
+                                      ? (line.includedGripo ?? "PUSH_TYPE")
+                                      : line.includedGripo;
                                   setCorrectionLines((prev) =>
                                     prev.map((entry) =>
                                       entry.key === line.key
@@ -986,7 +1080,10 @@ export function SaleActionModal({
                                           waterType: pkgMeta.waterType,
                                           unitVolumeLiters: pkgMeta.unitVolumeLiters,
                                           unitPriceCentavos: pkgMeta.unitPriceCentavos,
-                                          displayLabel: `${pkgMeta.name} · ${formatIncludedGripoLabel(gripo)}`,
+                                          displayLabel: formatContainerPackageDisplayLabel(
+                                            pkgMeta.name,
+                                            gripo,
+                                          ),
                                         }
                                         : entry,
                                     ),
@@ -995,41 +1092,46 @@ export function SaleActionModal({
                                 }}
                               >
                                 {CONTAINER_PACKAGE_FALLBACKS.filter(
-                                  (c) => c.shape === shapeFromPackageCode(line.packageCode!),
+                                  (c) => c.shape === containerShapeFromPackageCode(line.packageCode!),
                                 ).map((opt) => (
                                   <option key={opt.packageCode} value={opt.packageCode}>
                                     {opt.name} ({formatCentavos(opt.unitPriceCentavos)})
                                   </option>
                                 ))}
                               </select>
-                              <select
-                                aria-label={`Included gripo for ${line.displayLabel}`}
-                                value={line.includedGripo ?? "PUSH_TYPE"}
-                                disabled={busy}
-                                onChange={(event) => {
-                                  const nextGripo = event.target.value as IncludedGripoType;
-                                  const pkgMeta =
-                                    catalogContainers.find((c) => c.packageCode === line.packageCode) ??
-                                    CONTAINER_PACKAGE_FALLBACKS.find(
-                                      (c) => c.packageCode === line.packageCode,
+                              {containerShapeFromPackageCode(line.packageCode) === "SLIM" && (
+                                <select
+                                  aria-label={`Included gripo for ${line.displayLabel}`}
+                                  value={line.includedGripo ?? "PUSH_TYPE"}
+                                  disabled={busy}
+                                  onChange={(event) => {
+                                    const nextGripo = event.target.value as IncludedGripoType;
+                                    const pkgMeta =
+                                      catalogContainers.find((c) => c.packageCode === line.packageCode) ??
+                                      CONTAINER_PACKAGE_FALLBACKS.find(
+                                        (c) => c.packageCode === line.packageCode,
+                                      );
+                                    setCorrectionLines((prev) =>
+                                      prev.map((entry) =>
+                                        entry.key === line.key
+                                          ? {
+                                            ...entry,
+                                            includedGripo: nextGripo,
+                                            displayLabel: formatContainerPackageDisplayLabel(
+                                              pkgMeta?.name ?? "Container",
+                                              nextGripo,
+                                            ),
+                                          }
+                                          : entry,
+                                      ),
                                     );
-                                  setCorrectionLines((prev) =>
-                                    prev.map((entry) =>
-                                      entry.key === line.key
-                                        ? {
-                                          ...entry,
-                                          includedGripo: nextGripo,
-                                          displayLabel: `${pkgMeta?.name ?? "Container"} · ${formatIncludedGripoLabel(nextGripo)}`,
-                                        }
-                                        : entry,
-                                    ),
-                                  );
-                                  setPrepareKey(generateActionKey());
-                                }}
-                              >
-                                <option value="PUSH_TYPE">Push-Type gripo</option>
-                                <option value="TWIST_TYPE">Twist-Type gripo</option>
-                              </select>
+                                    setPrepareKey(generateActionKey());
+                                  }}
+                                >
+                                  <option value="PUSH_TYPE">Push-Type gripo</option>
+                                  <option value="TWIST_TYPE">Twist-Type gripo</option>
+                                </select>
+                              )}
                             </div>
                           )}
                         </div>
