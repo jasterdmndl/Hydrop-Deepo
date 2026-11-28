@@ -326,6 +326,128 @@ describe("DEC-114 Employee role rename and migration 0017", () => {
           })
       ).status,
     ).toBe(201);
+
+    // DEC-114 / Task 4: Migrated EMPLOYEE keeps operating-supply usage + OWN_USAGE history
+    // and remains blocked from Owner-only Inventory writes and Dashboard Stock Trend.
+    const supplyCreate = await request(app)
+      .post("/api/inventory/products")
+      .set("Cookie", owner.cookie)
+      .set("X-CSRF-Token", owner.csrfToken)
+      .send({
+        category: "OPERATING_SUPPLY",
+        name: "Backwash Salt",
+        unit: "kg",
+        allowDecimalQuantity: true,
+        unitConfirmed: true,
+      });
+    expect(supplyCreate.status).toBe(201);
+    const supplyId = supplyCreate.body.item.id as string;
+
+    const supplyOpen = await request(app)
+      .post(`/api/inventory/items/${encodeURIComponent(supplyId)}/opening-stock`)
+      .set("Cookie", owner.cookie)
+      .set("X-CSRF-Token", owner.csrfToken)
+      .send({ quantity: 5 });
+    expect(supplyOpen.status).toBe(201);
+
+    const empUsage = await request(app)
+      .post(`/api/inventory/items/${encodeURIComponent(supplyId)}/usage`)
+      .set("Cookie", employee.cookie)
+      .set("X-CSRF-Token", employee.csrfToken)
+      .send({
+        quantity: 1,
+        purpose: "Brine recharge",
+        expectedRevision: supplyOpen.body.item.stockRevision,
+        expectedCurrentQuantity: 5,
+        requestKey: "post-0017-emp-usage",
+      });
+    expect(empUsage.status).toBe(201);
+    expect(empUsage.body.item.currentQuantity).toBe(4);
+    const empUsageMovId = empUsage.body.movement.id as string;
+
+    const empHistory = await request(app)
+      .get(`/api/inventory/items/${encodeURIComponent(supplyId)}/history`)
+      .set("Cookie", employee.cookie);
+    expect(empHistory.status).toBe(200);
+    expect(empHistory.body.scope).toBe("OWN_USAGE");
+    expect(empHistory.body.openingStock).toBeNull();
+    expect(empHistory.body.item.openingStock).toBeNull();
+    expect(empHistory.body.reconciliations).toEqual([]);
+    expect(empHistory.body.movements).toHaveLength(1);
+    expect(empHistory.body.movements[0]).toMatchObject({
+      id: empUsageMovId,
+      recordedBy: "cashier1",
+    });
+
+    expect(
+      (
+        await request(app)
+          .post(`/api/inventory/items/${encodeURIComponent(supplyId)}/receiving`)
+          .set("Cookie", employee.cookie)
+          .set("X-CSRF-Token", employee.csrfToken)
+          .send({
+            quantity: 2,
+            expectedRevision: empUsage.body.item.stockRevision,
+            expectedCurrentQuantity: 4,
+            requestKey: "post-0017-emp-recv-denied",
+          })
+      ).status,
+    ).toBe(403);
+    expect(
+      (
+        await request(app)
+          .post(`/api/inventory/items/${encodeURIComponent(supplyId)}/reconciliations`)
+          .set("Cookie", employee.cookie)
+          .set("X-CSRF-Token", employee.csrfToken)
+          .send({
+            physicalCount: 4,
+            reason: "Unauthorized recount",
+            expectedRevision: empUsage.body.item.stockRevision,
+            expectedCurrentQuantity: 4,
+            requestKey: "post-0017-emp-rec-denied",
+          })
+      ).status,
+    ).toBe(403);
+    expect(
+      (
+        await request(app)
+          .get("/api/inventory/pending-reviews")
+          .set("Cookie", employee.cookie)
+      ).status,
+    ).toBe(403);
+    expect(
+      (
+        await request(app)
+          .get("/api/inventory/pending-corrections")
+          .set("Cookie", employee.cookie)
+      ).status,
+    ).toBe(403);
+    expect(
+      (
+        await request(app)
+          .post(`/api/inventory/movements/${encodeURIComponent(empUsageMovId)}/correct-quantity`)
+          .set("Cookie", employee.cookie)
+          .set("X-CSRF-Token", employee.csrfToken)
+          .send({
+            newQuantity: 2,
+            reason: "Unauthorized edit",
+            coverageMode: "NONE",
+            expectedCorrectionVersion: 0,
+            expectedRevision: empUsage.body.item.stockRevision,
+            expectedCurrentQuantity: 4,
+            expectedLatestReconciliationId: null,
+            expectedOpeningCountCoversDate: false,
+            requestKey: "post-0017-emp-corr-denied",
+          })
+      ).status,
+    ).toBe(403);
+    expect(
+      (
+        await request(app)
+          .get("/api/dashboard/stocks/ROUND/trend")
+          .set("Cookie", employee.cookie)
+      ).status,
+    ).toBe(403);
   });
 
   it("supports cutover, transactional rollback to CASHIER, and re-cutover without losing identity or history", async () => {

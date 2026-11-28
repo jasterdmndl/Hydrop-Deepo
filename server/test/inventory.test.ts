@@ -4404,3 +4404,718 @@ describe("Final Inventory Task 2 — late-entry review and role-scoped history (
     expect(targetTrend.body.points.map((p: any) => p.balanceAfter)).toEqual([10, 15, 10]);
   });
 });
+
+describe("Final Inventory Task 4 — integrated application verification (DEC-094, DEC-104, DEC-106, DEC-112, DEC-114, INV-045)", () => {
+  let ctx: TestContext;
+  let owner: Activated;
+  let employee: Activated;
+
+  beforeEach(async () => {
+    ctx = await createTestContext({ clock: new ManualClock(BASE_MANILA) });
+    owner = await activatedAccount(ctx, "owner_t4", "OWNER");
+    employee = await activatedAccount(ctx, "emp_t4", "EMPLOYEE");
+  });
+
+  afterEach(async () => {
+    await ctx.close();
+  });
+
+  it("verifies Dashboard Stock Trend across Not Set, explicit zero, low stock, decimals, negative supplies, pending/history-only entries, and date fixes (DEC-094)", async () => {
+    const notSetId = (
+      await postProduct(ctx, owner, {
+        name: "Unset Filter Cartridge",
+        unit: "pcs",
+        unitConfirmed: true,
+        unitPriceCentavos: 9000,
+        showInPos: false,
+        posSection: "TAKIP_ACCESSORIES",
+      })
+    ).body.item.id as string;
+
+    const zeroId = (
+      await postProduct(ctx, owner, {
+        name: "Zero Nozzle Pack",
+        unit: "pcs",
+        unitConfirmed: true,
+        unitPriceCentavos: 3500,
+        showInPos: false,
+        posSection: "TAKIP_ACCESSORIES",
+        lowStockLevel: 2,
+      })
+    ).body.item.id as string;
+    expect((await postOpeningStock(ctx, owner, zeroId, { quantity: 0 })).status).toBe(201);
+
+    const supplyId = (
+      await postProduct(ctx, owner, {
+        category: "OPERATING_SUPPLY",
+        name: "Liquid Sanitizer",
+        unit: "L",
+        allowDecimalQuantity: true,
+        unitConfirmed: true,
+        lowStockLevel: 1,
+      })
+    ).body.item.id as string;
+    const openSupply = await postOpeningStock(ctx, owner, supplyId, { quantity: 1.25 });
+    expect(openSupply.status).toBe(201);
+
+    // Employee is blocked from Dashboard routes (403).
+    expect(
+      (await request(ctx.app).get(`/api/dashboard/stocks/${supplyId}/trend`).set("Cookie", employee.cookie))
+        .status,
+    ).toBe(403);
+    expect(
+      (await request(ctx.app).get("/api/dashboard/sales").set("Cookie", employee.cookie)).status,
+    ).toBe(403);
+
+    // NOT_SET and explicit-zero trend assertions.
+    const notSetTrend = await request(ctx.app)
+      .get(`/api/dashboard/stocks/${notSetId}/trend`)
+      .set("Cookie", owner.cookie);
+    expect(notSetTrend.status).toBe(200);
+    expect(notSetTrend.body).toMatchObject({
+      historyState: "NOT_SET",
+      openingStock: null,
+      points: [],
+    });
+
+    const zeroTrend = await request(ctx.app)
+      .get(`/api/dashboard/stocks/${zeroId}/trend`)
+      .set("Cookie", owner.cookie);
+    expect(zeroTrend.status).toBe(200);
+    expect(zeroTrend.body).toMatchObject({
+      historyState: "COMPLETE",
+      item: {
+        currentQuantity: 0,
+        lowStockLevel: 2,
+        status: "INITIALIZED",
+      },
+    });
+    expect(zeroTrend.body.points.map((p: any) => p.balanceAfter)).toEqual([0]);
+
+    // Advance to Day 2 (2026-11-23).
+    ctx.clock.set("2026-11-23T10:00:00+08:00");
+    const owner2 = await signIn(ctx.app, "owner_t4", owner.password);
+    const emp2 = await signIn(ctx.app, "emp_t4", employee.password);
+
+    // Employee records 1.5 L decimal usage -> -0.25 L, flagging supply for reconciliation.
+    const decUsage = await postUsage(ctx, emp2, supplyId, {
+      quantity: 1.5,
+      purpose: "Morning line flush",
+      expectedRevision: openSupply.body.item.stockRevision,
+      expectedCurrentQuantity: 1.25,
+      requestKey: "t4-dash-use-1",
+    });
+    expect(decUsage.status).toBe(201);
+    expect(decUsage.body.item).toMatchObject({
+      currentQuantity: -0.25,
+      needsReconciliation: true,
+    });
+
+    // Pending late receipt (UNCLEAR) and note-only METADATA edit emit 0 balance delta and no Trend points.
+    ctx.clock.advance(5_000);
+    const pendingLateRecv = await postReceiving(ctx, owner2, supplyId, {
+      quantity: 2,
+      note: "Unclear delivery timing",
+      effectiveDate: "2026-11-22",
+      coverageMode: "UNCLEAR",
+      expectedLatestReconciliationId: null,
+      expectedOpeningCountCoversDate: true,
+      expectedRevision: decUsage.body.item.stockRevision,
+      expectedCurrentQuantity: -0.25,
+      requestKey: "t4-dash-pending-recv",
+    });
+    expect(pendingLateRecv.status).toBe(201);
+    expect(pendingLateRecv.body.item.currentQuantity).toBe(-0.25);
+
+    ctx.clock.advance(5_000);
+    const noteOnlyFix = await request(ctx.app)
+      .post(`/api/inventory/movements/${encodeURIComponent(decUsage.body.movement.id)}/correct-metadata`)
+      .set("Cookie", owner2.cookie)
+      .set("X-CSRF-Token", owner2.csrfToken)
+      .send({
+        note: "Morning tank + line flush",
+        reason: "Clarify logged purpose",
+        expectedCorrectionVersion: 0,
+        expectedRevision: decUsage.body.item.stockRevision,
+        expectedCurrentQuantity: -0.25,
+        requestKey: "t4-dash-note-fix",
+      });
+    expect(noteOnlyFix.status).toBe(200);
+    expect(noteOnlyFix.body.primaryItem.currentQuantity).toBe(-0.25);
+
+    // Owner reconciles physical count to 0.75 L, clearing discrepancy flag.
+    ctx.clock.advance(5_000);
+    const recClear = await postReconciliation(ctx, owner2, supplyId, {
+      physicalCount: 0.75,
+      reason: "Measured remaining drum volume",
+      expectedRevision: decUsage.body.item.stockRevision,
+      expectedCurrentQuantity: -0.25,
+      requestKey: "t4-dash-rec-clear",
+    });
+    expect(recClear.status).toBe(201);
+    expect(recClear.body.item).toMatchObject({
+      currentQuantity: 0.75,
+      needsReconciliation: false,
+    });
+
+    // Resolve the pending late receipt with FULL coverage against the new count -> 0 further delta.
+    ctx.clock.advance(5_000);
+    const resolvePending = await request(ctx.app)
+      .post(`/api/inventory/pending-reviews/${encodeURIComponent(pendingLateRecv.body.movement.id)}/resolve`)
+      .set("Cookie", owner2.cookie)
+      .set("X-CSRF-Token", owner2.csrfToken)
+      .send({
+        coverageMode: "FULL",
+        supportingReconciliationId: recClear.body.reconciliation.id,
+        expectedLatestReconciliationId: recClear.body.reconciliation.id,
+        expectedOpeningCountCoversDate: true,
+        expectedRevision: recClear.body.item.stockRevision,
+        expectedCurrentQuantity: 0.75,
+        requestKey: "t4-dash-resolve-full",
+      });
+    expect(resolvePending.status).toBe(200);
+    expect(resolvePending.body.item.currentQuantity).toBe(0.75);
+
+    // Record a late 2.5 L receipt (PARTIAL 0.5 L covered -> +2.0 L -> 2.75 L), then apply a date-crossing
+    // METADATA fix (2026-11-22 -> 2026-11-23) with FULL coverage -> preserves recorded balance order.
+    ctx.clock.advance(5_000);
+    const partialLateRecv = await postReceiving(ctx, owner2, supplyId, {
+      quantity: 2.5,
+      note: "Late top-up jug",
+      effectiveDate: "2026-11-22",
+      coverageMode: "PARTIAL",
+      coveredQuantity: 0.5,
+      supportingReconciliationId: recClear.body.reconciliation.id,
+      expectedLatestReconciliationId: recClear.body.reconciliation.id,
+      expectedOpeningCountCoversDate: true,
+      expectedRevision: recClear.body.item.stockRevision,
+      expectedCurrentQuantity: 0.75,
+      requestKey: "t4-dash-partial-recv",
+    });
+    expect(partialLateRecv.status).toBe(201);
+    expect(partialLateRecv.body.item.currentQuantity).toBe(2.75);
+
+    ctx.clock.advance(5_000);
+    const dateCrossFix = await request(ctx.app)
+      .post(`/api/inventory/movements/${encodeURIComponent(partialLateRecv.body.movement.id)}/correct-metadata`)
+      .set("Cookie", owner2.cookie)
+      .set("X-CSRF-Token", owner2.csrfToken)
+      .send({
+        effectiveDate: "2026-11-23",
+        reason: "Delivery date matched today's gate log",
+        coverageMode: "PARTIAL",
+        coveredQuantity: 0.5,
+        supportingReconciliationId: recClear.body.reconciliation.id,
+        expectedLatestReconciliationId: recClear.body.reconciliation.id,
+        expectedOpeningCountCoversDate: false,
+        expectedCorrectionVersion: 0,
+        expectedRevision: partialLateRecv.body.item.stockRevision,
+        expectedCurrentQuantity: 2.75,
+        requestKey: "t4-dash-date-fix",
+      });
+    expect(dateCrossFix.status).toBe(200);
+    expect(dateCrossFix.body.primaryItem.currentQuantity).toBe(2.75);
+
+    const supplyTrend = await request(ctx.app)
+      .get(`/api/dashboard/stocks/${supplyId}/trend`)
+      .set("Cookie", owner2.cookie);
+    expect(supplyTrend.status).toBe(200);
+    expect(supplyTrend.body).toMatchObject({
+      historyState: "COMPLETE",
+      item: {
+        unit: "L",
+        lowStockLevel: 1,
+        currentQuantity: 2.75,
+      },
+      openingStock: {
+        quantity: 1.25,
+        unit: "L",
+      },
+    });
+    expect(
+      supplyTrend.body.points.map((p: any) => ({
+        type: p.movementType,
+        after: p.balanceAfter,
+      })),
+    ).toEqual([
+      { type: "OPENING_COUNT", after: 1.25 },
+      { type: "STOCK_USED", after: -0.25 },
+      { type: "PHYSICAL_COUNT_RECONCILIATION", after: 0.75 },
+      { type: "STOCK_RECEIVED", after: 2.75 },
+    ]);
+  });
+
+  it("verifies simultaneous POS and Inventory activity, customer refills, reservations, held goods, covering-count return resolution, and prior-day settlement (DEC-104, DEC-106, INV-045)", async () => {
+    // Enable Round & Slim for POS and initialize Round (5), Slim (4), and standalone Push Faucet (6).
+    for (const shape of ["ROUND", "SLIM"] as const) {
+      expect(
+        (
+          await request(ctx.app)
+            .patch(`/api/inventory/containers/${shape}`)
+            .set("Cookie", owner.cookie)
+            .set("X-CSRF-Token", owner.csrfToken)
+            .send({ showInPos: true })
+        ).status,
+      ).toBe(200);
+    }
+    const openRound = await postOpeningStock(ctx, owner, "ROUND", { quantity: 5 });
+    const openSlim = await postOpeningStock(ctx, owner, "SLIM", { quantity: 4 });
+    const roundId = openRound.body.item.id as string;
+    const slimId = openSlim.body.item.id as string;
+
+    const createFaucet = await postProduct(ctx, owner, {
+      name: "Standby Push Faucet",
+      unit: "pcs",
+      unitConfirmed: true,
+      unitPriceCentavos: 4000,
+      showInPos: true,
+      posSection: "CHANGE_OF_GRIPO",
+      faucetReportingType: "PUSH_TYPE",
+    });
+    expect(createFaucet.status).toBe(201);
+    const faucetId = createFaucet.body.item.id as string;
+    const openFaucet = await postOpeningStock(ctx, owner, faucetId, { quantity: 6 });
+    expect(openFaucet.status).toBe(201);
+
+    ctx.clock.advance(5_000);
+    expect(
+      (
+        await request(ctx.app)
+          .post("/api/pos/day/start")
+          .set("Cookie", owner.cookie)
+          .set("X-CSRF-Token", owner.csrfToken)
+          .send({ requestKey: "t4-pos-start-day1" })
+      ).status,
+    ).toBe(201);
+
+    // 1. Customer-owned refill leaves container and accessory stock unchanged.
+    const refillPrep = await request(ctx.app)
+      .post("/api/pos/checkouts")
+      .set("Cookie", employee.cookie)
+      .set("X-CSRF-Token", employee.csrfToken)
+      .send({
+        prepareKey: "t4-pos-refill",
+        items: [{ kind: "STANDARD", waterType: "PURIFIED", quantity: 2 }],
+      });
+    expect(refillPrep.status).toBe(201);
+    const refillRef = refillPrep.body.checkout.reference as string;
+    expect(
+      (
+        await request(ctx.app)
+          .post(`/api/pos/checkouts/${encodeURIComponent(refillRef)}/begin-payment`)
+          .set("Cookie", employee.cookie)
+          .set("X-CSRF-Token", employee.csrfToken)
+          .send({})
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await request(ctx.app)
+          .post(`/api/pos/checkouts/${encodeURIComponent(refillRef)}/confirm`)
+          .set("Cookie", employee.cookie)
+          .set("X-CSRF-Token", employee.csrfToken)
+          .send({ cashReceivedCentavos: 5000 })
+      ).status,
+    ).toBe(201);
+
+    // 2. Simultaneous Inventory receiving during active POS PAYMENT_PENDING reservation:
+    // Employee holds 1 ROUND_EMPTY (₱175) + 1 Faucet (₱40) in PAYMENT_PENDING.
+    const mixedPrep = await request(ctx.app)
+      .post("/api/pos/checkouts")
+      .set("Cookie", employee.cookie)
+      .set("X-CSRF-Token", employee.csrfToken)
+      .send({
+        prepareKey: "t4-pos-mixed",
+        items: [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_EMPTY",
+            includedGripo: "PUSH_TYPE",
+            quantity: 1,
+          },
+          { kind: "MERCHANDISE", productId: faucetId, quantity: 1 },
+        ],
+      });
+    expect(mixedPrep.status).toBe(201);
+    const mixedRef = mixedPrep.body.checkout.reference as string;
+    expect(
+      (
+        await request(ctx.app)
+          .post(`/api/pos/checkouts/${encodeURIComponent(mixedRef)}/begin-payment`)
+          .set("Cookie", employee.cookie)
+          .set("X-CSRF-Token", employee.csrfToken)
+          .send({})
+      ).status,
+    ).toBe(200);
+
+    // Owner cannot reconcile ROUND below reserved qty (1), while Owner receiving +2 ROUND succeeds atomically.
+    const blockedRecRound = await postReconciliation(ctx, owner, "ROUND", {
+      physicalCount: 0,
+      reason: "Below active reservation",
+      expectedRevision: openRound.body.item.stockRevision,
+      expectedCurrentQuantity: 5,
+      requestKey: "t4-pos-rec-block",
+    });
+    expect(blockedRecRound.status).toBe(409);
+    expect(blockedRecRound.body.error.code).toBe("ACTIVE_PAYMENT_COMMITMENT");
+
+    const ownerRecvRound = await postReceiving(ctx, owner, "ROUND", {
+      quantity: 2,
+      note: "New shell delivery during busy hour",
+      expectedRevision: openRound.body.item.stockRevision,
+      expectedCurrentQuantity: 5,
+      requestKey: "t4-pos-recv-round",
+    });
+    expect(ownerRecvRound.status).toBe(201);
+    expect(ownerRecvRound.body.item).toMatchObject({
+      currentQuantity: 7,
+      heldQuantity: 0,
+      availableQuantity: 6,
+    });
+
+    // Employee confirms the recovered checkout -> deducts 1 ROUND (7 -> 6) and 1 standalone Faucet (6 -> 5).
+    expect(
+      (
+        await request(ctx.app)
+          .post(`/api/pos/checkouts/${encodeURIComponent(mixedRef)}/confirm`)
+          .set("Cookie", employee.cookie)
+          .set("X-CSRF-Token", employee.csrfToken)
+          .send({ cashReceivedCentavos: 22000 })
+      ).status,
+    ).toBe(201);
+
+    // 3. Held filled SLIM remains unavailable in Inventory and blocks competing 4-unit checkout.
+    const slimHoldPrep = await request(ctx.app)
+      .post("/api/pos/checkouts")
+      .set("Cookie", employee.cookie)
+      .set("X-CSRF-Token", employee.csrfToken)
+      .send({
+        prepareKey: "t4-pos-slim-hold",
+        items: [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "SLIM_PURIFIED",
+            includedGripo: "PUSH_TYPE",
+            quantity: 1,
+          },
+        ],
+      });
+    expect(slimHoldPrep.status).toBe(201);
+    const slimHoldRef = slimHoldPrep.body.checkout.reference as string;
+    expect(
+      (
+        await request(ctx.app)
+          .post(`/api/pos/checkouts/${encodeURIComponent(slimHoldRef)}/begin-payment`)
+          .set("Cookie", employee.cookie)
+          .set("X-CSRF-Token", employee.csrfToken)
+          .send({})
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await request(ctx.app)
+          .post(`/api/pos/checkouts/${encodeURIComponent(slimHoldRef)}/resolve`)
+          .set("Cookie", owner.cookie)
+          .set("X-CSRF-Token", owner.csrfToken)
+          .send({
+            outcome: "FULL_REFUND",
+            undeliveredConfirmed: true,
+            fullRefundConfirmed: true,
+            cashReceivedCentavos: 22500,
+            changeAlreadyGiven: false,
+            heldItems: [{ productId: slimId, quantity: 1, reason: "Filled container held after cancel" }],
+          })
+      ).status,
+    ).toBe(201);
+
+    const competingSlim = await request(ctx.app)
+      .post("/api/pos/checkouts")
+      .set("Cookie", employee.cookie)
+      .set("X-CSRF-Token", employee.csrfToken)
+      .send({
+        prepareKey: "t4-pos-slim-blocked",
+        items: [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "SLIM_EMPTY",
+            includedGripo: "PUSH_TYPE",
+            quantity: 4,
+          },
+        ],
+      });
+    expect(competingSlim.status).toBe(409);
+    expect(competingSlim.body.error.code).toBe("INSUFFICIENT_STOCK");
+
+    // 4. Linked POS return restoration covered by an intervening physical count produces 0 extra stock change.
+    const roundSale2Prep = await request(ctx.app)
+      .post("/api/pos/checkouts")
+      .set("Cookie", employee.cookie)
+      .set("X-CSRF-Token", employee.csrfToken)
+      .send({
+        prepareKey: "t4-pos-round-2",
+        items: [
+          {
+            kind: "CONTAINER_PACKAGE",
+            packageCode: "ROUND_EMPTY",
+            includedGripo: "PUSH_TYPE",
+            quantity: 1,
+          },
+        ],
+      });
+    expect(roundSale2Prep.status).toBe(201);
+    const roundSale2Ref = roundSale2Prep.body.checkout.reference as string;
+    expect(
+      (
+        await request(ctx.app)
+          .post(`/api/pos/checkouts/${encodeURIComponent(roundSale2Ref)}/begin-payment`)
+          .set("Cookie", employee.cookie)
+          .set("X-CSRF-Token", employee.csrfToken)
+          .send({})
+      ).status,
+    ).toBe(200);
+    const roundSale2Conf = await request(ctx.app)
+      .post(`/api/pos/checkouts/${encodeURIComponent(roundSale2Ref)}/confirm`)
+      .set("Cookie", employee.cookie)
+      .set("X-CSRF-Token", employee.csrfToken)
+      .send({ cashReceivedCentavos: 20000 });
+    expect(roundSale2Conf.status).toBe(201);
+    const roundSale2IdRef = roundSale2Conf.body.sale.reference as string;
+
+    // Owner records physical count matching 5 ROUND after sale, then voids the sale with COVERED_BY_COUNT.
+    const invMid = await request(ctx.app).get("/api/inventory/items").set("Cookie", owner.cookie);
+    const roundMid = invMid.body.items.find((i: any) => i.id === roundId);
+    expect(roundMid.currentQuantity).toBe(5);
+    ctx.clock.advance(5_000);
+    const roundRec = await postReconciliation(ctx, owner, "ROUND", {
+      physicalCount: 5,
+      reason: "Mid-shift physical count includes returned shell",
+      expectedRevision: roundMid.stockRevision,
+      expectedCurrentQuantity: 5,
+      requestKey: "t4-pos-rec-covered",
+    });
+    expect(roundRec.status).toBe(201);
+
+    const voidWithCount = await request(ctx.app)
+      .post(`/api/pos/sales/${encodeURIComponent(roundSale2IdRef)}/actions`)
+      .set("Cookie", owner.cookie)
+      .set("X-CSRF-Token", owner.csrfToken)
+      .send({
+        actionType: "VOID",
+        reason: "Customer returned unused shell after physical count",
+        prepareKey: "t4-pos-void-covered",
+        stockDispositions: [
+          {
+            productId: roundId,
+            eligibleReturnedQuantity: 1,
+            countCoverage: "COVERED_BY_COUNT",
+          },
+        ],
+      });
+    expect(voidWithCount.status).toBe(201);
+    const confirmVoidCovered = await request(ctx.app)
+      .post(`/api/pos/sale-actions/${encodeURIComponent(voidWithCount.body.action.reference)}/confirm`)
+      .set("Cookie", owner.cookie)
+      .set("X-CSRF-Token", owner.csrfToken)
+      .send({ cashConfirmed: true });
+    expect(confirmVoidCovered.status).toBe(201);
+    expect(confirmVoidCovered.body.action.merchandisePlan.items[0]).toMatchObject({
+      restoredQuantity: 0,
+      countCoveredQuantity: 1,
+    });
+
+    // 5. Leave one Faucet PAYMENT_PENDING across Manila midnight, settle on Day 2 before closing Day 1.
+    const priorPrep = await request(ctx.app)
+      .post("/api/pos/checkouts")
+      .set("Cookie", employee.cookie)
+      .set("X-CSRF-Token", employee.csrfToken)
+      .send({
+        prepareKey: "t4-pos-prior-faucet",
+        items: [{ kind: "MERCHANDISE", productId: faucetId, quantity: 1 }],
+      });
+    expect(priorPrep.status).toBe(201);
+    const priorRef = priorPrep.body.checkout.reference as string;
+    expect(
+      (
+        await request(ctx.app)
+          .post(`/api/pos/checkouts/${encodeURIComponent(priorRef)}/begin-payment`)
+          .set("Cookie", employee.cookie)
+          .set("X-CSRF-Token", employee.csrfToken)
+          .send({})
+      ).status,
+    ).toBe(200);
+
+    ctx.clock.set("2026-11-23T09:00:00+08:00");
+    const ownerDay2 = await signIn(ctx.app, "owner_t4", owner.password);
+    expect(
+      (
+        await request(ctx.app)
+          .post(`/api/pos/checkouts/${encodeURIComponent(priorRef)}/settle`)
+          .set("Cookie", ownerDay2.cookie)
+          .set("X-CSRF-Token", ownerDay2.csrfToken)
+          .send({
+            paymentKeptConfirmed: true,
+            itemsHandedOverConfirmed: true,
+          })
+      ).status,
+    ).toBe(201);
+    expect(
+      (
+        await request(ctx.app)
+          .post("/api/pos/day/end")
+          .set("Cookie", ownerDay2.cookie)
+          .set("X-CSRF-Token", ownerDay2.csrfToken)
+          .send({ requestKey: "t4-pos-end-day1" })
+      ).status,
+    ).toBe(200);
+    expect(
+      (
+        await request(ctx.app)
+          .post("/api/pos/day/start")
+          .set("Cookie", ownerDay2.cookie)
+          .set("X-CSRF-Token", ownerDay2.csrfToken)
+          .send({ requestKey: "t4-pos-start-day2" })
+      ).status,
+    ).toBe(201);
+
+    const invFinal = await request(ctx.app).get("/api/inventory/items").set("Cookie", ownerDay2.cookie);
+    expect(invFinal.status).toBe(200);
+    expect(invFinal.body.items.find((i: any) => i.id === roundId)).toMatchObject({
+      currentQuantity: 5,
+      heldQuantity: 0,
+      availableQuantity: 5,
+    });
+    expect(invFinal.body.items.find((i: any) => i.id === slimId)).toMatchObject({
+      currentQuantity: 4,
+      heldQuantity: 1,
+      availableQuantity: 3,
+    });
+    expect(invFinal.body.items.find((i: any) => i.id === faucetId)).toMatchObject({
+      currentQuantity: 4,
+      heldQuantity: 0,
+      availableQuantity: 4,
+    });
+
+    const dashDay1 = await request(ctx.app)
+      .get("/api/dashboard/sales?period=custom&from=2026-11-22&to=2026-11-22")
+      .set("Cookie", ownerDay2.cookie);
+    expect(dashDay1.status).toBe(200);
+    expect(dashDay1.body.totals).toEqual({
+      salesCentavos: 26500, // ₱50 refill + ₱175 Round + ₱40 Faucet (Round sale 2 was voided)
+      containersRefilled: 2,
+      waterVolumeMl: 50000,
+      transactions: 2,
+    });
+    expect(dashDay1.body.priorDaySettlements).toEqual([]);
+
+    const dashDay2 = await request(ctx.app)
+      .get("/api/dashboard/sales?period=today")
+      .set("Cookie", ownerDay2.cookie);
+    expect(dashDay2.status).toBe(200);
+    expect(dashDay2.body.totals.salesCentavos).toBe(0);
+    expect(dashDay2.body.priorDaySettlements).toHaveLength(1);
+    expect(dashDay2.body.priorDaySettlements[0].netAmountKeptCentavos).toBe(4000);
+  });
+
+  it("keeps Inventory balances and movement history unchanged across Calendar series, reschedule, cancellation, completion, and completion correction (DEC-112)", async () => {
+    const supplyCreate = await postProduct(ctx, owner, {
+      category: "OPERATING_SUPPLY",
+      name: "Carbon Filter Media",
+      unit: "kg",
+      allowDecimalQuantity: true,
+      unitConfirmed: true,
+    });
+    expect(supplyCreate.status).toBe(201);
+    const supplyId = supplyCreate.body.item.id as string;
+    const opened = await postOpeningStock(ctx, owner, supplyId, { quantity: 10 });
+    expect(opened.status).toBe(201);
+
+    const series = await request(ctx.app)
+      .post("/api/calendar/activities")
+      .set("Cookie", owner.cookie)
+      .set("X-CSRF-Token", owner.csrfToken)
+      .send({
+        requestKey: "t4-cal-series",
+        name: "Replace carbon pre-filter",
+        scheduledDate: "2026-11-22",
+        scheduledTime: "10:00",
+        scheduleNotes: "Sanitation maintenance",
+        recurrence: "DAILY",
+        endDate: "2026-11-24",
+      });
+    expect(series.status).toBe(201);
+    const activities = series.body.activities as Array<{ reference: string }>;
+    expect(activities).toHaveLength(3);
+    const day1Act = activities[0]!;
+    const day2Act = activities[1]!;
+    const day3Act = activities[2]!;
+
+    expect(
+      (
+        await request(ctx.app)
+          .patch(`/api/calendar/activities/${encodeURIComponent(day2Act.reference)}`)
+          .set("Cookie", owner.cookie)
+          .set("X-CSRF-Token", owner.csrfToken)
+          .send({
+            requestKey: "t4-cal-resched",
+            expectedVersion: 1,
+            scope: "THIS_OCCURRENCE",
+            scheduledDate: "2026-11-22",
+            scheduledTime: "14:00",
+          })
+      ).status,
+    ).toBe(200);
+
+    expect(
+      (
+        await request(ctx.app)
+          .post(`/api/calendar/activities/${encodeURIComponent(day3Act.reference)}/cancellation`)
+          .set("Cookie", owner.cookie)
+          .set("X-CSRF-Token", owner.csrfToken)
+          .send({
+            requestKey: "t4-cal-cancel",
+            expectedVersion: 1,
+            scope: "THIS_OCCURRENCE",
+            reason: "Combined with Day 2 maintenance",
+          })
+      ).status,
+    ).toBe(200);
+
+    const completed = await request(ctx.app)
+      .post(`/api/calendar/activities/${encodeURIComponent(day1Act.reference)}/completion`)
+      .set("Cookie", owner.cookie)
+      .set("X-CSRF-Token", owner.csrfToken)
+      .send({
+        completedDate: "2026-11-22",
+        completedTime: "08:50",
+        completionNotes: "Completed morning filter swap",
+        confirmed: true,
+      });
+    expect(completed.status).toBe(200);
+
+    const correctedCompletion = await request(ctx.app)
+      .patch(`/api/calendar/activities/${encodeURIComponent(day1Act.reference)}/completion`)
+      .set("Cookie", owner.cookie)
+      .set("X-CSRF-Token", owner.csrfToken)
+      .send({
+        requestKey: "t4-cal-comp-corr",
+        expectedVersion: 2,
+        completedDate: "2026-11-22",
+        completedTime: "08:55",
+        completionNotes: "Completed morning filter swap and rinsed housing",
+        reason: "Adjust exact completion minute",
+        confirmed: true,
+      });
+    expect(correctedCompletion.status).toBe(200);
+
+    const hist = await request(ctx.app)
+      .get(`/api/inventory/items/${encodeURIComponent(supplyId)}/history`)
+      .set("Cookie", owner.cookie);
+    expect(hist.status).toBe(200);
+    expect(hist.body.item).toMatchObject({
+      currentQuantity: 10,
+      stockRevision: 1,
+    });
+    expect(hist.body.movements).toEqual([]);
+    expect(hist.body.reconciliations).toEqual([]);
+  });
+});
