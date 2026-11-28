@@ -3726,6 +3726,36 @@ textarea:focus-visible {
   min-width: 0;
 }
 
+.pos-lookup-panel__header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 12px;
+  min-width: 0;
+}
+
+.pos-lookup-panel__toggle {
+  flex-shrink: 0;
+}
+
+.pos-lookup-panel__body {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.pos-lookup-panel__body[hidden] {
+  display: none;
+}
+
+.pos-lookup-panel__body input[type="text"] {
+  flex: 1 1 200px;
+  min-width: 0;
+  max-width: 100%;
+}
+
 /* Choose Module visual refresh (DEC-046 & DEC-047) */
 
 .shell--home .topbar {

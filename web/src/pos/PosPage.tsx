@@ -295,6 +295,7 @@ export function PosPage() {
   const serverRecoveryRef = useRef<PendingCheckoutRecovery | null>(null);
   serverRecoveryRef.current = serverRecovery;
   const [lookupRefInput, setLookupRefInput] = useState("");
+  const [lookupPanelOpen, setLookupPanelOpen] = useState(false);
   const [lookupSubmitting, setLookupSubmitting] = useState(false);
   const [lookupInputError, setLookupInputError] = useState<NoticeEnvelope<string> | null>(null);
   const [activeConfirming, setActiveConfirming] = useState<PendingCheckoutRecovery | null>(null);
@@ -545,6 +546,7 @@ export function PosPage() {
     setServerRecovery(null);
     setCheckingStatus(false);
     setLookupRefInput("");
+    setLookupPanelOpen(false);
     setLookupSubmitting(false);
     setLookupInputError(null);
     setLines([]);
@@ -2965,51 +2967,75 @@ export function PosPage() {
                   </div>
                 )}
 
-                {step === "select" && (
-                  <form
-                    className="callout callout--info"
-                    aria-label="Check transaction status by reference"
-                    onSubmit={(event) => void handleLookupByReference(event)}
-                  >
-                    <p className="callout__title">Check an uncertain transaction on another device</p>
-                    <p className="callout__body">
-                      If cash was taken on another device and you are unsure whether the sale saved, check the original
-                      reference before taking any further payment.
-                    </p>
-                    <div className="pos-unresolved-row">
-                      <input
-                        type="text"
-                        aria-label="Transaction reference to check"
-                        placeholder="e.g. HD-1125-001"
-                        value={lookupRefInput}
-                        disabled={lookupSubmitting}
-                        onChange={(event) => {
-                          setLookupRefInput(event.target.value);
-                          setLookupInputError(null);
-                        }}
-                      />
-                      <button
-                        type="submit"
-                        className="button button--ghost button--sm"
-                        disabled={lookupSubmitting || !lookupRefInput.trim()}
+                {step === "select" && (() => {
+                  const isLookupPanelExpanded = lookupPanelOpen || lookupSubmitting;
+                  return (
+                    <div
+                      className={`callout callout--info pos-lookup-panel${isLookupPanelExpanded ? " pos-lookup-panel--open" : ""}`}
+                    >
+                      <div className="pos-lookup-panel__header">
+                        <p className="callout__title">Check an uncertain transaction on another device</p>
+                        <button
+                          type="button"
+                          className="button button--ghost button--sm pos-lookup-panel__toggle"
+                          aria-expanded={isLookupPanelExpanded}
+                          aria-controls="pos-device-lookup-panel"
+                          disabled={lookupSubmitting}
+                          onClick={() => {
+                            if (lookupSubmitting) return;
+                            setLookupPanelOpen((open) => !open);
+                          }}
+                        >
+                          {isLookupPanelExpanded ? "Hide" : "Show"}
+                        </button>
+                      </div>
+                      <form
+                        id="pos-device-lookup-panel"
+                        className="pos-lookup-panel__body"
+                        aria-label="Check transaction status by reference"
+                        hidden={!isLookupPanelExpanded}
+                        onSubmit={(event) => void handleLookupByReference(event)}
                       >
-                        {lookupSubmitting ? "Checking…" : "Check transaction status"}
-                      </button>
+                        <p className="callout__body">
+                          If cash was taken on another device and you are unsure whether the sale saved, check the original
+                          reference before taking any further payment.
+                        </p>
+                        <div className="pos-unresolved-row">
+                          <input
+                            type="text"
+                            aria-label="Transaction reference to check"
+                            placeholder="e.g. HD-1125-001"
+                            value={lookupRefInput}
+                            disabled={lookupSubmitting}
+                            onChange={(event) => {
+                              setLookupRefInput(event.target.value);
+                              setLookupInputError(null);
+                            }}
+                          />
+                          <button
+                            type="submit"
+                            className="button button--ghost button--sm"
+                            disabled={lookupSubmitting || !lookupRefInput.trim()}
+                          >
+                            {lookupSubmitting ? "Checking…" : "Check transaction status"}
+                          </button>
+                        </div>
+                        {lookupInputError && (
+                          <TemporaryNotice
+                            occurrenceId={lookupInputError.id}
+                            duration="brief"
+                            className="alert alert--error"
+                            role="alert"
+                            closeLabel="Close reference check error"
+                            onDismiss={() => setLookupInputError(null)}
+                          >
+                            {lookupInputError.data}
+                          </TemporaryNotice>
+                        )}
+                      </form>
                     </div>
-                    {lookupInputError && (
-                      <TemporaryNotice
-                        occurrenceId={lookupInputError.id}
-                        duration="brief"
-                        className="alert alert--error"
-                        role="alert"
-                        closeLabel="Close reference check error"
-                        onDismiss={() => setLookupInputError(null)}
-                      >
-                        {lookupInputError.data}
-                      </TemporaryNotice>
-                    )}
-                  </form>
-                )}
+                  );
+                })()}
               </div>
 
               {step === "select" ? (
